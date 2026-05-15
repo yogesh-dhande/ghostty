@@ -95,6 +95,16 @@ jobs:
           tar czf GhosttyKit.xcframework.tar.gz -C macos GhosttyKit.xcframework
           tar czf GhosttyKit-resources.tar.gz -C zig-out/share ghostty terminfo
 
+      - name: Push release tag
+        if: ${{ github.event.inputs.sync_only != 'true' }}
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          commit_sha="$(git rev-parse HEAD)"
+          git tag -f "$RELEASE_TAG" "$commit_sha"
+          git push origin "refs/tags/${RELEASE_TAG}" --force
+
       - name: Publish or update release
         if: ${{ github.event.inputs.sync_only != 'true' }}
         env:
@@ -118,8 +128,7 @@ jobs:
             gh release create "$RELEASE_TAG" \
               --repo "$GH_REPO" \
               --title "$RELEASE_TAG" \
-              --notes-file "$notes_file" \
-              --target HEAD
+              --notes-file "$notes_file"
           fi
 
           gh release upload "$RELEASE_TAG" \

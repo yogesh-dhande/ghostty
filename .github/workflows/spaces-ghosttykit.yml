@@ -1,0 +1,129 @@
+name: Spaces GhosttyKit
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional release tag override"
+        required: false
+      sync_only:
+        description: "Sync upstream without publishing a release"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-release:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      ZIG_VERSION: 0.15.2
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward from upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/ghostty-org/ghostty.git
+          git fetch upstream main --tags
+
+          current="$(git rev-parse HEAD)"
+          upstream_head="$(git rev-parse upstream/main)"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "upstream_head=$upstream_head" >> "$GITHUB_OUTPUT"
+
+          if [[ "$current" != "$upstream_head" ]]; then
+            git merge --ff-only upstream/main
+            git push origin HEAD:main
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
+            tag="${{ github.event.inputs.release_tag }}"
+          else
+            tag="build-$(date -u +%Y-%m-%d)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Skip release build
+        if: ${{ github.event.inputs.sync_only == 'true' }}
+        run: echo "Upstream sync complete; release build skipped."
+
+      - name: Set up Zig
+        if: ${{ github.event.inputs.sync_only != 'true' }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Show toolchain versions
+        if: ${{ github.event.inputs.sync_only != 'true' }}
+        run: |
+          set -euo pipefail
+          zig version
+          xcodebuild -version
+
+      - name: Build GhosttyKit
+        if: ${{ github.event.inputs.sync_only != 'true' }}
+        env:
+          GHOSTTY_VERSION: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Dversion-string="${GHOSTTY_VERSION}"
+
+      - name: Package GhosttyKit artifacts
+        if: ${{ github.event.inputs.sync_only != 'true' }}
+        run: |
+          set -euo pipefail
+          tar czf GhosttyKit.xcframework.tar.gz -C macos GhosttyKit.xcframework
+          tar czf GhosttyKit-resources.tar.gz -C zig-out/share ghostty terminfo
+
+      - name: Publish or update release
+        if: ${{ github.event.inputs.sync_only != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          UPSTREAM_HEAD: ${{ steps.sync.outputs.upstream_head }}
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          {
+            echo "Spaces GhosttyKit build"
+            echo
+            echo "- upstream commit: ${UPSTREAM_HEAD}"
+            echo "- fork commit: $(git rev-parse HEAD)"
+          } > "$notes_file"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes_file"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$notes_file" \
+              --target HEAD
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            GhosttyKit.xcframework.tar.gz \
+            GhosttyKit-resources.tar.gz \
+            --clobber

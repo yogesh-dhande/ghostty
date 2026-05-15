@@ -23,6 +23,8 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
 
+pub const DataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -52,6 +54,10 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for communicating with the surface.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Optional callback notified with raw PTY output before terminal parsing.
+data_callback: ?DataCallback = null,
+data_callback_userdata: ?*anyopaque = null,
 
 /// The cached size info
 size: renderer.Size,
@@ -650,6 +656,10 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    if (self.data_callback) |callback| {
+        callback(self.data_callback_userdata, buf.ptr, buf.len);
+    }
+
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch unreachable;
 

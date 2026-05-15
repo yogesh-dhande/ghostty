@@ -1014,6 +1014,7 @@ typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
+typedef void (*ghostty_surface_data_cb)(void*, const uint8_t*, uintptr_t);
 
 typedef struct {
   void* userdata;
@@ -1125,6 +1126,12 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_set_data_callback(ghostty_surface_t,
+                                                      ghostty_surface_data_cb,
+                                                      void*);
+GHOSTTY_API void ghostty_surface_send_input_raw(ghostty_surface_t,
+                                                   const uint8_t*,
+                                                   uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,

@@ -24,6 +24,8 @@ const String = @import("../main_c.zig").String;
 
 const log = std.log.scoped(.embedded_window);
 
+pub const SurfaceDataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
@@ -419,6 +421,8 @@ pub const Surface = struct {
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
+    data_callback: ?SurfaceDataCallback = null,
+    data_callback_userdata: ?*anyopaque = null,
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -1820,6 +1824,30 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.textCallback(ptr[0..len]);
+    }
+
+    /// Register a callback for raw PTY output bytes before Ghostty parses them.
+    export fn ghostty_surface_set_data_callback(
+        surface: *Surface,
+        callback: ?SurfaceDataCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.data_callback = callback;
+        surface.data_callback_userdata = userdata;
+        surface.core_surface.io.data_callback = callback;
+        surface.core_surface.io.data_callback_userdata = userdata;
+    }
+
+    /// Send raw PTY bytes directly to the child process.
+    export fn ghostty_surface_send_input_raw(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        if (ptr == null or len == 0) return;
+        surface.core_surface.sendInputRaw(ptr.?[0..len]) catch |err| {
+            log.warn("error sending raw input err={}", .{err});
+        };
     }
 
     /// Set the preedit text for the surface. This is used for IME

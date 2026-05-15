@@ -82,14 +82,11 @@ jobs:
 
       - name: Build GhosttyKit
         if: ${{ github.event.inputs.sync_only != 'true' }}
-        env:
-          GHOSTTY_VERSION: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           zig build \
             -Doptimize=ReleaseFast \
-            -Demit-macos-app=false \
-            -Dversion-string="${GHOSTTY_VERSION}"
+            -Demit-macos-app=false
 
       - name: Package GhosttyKit artifacts
         if: ${{ github.event.inputs.sync_only != 'true' }}

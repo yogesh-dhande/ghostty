@@ -99,6 +99,7 @@ jobs:
         if: ${{ github.event.inputs.sync_only != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           UPSTREAM_HEAD: ${{ steps.sync.outputs.upstream_head }}
         run: |
@@ -111,16 +112,18 @@ jobs:
             echo "- fork commit: $(git rev-parse HEAD)"
           } > "$notes_file"
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes_file"
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --repo "$GH_REPO" --title "$RELEASE_TAG" --notes-file "$notes_file"
           else
             gh release create "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
               --title "$RELEASE_TAG" \
               --notes-file "$notes_file" \
               --target HEAD
           fi
 
           gh release upload "$RELEASE_TAG" \
+            --repo "$GH_REPO" \
             GhosttyKit.xcframework.tar.gz \
             GhosttyKit-resources.tar.gz \
             --clobber

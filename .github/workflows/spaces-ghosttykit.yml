@@ -2,7 +2,7 @@ name: Spaces GhosttyKit
 
 on:
   schedule:
-    - cron: "17 9 * * *"
+    - cron: "17 9 * * 1"
   workflow_dispatch:
     inputs:
       release_tag:

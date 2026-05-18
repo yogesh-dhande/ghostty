@@ -47,7 +47,11 @@ jobs:
 
           git checkout --detach "$current"
           if [[ "$current" != "$upstream_head" ]]; then
-            git merge --ff-only upstream/main
+            if git merge-base --is-ancestor "$current" "$upstream_head"; then
+              git merge --ff-only upstream/main
+            else
+              git merge --no-edit upstream/main
+            fi
             if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
               git push origin HEAD:main
             else

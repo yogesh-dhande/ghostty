@@ -37,16 +37,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/ghostty-org/ghostty.git
+          git fetch --no-tags origin main
           git fetch --no-tags upstream main
 
-          current="$(git rev-parse HEAD)"
+          current="$(git rev-parse origin/main)"
           upstream_head="$(git rev-parse upstream/main)"
           echo "current=$current" >> "$GITHUB_OUTPUT"
           echo "upstream_head=$upstream_head" >> "$GITHUB_OUTPUT"
 
+          git checkout --detach "$current"
           if [[ "$current" != "$upstream_head" ]]; then
             git merge --ff-only upstream/main
-            git push origin HEAD:main
+            if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+              git push origin HEAD:main
+            else
+              echo "Skipping push to origin/main for ref ${GITHUB_REF_NAME}"
+            fi
             echo "updated=true" >> "$GITHUB_OUTPUT"
           else
             echo "updated=false" >> "$GITHUB_OUTPUT"
@@ -64,24 +70,29 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Skip release build
-        if: ${{ github.event.inputs.sync_only == 'true' }}
-        run: echo "Upstream sync complete; release build skipped."
+        if: ${{ github.event.inputs.sync_only == 'true' || github.ref_name != 'main' }}
+        run: |
+          if [[ "${{ github.event.inputs.sync_only }}" == 'true' ]]; then
+            echo "Upstream sync complete; release build skipped."
+          else
+            echo "Release build skipped for ref ${GITHUB_REF_NAME}; publish steps run only on main."
+          fi
 
       - name: Set up Zig
-        if: ${{ github.event.inputs.sync_only != 'true' }}
+        if: ${{ github.event.inputs.sync_only != 'true' && github.ref_name == 'main' }}
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Show toolchain versions
-        if: ${{ github.event.inputs.sync_only != 'true' }}
+        if: ${{ github.event.inputs.sync_only != 'true' && github.ref_name == 'main' }}
         run: |
           set -euo pipefail
           zig version
           xcodebuild -version
 
       - name: Build GhosttyKit
-        if: ${{ github.event.inputs.sync_only != 'true' }}
+        if: ${{ github.event.inputs.sync_only != 'true' && github.ref_name == 'main' }}
         run: |
           set -euo pipefail
           zig build \
@@ -89,14 +100,14 @@ jobs:
             -Demit-macos-app=false
 
       - name: Package GhosttyKit artifacts
-        if: ${{ github.event.inputs.sync_only != 'true' }}
+        if: ${{ github.event.inputs.sync_only != 'true' && github.ref_name == 'main' }}
         run: |
           set -euo pipefail
           tar czf GhosttyKit.xcframework.tar.gz -C macos GhosttyKit.xcframework
           tar czf GhosttyKit-resources.tar.gz -C zig-out/share ghostty terminfo
 
       - name: Push release tag
-        if: ${{ github.event.inputs.sync_only != 'true' }}
+        if: ${{ github.event.inputs.sync_only != 'true' && github.ref_name == 'main' }}
         env:
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
@@ -106,7 +117,7 @@ jobs:
           git push origin "refs/tags/${RELEASE_TAG}" --force
 
       - name: Publish or update release
-        if: ${{ github.event.inputs.sync_only != 'true' }}
+        if: ${{ github.event.inputs.sync_only != 'true' && github.ref_name == 'main' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

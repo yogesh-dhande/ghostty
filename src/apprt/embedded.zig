@@ -25,6 +25,24 @@ const String = @import("../main_c.zig").String;
 const log = std.log.scoped(.embedded_window);
 
 pub const SurfaceDataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const SessionStateCallback = *const fn (?*anyopaque, u32) callconv(.c) void;
+
+pub const SessionStateFlags = packed struct(u32) {
+    screen: bool = false,
+    title: bool = false,
+    working_directory: bool = false,
+    foreground_process: bool = false,
+    size: bool = false,
+    _padding: u27 = 0,
+
+    fn bits(self: @This()) u32 {
+        return @bitCast(self);
+    }
+
+    fn unionWith(self: @This(), other: @This()) @This() {
+        return @bitCast(self.bits() | other.bits());
+    }
+};
 
 pub const resourcesDir = internal_os.resourcesDir;
 
@@ -304,6 +322,17 @@ pub const App = struct {
                     const alloc = self.core_app.alloc;
                     if (surface.rt_surface.title) |v| alloc.free(v);
                     surface.rt_surface.title = alloc.dupeZ(u8, value.title) catch null;
+                    surface.rt_surface.notifyOwnerSessionStateChange(.{ .title = true });
+                },
+            },
+
+            .pwd => switch (target) {
+                .app => {},
+                .surface => |surface| {
+                    const alloc = self.core_app.alloc;
+                    if (surface.rt_surface.working_directory) |v| alloc.free(v);
+                    surface.rt_surface.working_directory = alloc.dupeZ(u8, value.pwd) catch null;
+                    surface.rt_surface.notifyOwnerSessionStateChange(.{ .working_directory = true });
                 },
             },
 
@@ -427,8 +456,11 @@ pub const Surface = struct {
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
+    working_directory: ?[:0]const u8 = null,
     data_callback: ?SurfaceDataCallback = null,
     data_callback_userdata: ?*anyopaque = null,
+    session_state_callback: ?SessionStateCallback = null,
+    session_state_userdata: ?*anyopaque = null,
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -499,6 +531,7 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
+                self.working_directory = app.core_app.alloc.dupeZ(u8, wd) catch null;
                 var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
                     log.warn(
                         "error opening requested working directory dir={s} err={}",
@@ -609,6 +642,7 @@ pub const Surface = struct {
 
         // Free our title
         if (self.title) |v| self.app.core_app.alloc.free(v);
+        if (self.working_directory) |v| self.app.core_app.alloc.free(v);
 
         // Remove ourselves from the list of known surfaces in the app.
         self.app.core_app.deleteSurface(self);
@@ -666,6 +700,15 @@ pub const Surface = struct {
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
         return self.title;
+    }
+
+    pub fn getWorkingDirectory(self: *Surface) ?[:0]const u8 {
+        return self.working_directory;
+    }
+
+    fn notifyOwnerSessionStateChange(self: *Surface, flags: SessionStateFlags) void {
+        const callback = self.session_state_callback orelse return;
+        callback(self.session_state_userdata, flags.bits());
     }
 
     pub fn supportsClipboard(
@@ -1372,6 +1415,18 @@ pub const CAPI = struct {
         surface: *Surface,
         parked_host: SurfaceHost,
         attached_renderer: ?*Renderer = null,
+        state_callback: ?SessionStateCallback = null,
+        state_callback_userdata: ?*anyopaque = null,
+        state_revision: u64 = 0,
+        last_known_foreground_pid: u64 = 0,
+        last_known_surface_size: SurfaceSize = .{
+            .columns = 0,
+            .rows = 0,
+            .width_px = 0,
+            .height_px = 0,
+            .cell_width_px = 0,
+            .cell_height_px = 0,
+        },
 
         pub fn init(self: *Session, app: *App, config: SessionConfig) !void {
             self.* = .{
@@ -1379,12 +1434,30 @@ pub const CAPI = struct {
                 .surface = try app.newSurface(config.surface),
                 .parked_host = config.parked_host,
                 .attached_renderer = null,
+                .state_callback = null,
+                .state_callback_userdata = null,
+                .state_revision = 0,
+                .last_known_foreground_pid = 0,
+                .last_known_surface_size = .{
+                    .columns = 0,
+                    .rows = 0,
+                    .width_px = 0,
+                    .height_px = 0,
+                    .cell_width_px = 0,
+                    .cell_height_px = 0,
+                },
             };
+            self.surface.session_state_callback = surfaceStateCallback;
+            self.surface.session_state_userdata = self;
+            self.last_known_foreground_pid = self.currentForegroundPID();
+            self.last_known_surface_size = self.currentSurfaceSize();
         }
 
         pub fn deinit(self: *Session) void {
             if (self.attached_renderer) |attached_renderer| attached_renderer.attached_session = null;
             self.attached_renderer = null;
+            self.surface.session_state_callback = null;
+            self.surface.session_state_userdata = null;
             self.app.closeSurface(self.surface);
         }
 
@@ -1406,6 +1479,64 @@ pub const CAPI = struct {
             try self.surface.setHost(self.parked_host);
             if (self.attached_renderer) |attached_renderer| attached_renderer.attached_session = null;
             self.attached_renderer = null;
+        }
+
+        fn currentForegroundPID(self: *const Session) u64 {
+            return self.surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
+        }
+
+        fn currentSurfaceSize(self: *const Session) SurfaceSize {
+            const grid_size = self.surface.core_surface.size.grid();
+            return .{
+                .columns = grid_size.columns,
+                .rows = grid_size.rows,
+                .width_px = self.surface.core_surface.size.screen.width,
+                .height_px = self.surface.core_surface.size.screen.height,
+                .cell_width_px = self.surface.core_surface.size.cell.width,
+                .cell_height_px = self.surface.core_surface.size.cell.height,
+            };
+        }
+
+        pub fn setStateCallback(
+            self: *Session,
+            callback: ?SessionStateCallback,
+            userdata: ?*anyopaque,
+        ) void {
+            self.state_callback = callback;
+            self.state_callback_userdata = userdata;
+        }
+
+        pub fn notifyStateChange(self: *Session, flags: SessionStateFlags) void {
+            if (flags.bits() == 0) return;
+            self.state_revision +%= 1;
+            const callback = self.state_callback orelse return;
+            callback(self.state_callback_userdata, flags.bits());
+        }
+
+        fn notifyForegroundProcessIfChanged(self: *Session) SessionStateFlags {
+            const current = self.currentForegroundPID();
+            if (current == self.last_known_foreground_pid) return .{};
+            self.last_known_foreground_pid = current;
+            return .{ .foreground_process = true };
+        }
+
+        fn notifySizeIfChanged(self: *Session) SessionStateFlags {
+            const current = self.currentSurfaceSize();
+            if (std.meta.eql(current, self.last_known_surface_size)) return .{};
+            self.last_known_surface_size = current;
+            return .{ .size = true };
+        }
+
+        fn notifyScreenMutation(self: *Session) void {
+            var flags: SessionStateFlags = .{ .screen = true };
+            flags = flags.unionWith(self.notifyForegroundProcessIfChanged());
+            self.notifyStateChange(flags);
+        }
+
+        fn surfaceStateCallback(userdata: ?*anyopaque, flags_raw: u32) callconv(.c) void {
+            const ptr = userdata orelse return;
+            const session: *Session = @ptrCast(@alignCast(ptr));
+            session.notifyStateChange(@bitCast(flags_raw));
         }
     };
 
@@ -2015,10 +2146,12 @@ pub const CAPI = struct {
 
     export fn ghostty_session_refresh(session: *Session) void {
         session.surface.refresh();
+        session.notifyStateChange(session.notifyForegroundProcessIfChanged());
     }
 
     export fn ghostty_session_set_content_scale(session: *Session, x: f64, y: f64) void {
         session.surface.updateContentScale(x, y);
+        session.notifyStateChange(session.notifySizeIfChanged());
     }
 
     export fn ghostty_session_set_focus(session: *Session, focused: bool) void {
@@ -2031,6 +2164,23 @@ pub const CAPI = struct {
 
     export fn ghostty_session_set_size(session: *Session, w: u32, h: u32) void {
         session.surface.updateSize(w, h);
+        var flags = session.notifySizeIfChanged();
+        flags = flags.unionWith(.{ .screen = true });
+        flags = flags.unionWith(session.notifyForegroundProcessIfChanged());
+        session.notifyStateChange(flags);
+    }
+
+    export fn ghostty_session_set_font_size(session: *Session, points: f32) void {
+        if (points <= 0) return;
+
+        var font_size = session.surface.core_surface.font_size;
+        font_size.points = points;
+        session.surface.core_surface.setFontSize(font_size) catch |err| {
+            log.err("error setting session font size err={}", .{err});
+        };
+        var flags = session.notifySizeIfChanged();
+        flags = flags.unionWith(.{ .screen = true });
+        session.notifyStateChange(flags);
     }
 
     export fn ghostty_session_size(session: *Session) SurfaceSize {
@@ -2041,8 +2191,51 @@ pub const CAPI = struct {
         return ghostty_surface_foreground_pid(session.surface);
     }
 
+    export fn ghostty_session_state_revision(session: *Session) u64 {
+        return session.state_revision;
+    }
+
     export fn ghostty_session_tty_name(session: *Session) String {
         return ghostty_surface_tty_name(session.surface);
+    }
+
+    export fn ghostty_session_title(session: *Session) String {
+        const title = session.surface.getTitle() orelse return .empty;
+        const copy = session.app.core_app.alloc.dupeZ(u8, title) catch |err| {
+            log.err("error allocating session title err={}", .{err});
+            return .empty;
+        };
+        return .fromSlice(copy);
+    }
+
+    export fn ghostty_session_working_directory(session: *Session) String {
+        if (session.surface.getWorkingDirectory()) |working_directory| {
+            const copy = session.app.core_app.alloc.dupeZ(u8, working_directory) catch |err| {
+                log.err("error allocating session working directory err={}", .{err});
+                return .empty;
+            };
+            return .fromSlice(copy);
+        }
+
+        const cwd = session.surface.core_surface.pwd(session.app.core_app.alloc) catch |err| {
+            log.err("error resolving session working directory err={}", .{err});
+            return .empty;
+        } orelse return .empty;
+        defer session.app.core_app.alloc.free(cwd);
+
+        const copy = session.app.core_app.alloc.dupeZ(u8, cwd) catch |err| {
+            log.err("error allocating session working directory copy err={}", .{err});
+            return .empty;
+        };
+        return .fromSlice(copy);
+    }
+
+    export fn ghostty_session_set_state_callback(
+        session: *Session,
+        callback: ?SessionStateCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        session.setStateCallback(callback, userdata);
     }
 
     export fn ghostty_session_set_data_callback(
@@ -2060,6 +2253,7 @@ pub const CAPI = struct {
     ) void {
         const slice = ptr orelse return;
         session.surface.core_surface.io.processOutput(slice[0..len]);
+        session.notifyScreenMutation();
     }
 
     export fn ghostty_session_send_input_raw(
@@ -2068,6 +2262,7 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         ghostty_surface_send_input_raw(session.surface, ptr, len);
+        session.notifyStateChange(session.notifyForegroundProcessIfChanged());
     }
 
     export fn ghostty_session_export_snapshot(

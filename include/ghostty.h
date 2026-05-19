@@ -501,6 +501,16 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+typedef enum {
+  GHOSTTY_SESSION_STATE_SCREEN = 1u << 0,
+  GHOSTTY_SESSION_STATE_TITLE = 1u << 1,
+  GHOSTTY_SESSION_STATE_WORKING_DIRECTORY = 1u << 2,
+  GHOSTTY_SESSION_STATE_FOREGROUND_PROCESS = 1u << 3,
+  GHOSTTY_SESSION_STATE_SIZE = 1u << 4,
+} ghostty_session_state_flag_e;
+
+typedef uint32_t ghostty_session_state_flags_t;
+
 typedef struct {
   uint32_t codepoint;
   uint32_t foreground_rgb;
@@ -1047,6 +1057,7 @@ typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
 typedef void (*ghostty_surface_data_cb)(void*, const uint8_t*, uintptr_t);
+typedef void (*ghostty_session_state_cb)(void*, ghostty_session_state_flags_t);
 
 typedef struct {
   void* userdata;
@@ -1214,9 +1225,16 @@ GHOSTTY_API void ghostty_session_set_content_scale(ghostty_session_t, double, do
 GHOSTTY_API void ghostty_session_set_focus(ghostty_session_t, bool);
 GHOSTTY_API void ghostty_session_set_occlusion(ghostty_session_t, bool);
 GHOSTTY_API void ghostty_session_set_size(ghostty_session_t, uint32_t, uint32_t);
+GHOSTTY_API void ghostty_session_set_font_size(ghostty_session_t, float);
 GHOSTTY_API ghostty_surface_size_s ghostty_session_size(ghostty_session_t);
 GHOSTTY_API uint64_t ghostty_session_foreground_pid(ghostty_session_t);
+GHOSTTY_API uint64_t ghostty_session_state_revision(ghostty_session_t);
 GHOSTTY_API ghostty_string_s ghostty_session_tty_name(ghostty_session_t);
+GHOSTTY_API ghostty_string_s ghostty_session_title(ghostty_session_t);
+GHOSTTY_API ghostty_string_s ghostty_session_working_directory(ghostty_session_t);
+GHOSTTY_API void ghostty_session_set_state_callback(ghostty_session_t,
+                                                       ghostty_session_state_cb,
+                                                       void*);
 GHOSTTY_API void ghostty_session_set_data_callback(ghostty_session_t,
                                                       ghostty_surface_data_cb,
                                                       void*);

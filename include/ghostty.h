@@ -1229,6 +1229,7 @@ GHOSTTY_API void ghostty_session_set_font_size(ghostty_session_t, float);
 GHOSTTY_API ghostty_surface_size_s ghostty_session_size(ghostty_session_t);
 GHOSTTY_API uint64_t ghostty_session_foreground_pid(ghostty_session_t);
 GHOSTTY_API uint64_t ghostty_session_state_revision(ghostty_session_t);
+GHOSTTY_API ghostty_session_state_flags_t ghostty_session_take_pending_state_flags(ghostty_session_t);
 GHOSTTY_API ghostty_string_s ghostty_session_tty_name(ghostty_session_t);
 GHOSTTY_API ghostty_string_s ghostty_session_title(ghostty_session_t);
 GHOSTTY_API ghostty_string_s ghostty_session_working_directory(ghostty_session_t);

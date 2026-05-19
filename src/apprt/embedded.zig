@@ -1418,6 +1418,7 @@ pub const CAPI = struct {
         state_callback: ?SessionStateCallback = null,
         state_callback_userdata: ?*anyopaque = null,
         state_revision: u64 = 0,
+        pending_state_flags: SessionStateFlags = .{},
         last_known_foreground_pid: u64 = 0,
         last_known_surface_size: SurfaceSize = .{
             .columns = 0,
@@ -1437,6 +1438,7 @@ pub const CAPI = struct {
                 .state_callback = null,
                 .state_callback_userdata = null,
                 .state_revision = 0,
+                .pending_state_flags = .{},
                 .last_known_foreground_pid = 0,
                 .last_known_surface_size = .{
                     .columns = 0,
@@ -1509,8 +1511,15 @@ pub const CAPI = struct {
         pub fn notifyStateChange(self: *Session, flags: SessionStateFlags) void {
             if (flags.bits() == 0) return;
             self.state_revision +%= 1;
+            self.pending_state_flags = self.pending_state_flags.unionWith(flags);
             const callback = self.state_callback orelse return;
             callback(self.state_callback_userdata, flags.bits());
+        }
+
+        pub fn takePendingStateFlags(self: *Session) SessionStateFlags {
+            const pending = self.pending_state_flags;
+            self.pending_state_flags = .{};
+            return pending;
         }
 
         fn notifyForegroundProcessIfChanged(self: *Session) SessionStateFlags {
@@ -2193,6 +2202,10 @@ pub const CAPI = struct {
 
     export fn ghostty_session_state_revision(session: *Session) u64 {
         return session.state_revision;
+    }
+
+    export fn ghostty_session_take_pending_state_flags(session: *Session) u32 {
+        return session.takePendingStateFlags().bits();
     }
 
     export fn ghostty_session_tty_name(session: *Session) String {

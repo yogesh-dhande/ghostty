@@ -58,6 +58,8 @@ typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
+typedef void* ghostty_session_t;
+typedef void* ghostty_renderer_t;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -480,6 +482,17 @@ typedef struct {
 } ghostty_surface_config_s;
 
 typedef struct {
+  ghostty_platform_e platform_tag;
+  ghostty_platform_u platform;
+  double scale_factor;
+} ghostty_surface_host_s;
+
+typedef struct {
+  ghostty_surface_config_s surface;
+  ghostty_surface_host_s parked_host;
+} ghostty_session_config_s;
+
+typedef struct {
   uint16_t columns;
   uint16_t rows;
   uint32_t width_px;
@@ -487,6 +500,25 @@ typedef struct {
   uint32_t cell_width_px;
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
+
+typedef struct {
+  uint32_t codepoint;
+  uint32_t foreground_rgb;
+  uint32_t background_rgb;
+  uint16_t flags;
+} ghostty_terminal_snapshot_cell_s;
+
+typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+  uint16_t cursor_column;
+  uint16_t cursor_row;
+  bool cursor_visible;
+  uint32_t default_foreground_rgb;
+  uint32_t default_background_rgb;
+  size_t cell_count;
+  ghostty_terminal_snapshot_cell_s* cells;
+} ghostty_terminal_snapshot_s;
 
 // Config types
 
@@ -1114,6 +1146,8 @@ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, do
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+GHOSTTY_API bool ghostty_surface_set_host(ghostty_surface_t,
+                                             const ghostty_surface_host_s*);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
@@ -1167,9 +1201,46 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_export_snapshot(ghostty_surface_t,
+                                                    ghostty_terminal_snapshot_s*);
+
+GHOSTTY_API ghostty_session_config_s ghostty_session_config_new();
+GHOSTTY_API ghostty_session_t ghostty_session_new(ghostty_app_t,
+                                                     const ghostty_session_config_s*);
+GHOSTTY_API void ghostty_session_free(ghostty_session_t);
+GHOSTTY_API ghostty_surface_t ghostty_session_surface(ghostty_session_t);
+GHOSTTY_API void ghostty_session_refresh(ghostty_session_t);
+GHOSTTY_API void ghostty_session_set_content_scale(ghostty_session_t, double, double);
+GHOSTTY_API void ghostty_session_set_focus(ghostty_session_t, bool);
+GHOSTTY_API void ghostty_session_set_occlusion(ghostty_session_t, bool);
+GHOSTTY_API void ghostty_session_set_size(ghostty_session_t, uint32_t, uint32_t);
+GHOSTTY_API ghostty_surface_size_s ghostty_session_size(ghostty_session_t);
+GHOSTTY_API uint64_t ghostty_session_foreground_pid(ghostty_session_t);
+GHOSTTY_API ghostty_string_s ghostty_session_tty_name(ghostty_session_t);
+GHOSTTY_API void ghostty_session_set_data_callback(ghostty_session_t,
+                                                      ghostty_surface_data_cb,
+                                                      void*);
+GHOSTTY_API void ghostty_session_process_output(ghostty_session_t,
+                                                   const uint8_t*,
+                                                   uintptr_t);
+GHOSTTY_API void ghostty_session_send_input_raw(ghostty_session_t,
+                                                   const uint8_t*,
+                                                   uintptr_t);
+GHOSTTY_API bool ghostty_session_export_snapshot(ghostty_session_t,
+                                                    ghostty_terminal_snapshot_s*);
+
+GHOSTTY_API ghostty_renderer_t ghostty_renderer_new(const ghostty_surface_host_s*);
+GHOSTTY_API void ghostty_renderer_free(ghostty_renderer_t);
+GHOSTTY_API bool ghostty_renderer_attach(ghostty_renderer_t, ghostty_session_t);
+GHOSTTY_API bool ghostty_renderer_detach(ghostty_renderer_t);
+GHOSTTY_API bool ghostty_renderer_set_host(ghostty_renderer_t,
+                                              const ghostty_surface_host_s*);
+GHOSTTY_API ghostty_session_t ghostty_renderer_session(ghostty_renderer_t);
+GHOSTTY_API void ghostty_terminal_snapshot_free(ghostty_terminal_snapshot_s*);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
+GHOSTTY_API void ghostty_session_set_display_id(ghostty_session_t, uint32_t);
 GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif

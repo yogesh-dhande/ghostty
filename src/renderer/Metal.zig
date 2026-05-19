@@ -39,6 +39,7 @@ pub const swap_chain_count = 3;
 const log = std.log.scoped(.metal);
 
 layer: IOSurfaceLayer,
+view: objc.Object,
 
 /// MTLDevice
 device: objc.Object,
@@ -60,6 +61,12 @@ max_texture_size: u32,
 
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
+display_callback_renderer: ?*align(1) Renderer = null,
+
+const ViewInfo = struct {
+    view: objc.Object,
+    scaleFactor: f64,
+};
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     comptime switch (builtin.os.tag) {
@@ -87,23 +94,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
         .{ default_storage_mode, max_texture_size },
     );
 
-    const ViewInfo = struct {
-        view: objc.Object,
-        scaleFactor: f64,
-    };
-
     // Get the metadata about our underlying view that we'll be rendering to.
-    const info: ViewInfo = switch (apprt.runtime) {
-        apprt.embedded => .{
-            .scaleFactor = @floatCast(opts.rt_surface.content_scale.x),
-            .view = switch (opts.rt_surface.platform) {
-                .macos => |v| v.nsview,
-                .ios => |v| v.uiview,
-            },
-        },
-
-        else => @compileError("unsupported apprt for metal"),
-    };
+    const info = viewInfo(opts.rt_surface);
 
     // Create an IOSurfaceLayer which we can assign to the view to make
     // it in to a "layer-hosting view", so that we can manually control
@@ -111,42 +103,11 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     var layer = try IOSurfaceLayer.init();
     errdefer layer.release();
 
-    // Add our layer to the view.
-    //
-    // On macOS we do this by making the view "layer-hosting"
-    // by assigning it to the view's `layer` property BEFORE
-    // setting `wantsLayer` to `true`.
-    //
-    // On iOS, views are always layer-backed, and `layer`
-    // is readonly, so instead we add it as a sublayer.
-    switch (comptime builtin.os.tag) {
-        .macos => {
-            info.view.setProperty("layer", layer.layer.value);
-            info.view.setProperty("wantsLayer", true);
-        },
-
-        .ios => {
-            const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
-            view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
-        },
-
-        else => @compileError("unsupported target for Metal"),
-    }
-
-    // Ensure that if our layer is oversized it
-    // does not overflow the bounds of the view.
-    info.view.setProperty("clipsToBounds", true);
-
-    // Ensure that our layer has a content scale set to
-    // match the scale factor of the window. This avoids
-    // magnification issues leading to blurry rendering.
-    layer.layer.setProperty("contentsScale", info.scaleFactor);
-
-    // This makes it so that our display callback will actually be called.
-    layer.layer.setProperty("needsDisplayOnBoundsChange", true);
+    attachLayer(info.view, &layer, info.scaleFactor);
 
     return .{
         .layer = layer,
+        .view = info.view,
         .device = device,
         .queue = queue,
         .blending = opts.config.blending,
@@ -156,6 +117,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
 }
 
 pub fn deinit(self: *Metal) void {
+    self.display_callback_renderer = null;
+    self.layer.setDisplayCallback(null, null);
     self.queue.release();
     self.device.release();
     self.layer.release();
@@ -163,10 +126,30 @@ pub fn deinit(self: *Metal) void {
 
 pub fn loopEnter(self: *Metal) void {
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    self.display_callback_renderer = renderer;
     self.layer.setDisplayCallback(
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
+}
+
+pub fn rebindSurface(self: *Metal, surface: *apprt.Surface) !void {
+    const info = viewInfo(surface);
+    self.layer.setDisplayCallback(null, null);
+    detachLayer(self.view, self.layer);
+    var layer = try IOSurfaceLayer.init();
+    errdefer layer.release();
+    attachLayer(info.view, &layer, info.scaleFactor);
+    if (self.display_callback_renderer) |renderer| {
+        layer.setDisplayCallback(
+            @ptrCast(&displayCallback),
+            @ptrCast(renderer),
+        );
+    }
+
+    self.layer.release();
+    self.layer = layer;
+    self.view = info.view;
 }
 
 fn displayCallback(renderer: *Renderer) align(8) void {
@@ -255,6 +238,55 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         self.layer.setSurfaceSync(target.surface);
     } else {
         try self.layer.setSurface(target.surface);
+    }
+}
+
+fn viewInfo(surface: *apprt.Surface) ViewInfo {
+    return switch (apprt.runtime) {
+        apprt.embedded => .{
+            .scaleFactor = @floatCast(surface.content_scale.x),
+            .view = switch (surface.platform) {
+                .macos => |v| v.nsview,
+                .ios => |v| v.uiview,
+            },
+        },
+
+        else => @compileError("unsupported apprt for metal"),
+    };
+}
+
+fn attachLayer(view: objc.Object, layer: *IOSurfaceLayer, scale_factor: f64) void {
+    switch (comptime builtin.os.tag) {
+        .macos => {
+            view.setProperty("layer", layer.layer.value);
+            view.setProperty("wantsLayer", true);
+        },
+
+        .ios => {
+            const view_layer = objc.Object.fromId(view.getProperty(?*anyopaque, "layer"));
+            view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
+        },
+
+        else => @compileError("unsupported target for Metal"),
+    }
+
+    view.setProperty("clipsToBounds", true);
+    layer.layer.setProperty("contentsScale", scale_factor);
+    layer.layer.setProperty("needsDisplayOnBoundsChange", true);
+}
+
+fn detachLayer(view: objc.Object, layer: IOSurfaceLayer) void {
+    switch (comptime builtin.os.tag) {
+        .macos => {
+            view.msgSend(void, objc.sel("setLayer:"), .{@as(objc.c.id, null)});
+            view.setProperty("wantsLayer", false);
+        },
+
+        .ios => {
+            layer.layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
+        },
+
+        else => @compileError("unsupported target for Metal"),
     }
 }
 

@@ -408,6 +408,12 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+pub const SurfaceHost = extern struct {
+    platform_tag: c_int = 0,
+    platform: Platform.C = undefined,
+    scale_factor: f64 = 1,
+};
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -813,6 +819,16 @@ pub const Surface = struct {
             log.err("error in size callback err={}", .{err});
             return;
         };
+    }
+
+    pub fn setHost(self: *Surface, host: SurfaceHost) !void {
+        const scale_factor = @max(1, if (std.math.isNan(host.scale_factor)) 1 else host.scale_factor);
+        self.platform = try .init(host.platform_tag, host.platform);
+        self.content_scale = .{
+            .x = @floatCast(scale_factor),
+            .y = @floatCast(scale_factor),
+        };
+        try self.core_surface.rebindRendererHost(self);
     }
 
     pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) void {
@@ -1308,6 +1324,108 @@ pub const CAPI = struct {
         }
     };
 
+    const SnapshotFlags = struct {
+        const bold: u16 = 1 << 0;
+        const italic: u16 = 1 << 1;
+        const faint: u16 = 1 << 2;
+        const inverse: u16 = 1 << 4;
+        const invisible: u16 = 1 << 5;
+        const strikethrough: u16 = 1 << 6;
+        const underline: u16 = 1 << 7;
+        const spacer: u16 = 1 << 10;
+    };
+
+    const SessionConfig = extern struct {
+        surface: Surface.Options = .{},
+        parked_host: SurfaceHost = .{},
+    };
+
+    const SnapshotCell = extern struct {
+        codepoint: u32 = 0,
+        foreground_rgb: u32 = 0,
+        background_rgb: u32 = 0,
+        flags: u16 = 0,
+    };
+
+    const Snapshot = extern struct {
+        columns: u16 = 0,
+        rows: u16 = 0,
+        cursor_column: u16 = 0,
+        cursor_row: u16 = 0,
+        cursor_visible: bool = false,
+        default_foreground_rgb: u32 = 0,
+        default_background_rgb: u32 = 0,
+        cell_count: usize = 0,
+        cells: ?[*]SnapshotCell = null,
+
+        pub fn deinit(self: *Snapshot) void {
+            if (self.cells) |ptr| {
+                global.alloc.free(ptr[0..self.cell_count]);
+                self.cells = null;
+            }
+            self.cell_count = 0;
+        }
+    };
+
+    const Session = struct {
+        app: *App,
+        surface: *Surface,
+        parked_host: SurfaceHost,
+        attached_renderer: ?*Renderer = null,
+
+        pub fn init(self: *Session, app: *App, config: SessionConfig) !void {
+            self.* = .{
+                .app = app,
+                .surface = try app.newSurface(config.surface),
+                .parked_host = config.parked_host,
+                .attached_renderer = null,
+            };
+        }
+
+        pub fn deinit(self: *Session) void {
+            if (self.attached_renderer) |attached_renderer| attached_renderer.attached_session = null;
+            self.attached_renderer = null;
+            self.app.closeSurface(self.surface);
+        }
+
+        pub fn attachRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session) |existing_session| {
+                if (existing_session != self) try renderer_handle.detach();
+            }
+
+            if (self.attached_renderer) |existing_renderer| {
+                if (existing_renderer != renderer_handle) existing_renderer.attached_session = null;
+            }
+
+            try self.surface.setHost(renderer_handle.host);
+            self.attached_renderer = renderer_handle;
+            renderer_handle.attached_session = self;
+        }
+
+        pub fn detachRenderer(self: *Session) !void {
+            try self.surface.setHost(self.parked_host);
+            if (self.attached_renderer) |attached_renderer| attached_renderer.attached_session = null;
+            self.attached_renderer = null;
+        }
+    };
+
+    const Renderer = struct {
+        host: SurfaceHost,
+        attached_session: ?*Session = null,
+
+        pub fn detach(self: *Renderer) !void {
+            const session = self.attached_session orelse return;
+            try session.detachRenderer();
+        }
+
+        pub fn setHost(self: *Renderer, host: SurfaceHost) !void {
+            self.host = host;
+            if (self.attached_session) |session| {
+                try session.surface.setHost(host);
+            }
+        }
+    };
+
     // ghostty_point_s
     const Point = extern struct {
         tag: Tag,
@@ -1680,8 +1798,128 @@ pub const CAPI = struct {
         return true;
     }
 
+    fn packRGB(rgb: terminal.color.RGB) u32 {
+        return (@as(u32, rgb.r) << 16) |
+            (@as(u32, rgb.g) << 8) |
+            @as(u32, rgb.b);
+    }
+
+    fn snapshotFlagsForCell(
+        raw: terminal.Cell,
+        style: terminal.Style,
+    ) u16 {
+        var flags: u16 = 0;
+        if (style.flags.bold) flags |= SnapshotFlags.bold;
+        if (style.flags.italic) flags |= SnapshotFlags.italic;
+        if (style.flags.faint) flags |= SnapshotFlags.faint;
+        if (style.flags.inverse) flags |= SnapshotFlags.inverse;
+        if (style.flags.invisible) flags |= SnapshotFlags.invisible;
+        if (style.flags.strikethrough) flags |= SnapshotFlags.strikethrough;
+        if (style.flags.underline != .none) flags |= SnapshotFlags.underline;
+        if (raw.wide == .spacer_head or raw.wide == .spacer_tail) flags |= SnapshotFlags.spacer;
+        return flags;
+    }
+
+    fn exportSnapshotFromSurface(
+        surface: *Surface,
+        result: *Snapshot,
+    ) bool {
+        result.* = .{};
+
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const terminal_state = core_surface.renderer_state.terminal;
+        const screen = terminal_state.screens.active;
+        const previous_terminal_dirty = terminal_state.flags.dirty;
+        const previous_screen_dirty = screen.dirty;
+
+        var render_state: terminal.RenderState = .empty;
+        defer render_state.deinit(global.alloc);
+
+        render_state.update(global.alloc, terminal_state) catch |err| {
+            log.warn("error exporting terminal snapshot err={}", .{err});
+            return false;
+        };
+
+        // Exporting a snapshot consumes terminal dirty state. Force a redraw
+        // on the next render pass so snapshot export cannot hide output.
+        terminal_state.flags.dirty = previous_terminal_dirty;
+        terminal_state.flags.dirty.clear = true;
+        screen.dirty = previous_screen_dirty;
+        screen.dirty.selection = true;
+
+        const columns: u16 = render_state.cols;
+        const rows: u16 = render_state.rows;
+        const cell_count: usize = @as(usize, columns) * @as(usize, rows);
+
+        var copied_cells: []SnapshotCell = if (cell_count > 0)
+            global.alloc.alloc(SnapshotCell, cell_count) catch |err| {
+                log.warn("error allocating snapshot cells err={}", .{err});
+                return false;
+            }
+        else
+            &.{};
+        errdefer if (cell_count > 0) global.alloc.free(copied_cells);
+
+        const row_data = render_state.row_data.slice();
+        const row_cells = row_data.items(.cells);
+        const palette = &render_state.colors.palette;
+        const default_fg = render_state.colors.foreground;
+        const default_bg = render_state.colors.background;
+        var cell_index: usize = 0;
+
+        for (0..rows) |row_index| {
+            const cells_slice = row_cells[row_index].slice();
+            const raws = cells_slice.items(.raw);
+            const styles = cells_slice.items(.style);
+
+            for (0..columns) |column_index| {
+                const raw = raws[column_index];
+                const has_cached_style = raw.hasStyling() or
+                    raw.content_tag == .bg_color_rgb or
+                    raw.content_tag == .bg_color_palette;
+                const style: terminal.Style = if (has_cached_style) styles[column_index] else .{};
+                const foreground = style.fg(.{
+                    .default = default_fg,
+                    .palette = palette,
+                });
+                const background = style.bg(&raw, palette) orelse default_bg;
+                copied_cells[cell_index] = .{
+                    .codepoint = if (raw.hasText()) @intCast(raw.codepoint()) else 0,
+                    .foreground_rgb = packRGB(foreground),
+                    .background_rgb = packRGB(background),
+                    .flags = snapshotFlagsForCell(raw, style),
+                };
+                cell_index += 1;
+            }
+        }
+
+        const cursor = render_state.cursor.viewport;
+        result.* = .{
+            .columns = columns,
+            .rows = rows,
+            .cursor_column = if (cursor) |vp| @intCast(vp.x) else 0,
+            .cursor_row = if (cursor) |vp| @intCast(vp.y) else 0,
+            .cursor_visible = render_state.cursor.visible and cursor != null,
+            .default_foreground_rgb = packRGB(default_fg),
+            .default_background_rgb = packRGB(default_bg),
+            .cell_count = cell_count,
+            .cells = if (cell_count > 0) copied_cells.ptr else null,
+        };
+        return true;
+    }
+
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
+    }
+
+    export fn ghostty_surface_export_snapshot(
+        surface: *Surface,
+        result: *Snapshot,
+    ) bool {
+        return exportSnapshotFromSurface(surface, result);
     }
 
     /// Tell the surface that it needs to schedule a render
@@ -1699,6 +1937,18 @@ pub const CAPI = struct {
     /// to the pty and the renderer.
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
+    }
+
+    /// Rebind the renderer for a live surface to a replacement host view.
+    export fn ghostty_surface_set_host(
+        surface: *Surface,
+        host: *const SurfaceHost,
+    ) bool {
+        surface.setHost(host.*) catch |err| {
+            log.err("error rebinding surface host err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// Return the size information a surface has.
@@ -1729,6 +1979,159 @@ pub const CAPI = struct {
         };
 
         return .fromSlice(copy);
+    }
+
+    export fn ghostty_session_config_new() SessionConfig {
+        return .{
+            .surface = ghostty_surface_config_new(),
+            .parked_host = .{},
+        };
+    }
+
+    export fn ghostty_session_new(
+        app: *App,
+        config: *const SessionConfig,
+    ) ?*Session {
+        const session = global.alloc.create(Session) catch |err| {
+            log.err("error allocating session err={}", .{err});
+            return null;
+        };
+        errdefer global.alloc.destroy(session);
+        session.init(app, config.*) catch |err| {
+            log.err("error initializing session err={}", .{err});
+            return null;
+        };
+        return session;
+    }
+
+    export fn ghostty_session_free(session: *Session) void {
+        session.deinit();
+        global.alloc.destroy(session);
+    }
+
+    export fn ghostty_session_surface(session: *Session) *Surface {
+        return session.surface;
+    }
+
+    export fn ghostty_session_refresh(session: *Session) void {
+        session.surface.refresh();
+    }
+
+    export fn ghostty_session_set_content_scale(session: *Session, x: f64, y: f64) void {
+        session.surface.updateContentScale(x, y);
+    }
+
+    export fn ghostty_session_set_focus(session: *Session, focused: bool) void {
+        session.surface.focusCallback(focused);
+    }
+
+    export fn ghostty_session_set_occlusion(session: *Session, visible: bool) void {
+        session.surface.occlusionCallback(visible);
+    }
+
+    export fn ghostty_session_set_size(session: *Session, w: u32, h: u32) void {
+        session.surface.updateSize(w, h);
+    }
+
+    export fn ghostty_session_size(session: *Session) SurfaceSize {
+        return ghostty_surface_size(session.surface);
+    }
+
+    export fn ghostty_session_foreground_pid(session: *Session) u64 {
+        return ghostty_surface_foreground_pid(session.surface);
+    }
+
+    export fn ghostty_session_tty_name(session: *Session) String {
+        return ghostty_surface_tty_name(session.surface);
+    }
+
+    export fn ghostty_session_set_data_callback(
+        session: *Session,
+        callback: ?SurfaceDataCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        ghostty_surface_set_data_callback(session.surface, callback, userdata);
+    }
+
+    export fn ghostty_session_process_output(
+        session: *Session,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        const slice = ptr orelse return;
+        session.surface.core_surface.io.processOutput(slice[0..len]);
+    }
+
+    export fn ghostty_session_send_input_raw(
+        session: *Session,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        ghostty_surface_send_input_raw(session.surface, ptr, len);
+    }
+
+    export fn ghostty_session_export_snapshot(
+        session: *Session,
+        result: *Snapshot,
+    ) bool {
+        return exportSnapshotFromSurface(session.surface, result);
+    }
+
+    export fn ghostty_renderer_new(host: *const SurfaceHost) ?*Renderer {
+        const renderer_handle = global.alloc.create(Renderer) catch |err| {
+            log.err("error allocating renderer err={}", .{err});
+            return null;
+        };
+        renderer_handle.* = .{
+            .host = host.*,
+            .attached_session = null,
+        };
+        return renderer_handle;
+    }
+
+    export fn ghostty_renderer_free(renderer_handle: *Renderer) void {
+        renderer_handle.detach() catch |err| {
+            log.err("error detaching renderer during free err={}", .{err});
+        };
+        global.alloc.destroy(renderer_handle);
+    }
+
+    export fn ghostty_renderer_attach(
+        renderer_handle: *Renderer,
+        session: *Session,
+    ) bool {
+        session.attachRenderer(renderer_handle) catch |err| {
+            log.err("error attaching renderer err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_renderer_detach(renderer_handle: *Renderer) bool {
+        renderer_handle.detach() catch |err| {
+            log.err("error detaching renderer err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_renderer_set_host(
+        renderer_handle: *Renderer,
+        host: *const SurfaceHost,
+    ) bool {
+        renderer_handle.setHost(host.*) catch |err| {
+            log.err("error rebinding renderer host err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_renderer_session(renderer_handle: *Renderer) ?*Session {
+        return renderer_handle.attached_session;
+    }
+
+    export fn ghostty_terminal_snapshot_free(snapshot: *Snapshot) void {
+        snapshot.deinit();
     }
 
     /// Update the color scheme of the surface.
@@ -2165,6 +2568,10 @@ pub const CAPI = struct {
                 .{ .forever = {} },
             );
             surface.renderer_thread.wakeup.notify() catch {};
+        }
+
+        export fn ghostty_session_set_display_id(session: *Session, display_id: u32) void {
+            ghostty_surface_set_display_id(session.surface, display_id);
         }
 
         /// This returns a CTFontRef that should be used for quicklook

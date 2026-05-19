@@ -130,6 +130,24 @@ pub fn init(
     state: *rendererpkg.State,
     app_mailbox: App.Mailbox,
 ) !Thread {
+    return initWithDerivedConfig(
+        alloc,
+        .init(config),
+        surface,
+        renderer_impl,
+        state,
+        app_mailbox,
+    );
+}
+
+pub fn initWithDerivedConfig(
+    alloc: Allocator,
+    derived_config: DerivedConfig,
+    surface: *apprt.Surface,
+    renderer_impl: *rendererpkg.Renderer,
+    state: *rendererpkg.State,
+    app_mailbox: App.Mailbox,
+) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
     errdefer loop.deinit();
@@ -164,7 +182,7 @@ pub fn init(
 
     return .{
         .alloc = alloc,
-        .config = .init(config),
+        .config = derived_config,
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,

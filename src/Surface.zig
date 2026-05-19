@@ -845,6 +845,44 @@ pub fn deinit(self: *Surface) void {
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
 }
 
+/// Rebind the renderer to a replacement runtime surface without restarting
+/// the underlying PTY or terminal state.
+pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
+    self.renderer_thread.stop.notify() catch |err|
+        log.err("error notifying renderer thread to stop during rebind err={}", .{err});
+    self.renderer_thr.join();
+
+    // Re-enter the renderer on the calling thread so graphics API state is
+    // safe to mutate while we swap the host surface.
+    self.renderer.threadEnter(self.rt_surface) catch unreachable;
+
+    const thread_config = self.renderer_thread.config;
+    self.renderer_thread.deinit();
+
+    self.rt_surface = rt_surface;
+    try self.renderer.rebindSurface(rt_surface);
+
+    const render_thread = try rendererpkg.Thread.initWithDerivedConfig(
+        self.alloc,
+        thread_config,
+        rt_surface,
+        &self.renderer,
+        &self.renderer_state,
+        .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
+    );
+    self.renderer_thread = render_thread;
+    self.io.setRendererEndpoint(
+        self.renderer_thread.wakeup,
+        self.renderer_thread.mailbox,
+    );
+    self.renderer_thr = try std.Thread.spawn(
+        .{},
+        rendererpkg.Thread.threadMain,
+        .{&self.renderer_thread},
+    );
+    self.renderer_thr.setName("renderer") catch {};
+}
+
 /// Close this surface. This will trigger the runtime to start the
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {

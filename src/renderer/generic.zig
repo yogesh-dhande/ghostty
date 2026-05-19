@@ -893,6 +893,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        pub fn rebindSurface(self: *Self, surface: *apprt.Surface) !void {
+            if (@hasDecl(GraphicsAPI, "rebindSurface")) {
+                try self.api.rebindSurface(surface);
+            }
+        }
+
         /// Called by renderer.Thread when it starts the main loop.
         pub fn loopEnter(self: *Self, thr: *renderer.Thread) !void {
             // If our API has to do things on loop enter, let it.
@@ -1027,7 +1033,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setFocus(self: *Self, focus: bool) !void {
-            assert(self.focused != focus);
+            if (self.focused == focus) return;
 
             self.focused = focus;
 

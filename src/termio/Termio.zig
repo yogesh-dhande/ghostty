@@ -423,6 +423,18 @@ pub inline fn queueWrite(
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
 }
 
+/// Retarget renderer notifications to a replacement renderer thread.
+pub fn setRendererEndpoint(
+    self: *Termio,
+    renderer_wakeup: xev.Async,
+    renderer_mailbox: *renderer.Thread.Mailbox,
+) void {
+    self.renderer_wakeup = renderer_wakeup;
+    self.renderer_mailbox = renderer_mailbox;
+    self.terminal_stream.handler.renderer_wakeup = renderer_wakeup;
+    self.terminal_stream.handler.renderer_mailbox = renderer_mailbox;
+}
+
 /// Update the configuration.
 pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !void {
     // The remainder of this function is modifying terminal state or

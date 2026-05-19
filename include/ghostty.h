@@ -1251,10 +1251,14 @@ GHOSTTY_API bool ghostty_session_export_snapshot(ghostty_session_t,
 GHOSTTY_API ghostty_renderer_t ghostty_renderer_new(const ghostty_surface_host_s*);
 GHOSTTY_API void ghostty_renderer_free(ghostty_renderer_t);
 GHOSTTY_API bool ghostty_renderer_attach(ghostty_renderer_t, ghostty_session_t);
+GHOSTTY_API bool ghostty_renderer_attach_viewer(ghostty_renderer_t,
+                                                   ghostty_session_t);
 GHOSTTY_API bool ghostty_renderer_detach(ghostty_renderer_t);
+GHOSTTY_API bool ghostty_renderer_take_ownership(ghostty_renderer_t);
 GHOSTTY_API bool ghostty_renderer_set_host(ghostty_renderer_t,
                                               const ghostty_surface_host_s*);
 GHOSTTY_API ghostty_session_t ghostty_renderer_session(ghostty_renderer_t);
+GHOSTTY_API bool ghostty_renderer_is_owner(ghostty_renderer_t);
 GHOSTTY_API void ghostty_terminal_snapshot_free(ghostty_terminal_snapshot_s*);
 
 #ifdef __APPLE__

@@ -6,7 +6,7 @@ on:
     - cron: "17 6 * * *"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-main-from-upstream
@@ -20,7 +20,9 @@ jobs:
       - name: Checkout spaces branch
         uses: actions/checkout@v4
         with:
+          ref: spaces
           fetch-depth: 0
+          token: ${{ secrets.SYNC_MAIN_TOKEN }}
 
       - name: Configure git
         run: |

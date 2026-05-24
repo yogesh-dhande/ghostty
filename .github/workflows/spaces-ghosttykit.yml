@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           commit_sha="$(git rev-parse HEAD)"
-          echo "tag=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=ghosttykit-$commit_sha" >> "$GITHUB_OUTPUT"
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
@@ -63,8 +63,9 @@ jobs:
         run: |
           set -euo pipefail
           commit_sha="$(git rev-parse HEAD)"
-          if [[ "$RELEASE_TAG" != "$commit_sha" ]]; then
-            echo "release tag $RELEASE_TAG does not match checked out commit $commit_sha" >&2
+          expected_tag="ghosttykit-$commit_sha"
+          if [[ "$RELEASE_TAG" != "$expected_tag" ]]; then
+            echo "release tag $RELEASE_TAG does not match checked out commit tag $expected_tag" >&2
             exit 1
           fi
 

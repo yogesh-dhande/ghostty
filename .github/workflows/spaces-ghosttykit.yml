@@ -1,40 +1,37 @@
 name: Spaces GhosttyKit
 
 on:
-  schedule:
-    - cron: "17 9 * * *"
+  push:
+    branches:
+      - spaces
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Optional release tag override"
-        required: false
 
 permissions:
   contents: write
 
+concurrency:
+  group: spaces-ghosttykit-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   build-and-release:
+    if: github.ref == 'refs/heads/spaces'
     runs-on: macos-15
     timeout-minutes: 90
     env:
       ZIG_VERSION: 0.15.2
     steps:
-      - name: Check out spaces branch
+      - name: Check out source commit
         uses: actions/checkout@v4
         with:
-          ref: spaces
           fetch-depth: 0
 
-      - name: Set release tag
+      - name: Set release tag from commit
         id: tag
         run: |
           set -euo pipefail
-          if [[ -n "${{ github.event.inputs.release_tag }}" ]]; then
-            tag="${{ github.event.inputs.release_tag }}"
-          else
-            tag="build-$(date -u +%Y-%m-%d)"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          commit_sha="$(git rev-parse HEAD)"
+          echo "tag=$commit_sha" >> "$GITHUB_OUTPUT"
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
@@ -66,8 +63,23 @@ jobs:
         run: |
           set -euo pipefail
           commit_sha="$(git rev-parse HEAD)"
-          git tag -f "$RELEASE_TAG" "$commit_sha"
-          git push origin "refs/tags/${RELEASE_TAG}" --force
+          if [[ "$RELEASE_TAG" != "$commit_sha" ]]; then
+            echo "release tag $RELEASE_TAG does not match checked out commit $commit_sha" >&2
+            exit 1
+          fi
+
+          remote_tag="$(git ls-remote --tags origin "refs/tags/${RELEASE_TAG}" | awk '{print $1}')"
+          if [[ -n "$remote_tag" ]]; then
+            if [[ "$remote_tag" != "$commit_sha" ]]; then
+              echo "remote release tag $RELEASE_TAG points at $remote_tag, expected $commit_sha" >&2
+              exit 1
+            fi
+            echo "release tag $RELEASE_TAG already exists"
+            exit 0
+          fi
+
+          git tag "$RELEASE_TAG" "$commit_sha"
+          git push origin "refs/tags/${RELEASE_TAG}"
 
       - name: Publish or update release
         env:
@@ -80,7 +92,7 @@ jobs:
           {
             echo "Spaces GhosttyKit build"
             echo
-            echo "- source branch: spaces"
+            echo "- source branch: ${GITHUB_REF_NAME:-spaces}"
             echo "- fork commit: $(git rev-parse HEAD)"
           } > "$notes_file"
 

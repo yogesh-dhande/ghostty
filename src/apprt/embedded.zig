@@ -15,6 +15,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -25,6 +26,8 @@ const String = @import("../main_c.zig").String;
 const log = std.log.scoped(.embedded_window);
 
 pub const SurfaceDataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const SurfaceReceiveBufferCallback = termio.HostManaged.ReceiveBufferCallback;
+pub const SurfaceReceiveResizeCallback = termio.HostManaged.ReceiveResizeCallback;
 pub const SessionStateCallback = *const fn (?*anyopaque, u32) callconv(.c) void;
 
 pub const SessionStateFlags = packed struct(u32) {
@@ -443,10 +446,19 @@ pub const SurfaceHost = extern struct {
     scale_factor: f64 = 1,
 };
 
+pub const SurfaceIOBackend = enum(c_int) {
+    exec = 0,
+    host_managed = 1,
+};
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
     userdata: ?*anyopaque = null,
+    io_backend: SurfaceIOBackend = .exec,
+    receive_userdata: ?*anyopaque = null,
+    receive_buffer: ?SurfaceReceiveBufferCallback = null,
+    receive_resize: ?SurfaceReceiveResizeCallback = null,
     core_surface: CoreSurface,
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
@@ -471,6 +483,18 @@ pub const Surface = struct {
 
         /// Userdata passed to some of the callbacks.
         userdata: ?*anyopaque = null,
+
+        /// The IO backend for this embedded surface.
+        backend: SurfaceIOBackend = .exec,
+
+        /// Userdata passed to host-managed IO callbacks.
+        receive_userdata: ?*anyopaque = null,
+
+        /// Called when Ghostty wants to send input bytes to the host-owned PTY.
+        receive_buffer: ?SurfaceReceiveBufferCallback = null,
+
+        /// Called when Ghostty's terminal grid size changes.
+        receive_resize: ?SurfaceReceiveResizeCallback = null,
 
         /// The scale factor of the screen.
         scale_factor: f64 = 1,
@@ -501,6 +525,9 @@ pub const Surface = struct {
         /// Wait after the command exits
         wait_after_command: bool = false,
 
+        /// Whether command execution should use the macOS login shell wrapper.
+        use_login_shell: bool = true,
+
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
     };
@@ -510,6 +537,10 @@ pub const Surface = struct {
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
             .userdata = opts.userdata,
+            .io_backend = opts.backend,
+            .receive_userdata = opts.receive_userdata,
+            .receive_buffer = opts.receive_buffer,
+            .receive_resize = opts.receive_resize,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -573,7 +604,9 @@ pub const Surface = struct {
         if (opts.command) |c_command| {
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
-                config.command = .{ .shell = cmd };
+                var command: configpkg.Command = undefined;
+                try command.parseCLI(config.arenaAlloc(), cmd);
+                config.command = command;
                 config.@"wait-after-command" = true;
             }
         }
@@ -616,6 +649,7 @@ pub const Surface = struct {
         if (opts.wait_after_command) {
             config.@"wait-after-command" = true;
         }
+        config.@"macos-use-login-shell" = opts.use_login_shell;
 
         // Initialize our surface right away. We're given a view that is
         // ready to use.
@@ -1041,6 +1075,19 @@ pub const Surface = struct {
         }
 
         return env;
+    }
+
+    pub fn hostManagedTermioConfig(self: *const Surface) ?termio.HostManaged.Config {
+        if (self.io_backend != .host_managed) return null;
+        return .{
+            .userdata = self.receive_userdata,
+            .receive_buffer = self.receive_buffer,
+            .receive_resize = self.receive_resize,
+        };
+    }
+
+    pub fn termioBackend(self: *const Surface) SurfaceIOBackend {
+        return self.io_backend;
     }
 
     /// The cursor position from the host directly is in screen coordinates but
@@ -1907,6 +1954,24 @@ pub const CAPI = struct {
         return surface.app;
     }
 
+    export fn ghostty_surface_write_buffer(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        const slice = ptr orelse return;
+        surface.core_surface.io.processOutput(slice[0..len]);
+    }
+
+    export fn ghostty_surface_process_exit(surface: *Surface, exit_code: i32) void {
+        _ = surface.core_surface.io.surface_mailbox.push(.{
+            .child_exited = .{
+                .exit_code = @intCast(@max(exit_code, 0)),
+                .runtime_ms = 0,
+            },
+        }, .{ .forever = {} });
+    }
+
     /// Returns the config to use for surfaces that inherit from this one.
     export fn ghostty_surface_inherited_config(
         surface: *Surface,
@@ -2092,10 +2157,7 @@ pub const CAPI = struct {
 
             for (0..columns) |column_index| {
                 const raw = raws[column_index];
-                const has_cached_style = raw.hasStyling() or
-                    raw.content_tag == .bg_color_rgb or
-                    raw.content_tag == .bg_color_palette;
-                const style: terminal.Style = if (has_cached_style) styles[column_index] else .{};
+                const style: terminal.Style = if (raw.hasStyling()) styles[column_index] else .{};
                 const foreground = style.fg(.{
                     .default = default_fg,
                     .palette = palette,
@@ -2407,6 +2469,11 @@ pub const CAPI = struct {
             return false;
         };
         return true;
+    }
+
+    export fn ghostty_renderer_surface(renderer_handle: *Renderer) ?*Surface {
+        const session = renderer_handle.attached_session orelse return null;
+        return session.surface;
     }
 
     export fn ghostty_renderer_take_ownership(renderer_handle: *Renderer) bool {

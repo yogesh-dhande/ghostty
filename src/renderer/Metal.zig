@@ -264,6 +264,9 @@ fn attachLayer(view: objc.Object, layer: *IOSurfaceLayer, scale_factor: f64) voi
 
         .ios => {
             const view_layer = objc.Object.fromId(view.getProperty(?*anyopaque, "layer"));
+            const bounds = view_layer.getProperty(graphics.Rect, "bounds");
+            layer.layer.setProperty("frame", bounds);
+            layer.layer.setProperty("autoresizingMask", @as(u32, (1 << 1) | (1 << 4)));
             view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
         },
 

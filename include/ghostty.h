@@ -466,10 +466,22 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+typedef enum {
+  GHOSTTY_SURFACE_IO_BACKEND_EXEC = 0,
+  GHOSTTY_SURFACE_IO_BACKEND_HOST_MANAGED = 1,
+} ghostty_surface_io_backend_e;
+
+typedef void (*ghostty_surface_receive_buffer_cb)(void*, const uint8_t*, size_t);
+typedef void (*ghostty_surface_receive_resize_cb)(void*, uint16_t, uint16_t, uint32_t, uint32_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
   void* userdata;
+  ghostty_surface_io_backend_e backend;
+  void* receive_userdata;
+  ghostty_surface_receive_buffer_cb receive_buffer;
+  ghostty_surface_receive_resize_cb receive_resize;
   double scale_factor;
   float font_size;
   const char* working_directory;
@@ -478,6 +490,7 @@ typedef struct {
   size_t env_var_count;
   const char* initial_input;
   bool wait_after_command;
+  bool use_login_shell;
   ghostty_surface_context_e context;
 } ghostty_surface_config_s;
 
@@ -1160,6 +1173,11 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 GHOSTTY_API bool ghostty_surface_set_host(ghostty_surface_t,
                                              const ghostty_surface_host_s*);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_write_buffer(ghostty_surface_t,
+                                                 const uint8_t*,
+                                                 uintptr_t);
+GHOSTTY_API void ghostty_surface_process_exit(ghostty_surface_t,
+                                                 int32_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
@@ -1254,6 +1272,7 @@ GHOSTTY_API bool ghostty_renderer_attach(ghostty_renderer_t, ghostty_session_t);
 GHOSTTY_API bool ghostty_renderer_attach_viewer(ghostty_renderer_t,
                                                    ghostty_session_t);
 GHOSTTY_API bool ghostty_renderer_detach(ghostty_renderer_t);
+GHOSTTY_API ghostty_surface_t ghostty_renderer_surface(ghostty_renderer_t);
 GHOSTTY_API bool ghostty_renderer_take_ownership(ghostty_renderer_t);
 GHOSTTY_API bool ghostty_renderer_set_host(ghostty_renderer_t,
                                               const ghostty_surface_host_s*);

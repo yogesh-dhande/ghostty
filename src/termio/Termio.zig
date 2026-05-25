@@ -673,7 +673,9 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     }
 
     // Schedule a render. We can call this first because we have the lock.
-    self.terminal_stream.handler.queueRender() catch unreachable;
+    self.terminal_stream.handler.queueRender() catch |err| {
+        log.warn("error queueing render for terminal output err={}", .{err});
+    };
 
     // Whenever a character is typed, we ensure the cursor is in the
     // non-blink state so it is rendered if visible. If we're under

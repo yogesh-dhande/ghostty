@@ -1650,7 +1650,11 @@ pub const CAPI = struct {
         fn surfaceStateCallback(userdata: ?*anyopaque, flags_raw: u32) callconv(.c) void {
             const ptr = userdata orelse return;
             const session: *Session = @ptrCast(@alignCast(ptr));
-            session.notifyStateChange(@bitCast(flags_raw));
+            var flags: SessionStateFlags = @bitCast(flags_raw);
+            if (flags.screen) {
+                flags = flags.unionWith(session.notifyForegroundProcessIfChanged());
+            }
+            session.notifyStateChange(flags);
         }
 
         fn ensureRendererAttached(self: *Session, renderer_handle: *Renderer) !void {

@@ -673,6 +673,10 @@ fn processOutputWithScreenChange(
     buf: []const u8,
     notify_screen_change: bool,
 ) void {
+    if (self.data_callback) |callback| {
+        callback(self.data_callback_userdata, buf.ptr, buf.len);
+    }
+
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();
@@ -686,10 +690,6 @@ fn processOutputLocked(
     buf: []const u8,
     notify_screen_change: bool,
 ) void {
-    if (self.data_callback) |callback| {
-        callback(self.data_callback_userdata, buf.ptr, buf.len);
-    }
-
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch |err| {
         log.warn("error queueing render for terminal output err={}", .{err});

@@ -176,6 +176,12 @@ search: ?Search = null,
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.time.Instant = null,
 
+/// True when a runtime owner needs terminal screen mutation notifications.
+screen_change_notifications_enabled: std.atomic.Value(bool) = .{ .raw = false },
+
+/// Coalesces screen mutation notifications while the app thread catches up.
+screen_change_notification_pending: std.atomic.Value(bool) = .{ .raw = false },
+
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
 /// input can be forwarded to the OS for further processing if it
@@ -621,6 +627,8 @@ pub fn init(
         // Our conditional state is initialized to the app state. This
         // lets us get the most likely correct color theme and so on.
         .config_conditional_state = app.config_conditional_state,
+        .screen_change_notifications_enabled = .{ .raw = false },
+        .screen_change_notification_pending = .{ .raw = false },
     };
 
     // The command we're going to execute
@@ -1188,8 +1196,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
-        .screen_change => if (@hasDecl(apprt.runtime.Surface, "notifyOwnerSessionScreenChange"))
-            self.rt_surface.notifyOwnerSessionScreenChange(),
+        .screen_change => self.flushScreenChangeNotification(),
 
         .progress_report => |v| {
             _ = self.rt_app.performAction(
@@ -1306,7 +1313,11 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
             .exec => false,
             .host_managed => true,
         };
-        if (is_host_managed and info.exit_code == 0) break :runtime;
+
+        // Host-managed processes are launched and timed by the embedder. The
+        // process-exit API may not have launch timing, so don't classify these
+        // exits as Ghostty launch failures based on runtime_ms.
+        if (is_host_managed) break :runtime;
 
         // On macOS, our exit code detection doesn't work, possibly
         // because of our `login` wrapper. More investigation required.
@@ -1379,6 +1390,32 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // If we aren't waiting after the command, then we exit immediately
     // with no confirmation.
     self.close();
+}
+
+/// Enable or disable terminal screen mutation notifications for runtime
+/// owners that maintain session state outside core Surface.
+pub fn setScreenChangeNotificationsEnabled(self: *Surface, enabled: bool) void {
+    self.screen_change_notifications_enabled.store(enabled, .monotonic);
+    if (!enabled) {
+        self.screen_change_notification_pending.store(false, .monotonic);
+    }
+}
+
+/// Mark that a screen-change notification should be delivered. Returns true
+/// only for the transition from no pending notification to pending.
+pub fn queueScreenChangeNotification(self: *Surface) bool {
+    if (!self.screen_change_notifications_enabled.load(.monotonic)) return false;
+    return !self.screen_change_notification_pending.swap(true, .monotonic);
+}
+
+/// Deliver a pending screen-change notification on the app thread.
+pub fn flushScreenChangeNotification(self: *Surface) void {
+    if (!self.screen_change_notification_pending.swap(false, .monotonic)) return;
+    if (!self.screen_change_notifications_enabled.load(.monotonic)) return;
+
+    if (comptime @hasDecl(apprt.runtime.Surface, "notifyOwnerSessionScreenChange")) {
+        self.rt_surface.notifyOwnerSessionScreenChange();
+    }
 }
 
 /// Called when the child process exited abnormally.

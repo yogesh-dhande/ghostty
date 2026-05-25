@@ -745,6 +745,16 @@ pub const Surface = struct {
         callback(self.session_state_userdata, flags.bits());
     }
 
+    fn setSessionStateCallback(
+        self: *Surface,
+        callback: ?SessionStateCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        self.session_state_callback = callback;
+        self.session_state_userdata = userdata;
+        self.core_surface.setScreenChangeNotificationsEnabled(callback != null);
+    }
+
     pub fn notifyOwnerSessionScreenChange(self: *Surface) void {
         self.notifyOwnerSessionStateChange(.{ .screen = true });
     }
@@ -910,6 +920,7 @@ pub const Surface = struct {
             .y = @floatCast(scale_factor),
         };
         try self.core_surface.rebindRendererHost(self);
+        self.updateContentScale(scale_factor, scale_factor);
     }
 
     pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) void {
@@ -1502,8 +1513,7 @@ pub const CAPI = struct {
                     .cell_height_px = 0,
                 },
             };
-            self.surface.session_state_callback = surfaceStateCallback;
-            self.surface.session_state_userdata = self;
+            self.surface.setSessionStateCallback(surfaceStateCallback, self);
             self.last_known_foreground_pid = self.currentForegroundPID();
             self.last_known_surface_size = self.currentSurfaceSize();
         }
@@ -1515,8 +1525,7 @@ pub const CAPI = struct {
             }
             self.renderers.deinit(global.alloc);
             self.owner_renderer = null;
-            self.surface.session_state_callback = null;
-            self.surface.session_state_userdata = null;
+            self.surface.setSessionStateCallback(null, null);
             self.app.closeSurface(self.surface);
         }
 
@@ -1558,6 +1567,7 @@ pub const CAPI = struct {
             }
 
             try self.surface.setHost(renderer_handle.host);
+            self.notifyStateChange(self.notifySizeIfChanged());
             self.owner_renderer = renderer_handle;
             renderer_handle.role = .owner;
         }
@@ -1567,6 +1577,7 @@ pub const CAPI = struct {
 
             if (self.owner_renderer == renderer_handle) {
                 try self.surface.setHost(self.parked_host);
+                self.notifyStateChange(self.notifySizeIfChanged());
                 self.owner_renderer = null;
             }
 
@@ -1684,6 +1695,7 @@ pub const CAPI = struct {
             if (self.attached_session) |session| {
                 if (self.role != .owner) return;
                 try session.surface.setHost(host);
+                session.notifyStateChange(session.notifySizeIfChanged());
             }
         }
 
@@ -2406,7 +2418,7 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         const slice = ptr orelse return;
-        session.surface.core_surface.io.processOutput(slice[0..len]);
+        session.surface.core_surface.io.processOutputNoScreenChange(slice[0..len]);
         session.notifyScreenMutation();
     }
 

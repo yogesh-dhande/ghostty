@@ -659,15 +659,33 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
+    self.processOutputWithScreenChange(buf, true);
+}
+
+/// Process output without queueing an app-thread screen-change notification.
+/// Callers use this when they report the session mutation synchronously.
+pub fn processOutputNoScreenChange(self: *Termio, buf: []const u8) void {
+    self.processOutputWithScreenChange(buf, false);
+}
+
+fn processOutputWithScreenChange(
+    self: *Termio,
+    buf: []const u8,
+    notify_screen_change: bool,
+) void {
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    self.processOutputLocked(buf);
+    self.processOutputLocked(buf, notify_screen_change);
 }
 
 /// Process output from readdata but the lock is already held.
-fn processOutputLocked(self: *Termio, buf: []const u8) void {
+fn processOutputLocked(
+    self: *Termio,
+    buf: []const u8,
+    notify_screen_change: bool,
+) void {
     if (self.data_callback) |callback| {
         callback(self.data_callback_userdata, buf.ptr, buf.len);
     }
@@ -723,11 +741,18 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.mailbox.notify();
     }
 
-    if (self.surface_mailbox.push(.screen_change, .{ .instant = {} }) == 0) {
-        self.renderer_state.mutex.unlock();
-        defer self.renderer_state.mutex.lock();
-        _ = self.surface_mailbox.push(.screen_change, .{ .forever = {} });
-    }
+    if (notify_screen_change) self.notifyScreenChange();
+}
+
+fn notifyScreenChange(self: *Termio) void {
+    if (comptime !@hasDecl(apprt.runtime.Surface, "notifyOwnerSessionScreenChange")) return;
+    if (!self.surface_mailbox.surface.queueScreenChangeNotification()) return;
+
+    // This is a coalesced hint for session state consumers. If the app
+    // mailbox is full, the failed push still wakes the app thread and
+    // App.drainMailbox will flush the pending notification without blocking
+    // the IO thread.
+    _ = self.surface_mailbox.push(.screen_change, .{ .instant = {} });
 }
 
 /// Sends a DSR response for the current color scheme to the pty.

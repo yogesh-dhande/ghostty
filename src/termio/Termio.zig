@@ -722,6 +722,12 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.handler.termio_messaged = false;
         self.mailbox.notify();
     }
+
+    if (self.surface_mailbox.push(.screen_change, .{ .instant = {} }) == 0) {
+        self.renderer_state.mutex.unlock();
+        defer self.renderer_state.mutex.lock();
+        _ = self.surface_mailbox.push(.screen_change, .{ .forever = {} });
+    }
 }
 
 /// Sends a DSR response for the current color scheme to the pty.

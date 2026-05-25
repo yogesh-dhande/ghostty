@@ -745,6 +745,10 @@ pub const Surface = struct {
         callback(self.session_state_userdata, flags.bits());
     }
 
+    pub fn notifyOwnerSessionScreenChange(self: *Surface) void {
+        self.notifyOwnerSessionStateChange(.{ .screen = true });
+    }
+
     pub fn supportsClipboard(
         self: *const Surface,
         clipboard_type: apprt.Clipboard,
@@ -2437,6 +2441,7 @@ pub const CAPI = struct {
     export fn ghostty_renderer_free(renderer_handle: *Renderer) void {
         renderer_handle.detach() catch |err| {
             log.err("error detaching renderer during free err={}", .{err});
+            return;
         };
         global.alloc.destroy(renderer_handle);
     }

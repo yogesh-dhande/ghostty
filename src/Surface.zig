@@ -872,12 +872,7 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
     self.renderer.threadEnter(self.rt_surface) catch unreachable;
 
     const thread_config = self.renderer_thread.config;
-    self.renderer_thread.deinit();
-
-    self.rt_surface = rt_surface;
-    try self.renderer.rebindSurface(rt_surface);
-
-    const render_thread = try rendererpkg.Thread.initWithDerivedConfig(
+    var render_thread = try rendererpkg.Thread.initWithDerivedConfig(
         self.alloc,
         thread_config,
         rt_surface,
@@ -885,11 +880,23 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
         &self.renderer_state,
         .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
     );
+    var render_thread_installed = false;
+    defer if (!render_thread_installed) render_thread.deinit();
+
+    try self.renderer.rebindSurface(rt_surface);
+
+    self.renderer_state.mutex.lock();
+    var old_render_thread = self.renderer_thread;
+    self.rt_surface = rt_surface;
     self.renderer_thread = render_thread;
     self.io.setRendererEndpoint(
         self.renderer_thread.wakeup,
         self.renderer_thread.mailbox,
     );
+    render_thread_installed = true;
+    old_render_thread.deinit();
+    self.renderer_state.mutex.unlock();
+
     self.renderer_thr = try std.Thread.spawn(
         .{},
         rendererpkg.Thread.threadMain,
@@ -1181,6 +1188,9 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .screen_change => if (@hasDecl(apprt.runtime.Surface, "notifyOwnerSessionScreenChange"))
+            self.rt_surface.notifyOwnerSessionScreenChange(),
+
         .progress_report => |v| {
             _ = self.rt_app.performAction(
                 .{ .surface = self },
@@ -1292,6 +1302,12 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.
     if (info.runtime_ms <= self.config.abnormal_command_exit_runtime_ms) runtime: {
+        const is_host_managed = switch (self.io.backend) {
+            .exec => false,
+            .host_managed => true,
+        };
+        if (is_host_managed and info.exit_code == 0) break :runtime;
+
         // On macOS, our exit code detection doesn't work, possibly
         // because of our `login` wrapper. More investigation required.
         if (comptime !builtin.target.os.tag.isDarwin()) {

@@ -890,6 +890,8 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
     );
     var render_thread_installed = false;
     defer if (!render_thread_installed) render_thread.deinit();
+    render_thread.flags = self.renderer_thread.flags;
+    render_thread.flags.focused = self.focused;
 
     try self.renderer.rebindSurface(rt_surface);
 

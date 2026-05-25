@@ -562,7 +562,6 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
-                self.working_directory = app.core_app.alloc.dupeZ(u8, wd) catch null;
                 var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
                     log.warn(
                         "error opening requested working directory dir={s} err={}",
@@ -591,6 +590,9 @@ pub const Surface = struct {
                 var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
                 if (wd_val.finalize(config.arenaAlloc())) |_| {
                     config.@"working-directory" = wd_val;
+                    if (wd_val.value()) |path| {
+                        self.working_directory = app.core_app.alloc.dupeZ(u8, path) catch null;
+                    }
                 } else |err| {
                     log.warn(
                         "error finalizing working directory config dir={s} err={}",
@@ -2289,9 +2291,9 @@ pub const CAPI = struct {
             log.err("error allocating session err={}", .{err});
             return null;
         };
-        errdefer global.alloc.destroy(session);
         session.init(app, config.*) catch |err| {
             log.err("error initializing session err={}", .{err});
+            global.alloc.destroy(session);
             return null;
         };
         return session;

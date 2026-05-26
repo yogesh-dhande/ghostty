@@ -894,9 +894,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         pub fn rebindSurface(self: *Self, surface: *apprt.Surface) !void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+
             if (@hasDecl(GraphicsAPI, "rebindSurface")) {
                 try self.api.rebindSurface(surface);
             }
+
+            self.markDirty();
+            self.cells_rebuilt = true;
         }
 
         /// Called by renderer.Thread when it starts the main loop.

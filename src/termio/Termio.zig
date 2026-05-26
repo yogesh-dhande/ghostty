@@ -615,6 +615,8 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    var send_form_feed = false;
+
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
@@ -650,22 +652,25 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
                 &self.terminal,
                 .{ .all = true },
             );
-
-            return;
+        } else {
+            // At a prompt, we want to first fully clear the screen, and then after
+            // send a FF (0x0C) to the shell so that it can repaint the screen.
+            // Mark the current row as a not a prompt so we can properly
+            // clear the full screen in the next eraseDisplay call.
+            // TODO: fix this
+            // self.terminal.markSemanticPrompt(.command);
+            // assert(!self.terminal.cursorIsAtPrompt());
+            self.terminal.eraseDisplay(.complete, false);
+            send_form_feed = true;
         }
-
-        // At a prompt, we want to first fully clear the screen, and then after
-        // send a FF (0x0C) to the shell so that it can repaint the screen.
-        // Mark the current row as a not a prompt so we can properly
-        // clear the full screen in the next eraseDisplay call.
-        // TODO: fix this
-        // self.terminal.markSemanticPrompt(.command);
-        // assert(!self.terminal.cursorIsAtPrompt());
-        self.terminal.eraseDisplay(.complete, false);
     }
 
-    // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+    self.notifyScreenChange();
+
+    if (send_form_feed) {
+        // If we reached here it means we're at a prompt, so we send a form-feed.
+        try self.queueWrite(td, &[_]u8{0x0C}, false);
+    }
 }
 
 /// Scroll the viewport
@@ -673,17 +678,32 @@ pub fn scrollViewport(
     self: *Termio,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-    self.terminal.scrollViewport(scroll);
+    const screen_changed = changed: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        const before = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        self.terminal.scrollViewport(scroll);
+        const after = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        break :changed !before.eql(after);
+    };
+
+    if (screen_changed) self.notifyScreenChange();
 }
 
 /// Jump the viewport to the prompt.
 pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    const screen_changed = changed: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
 
-    self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+        const before = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+        const after = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        break :changed !before.eql(after);
+    };
+
+    if (screen_changed) self.notifyScreenChange();
 
     self.renderer_endpoint_mutex.lock();
     defer self.renderer_endpoint_mutex.unlock();

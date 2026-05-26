@@ -443,6 +443,24 @@ pub fn setRendererEndpoint(
     self.terminal_stream.handler.renderer_mailbox = renderer_mailbox;
 }
 
+/// Retarget renderer notifications and move messages still queued on the
+/// previous renderer thread into the replacement mailbox.
+pub fn setRendererEndpointAndDrain(
+    self: *Termio,
+    renderer_wakeup: xev.Async,
+    renderer_mailbox: *renderer.Thread.Mailbox,
+    old_renderer_thread: *renderer.Thread,
+) void {
+    self.renderer_endpoint_mutex.lock();
+    defer self.renderer_endpoint_mutex.unlock();
+
+    self.renderer_wakeup = renderer_wakeup;
+    self.renderer_mailbox = renderer_mailbox;
+    self.terminal_stream.handler.renderer_wakeup = renderer_wakeup;
+    self.terminal_stream.handler.renderer_mailbox = renderer_mailbox;
+    old_renderer_thread.drainMailboxTo(renderer_mailbox);
+}
+
 /// Notify the current renderer endpoint.
 pub fn notifyRenderer(self: *Termio) !void {
     self.renderer_endpoint_mutex.lock();

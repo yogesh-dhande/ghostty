@@ -213,6 +213,17 @@ pub fn deinit(self: *Thread) void {
     self.mailbox.destroy(self.alloc);
 }
 
+/// Move all pending mailbox messages to another renderer mailbox.
+/// This is only safe after this thread has stopped consuming messages.
+pub fn drainMailboxTo(self: *Thread, dst: *Mailbox) void {
+    var drain = self.mailbox.drain();
+    defer drain.deinit();
+
+    while (drain.next()) |message| {
+        std.debug.assert(dst.push(message, .{ .forever = {} }) > 0);
+    }
+}
+
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
     // Call child function so we can use errors...
@@ -730,4 +741,28 @@ fn cursorBlinkInterval() u64 {
     }
 
     return CURSOR_BLINK_INTERVAL;
+}
+
+test "drainMailboxTo preserves pending messages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const src_mailbox = try Mailbox.create(alloc);
+    defer src_mailbox.destroy(alloc);
+    const dst_mailbox = try Mailbox.create(alloc);
+    defer dst_mailbox.destroy(alloc);
+
+    try testing.expect(src_mailbox.push(.{ .focus = false }, .{ .instant = {} }) > 0);
+    try testing.expect(src_mailbox.push(.{ .visible = false }, .{ .instant = {} }) > 0);
+    try testing.expect(src_mailbox.push(.reset_cursor_blink, .{ .instant = {} }) > 0);
+
+    var thread: Thread = undefined;
+    thread.mailbox = src_mailbox;
+    thread.drainMailboxTo(dst_mailbox);
+
+    try testing.expect(src_mailbox.pop() == null);
+    try testing.expectEqual(false, dst_mailbox.pop().?.focus);
+    try testing.expectEqual(false, dst_mailbox.pop().?.visible);
+    try testing.expectEqual(.reset_cursor_blink, dst_mailbox.pop().?);
+    try testing.expect(dst_mailbox.pop() == null);
 }

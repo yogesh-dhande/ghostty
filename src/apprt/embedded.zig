@@ -444,6 +444,11 @@ pub const SurfaceHost = extern struct {
     platform_tag: c_int = 0,
     platform: Platform.C = undefined,
     scale_factor: f64 = 1,
+
+    pub fn isValid(self: SurfaceHost) bool {
+        _ = std.meta.intToEnum(PlatformTag, self.platform_tag) catch return false;
+        return true;
+    }
 };
 
 pub const SurfaceIOBackend = enum(c_int) {
@@ -1504,10 +1509,21 @@ pub const CAPI = struct {
         },
 
         pub fn init(self: *Session, app: *App, config: SessionConfig) !void {
+            const surface = try app.newSurface(config.surface);
+            const parked_host: SurfaceHost = if (config.parked_host.isValid()) .{
+                .platform_tag = config.parked_host.platform_tag,
+                .platform = config.parked_host.platform,
+                .scale_factor = config.parked_host.scale_factor,
+            } else .{
+                .platform_tag = config.surface.platform_tag,
+                .platform = config.surface.platform,
+                .scale_factor = config.surface.scale_factor,
+            };
+
             self.* = .{
                 .app = app,
-                .surface = try app.newSurface(config.surface),
-                .parked_host = config.parked_host,
+                .surface = surface,
+                .parked_host = parked_host,
                 .renderers = .{},
                 .owner_renderer = null,
                 .state_callback = null,

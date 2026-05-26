@@ -908,9 +908,10 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
     var old_render_thread = self.renderer_thread;
     self.rt_surface = rt_surface;
     self.renderer_thread = render_thread;
-    self.io.setRendererEndpoint(
+    self.io.setRendererEndpointAndDrain(
         self.renderer_thread.wakeup,
         self.renderer_thread.mailbox,
+        &old_render_thread,
     );
     render_thread_installed = true;
     old_render_thread.deinit();

@@ -351,6 +351,24 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+            .write_raw_small => |v| try io.queueWrite(
+                data,
+                v.data[0..v.len],
+                false,
+            ),
+            .write_raw_stable => |v| try io.queueWrite(
+                data,
+                v,
+                false,
+            ),
+            .write_raw_alloc => |v| {
+                defer v.alloc.free(v.data);
+                try io.queueWrite(
+                    data,
+                    v.data,
+                    false,
+                );
+            },
         }
     }
 

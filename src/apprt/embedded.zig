@@ -34,7 +34,7 @@ fn sanitizeFontSize(points: f32) ?f32 {
     return std.math.clamp(points, 1.0, 255.0);
 }
 
-pub const SurfaceDataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const SurfaceDataCallback = termio.Termio.DataCallback;
 pub const SurfaceReceiveBufferCallback = termio.HostManaged.ReceiveBufferCallback;
 pub const SurfaceReceiveResizeCallback = termio.HostManaged.ReceiveResizeCallback;
 pub const SessionStateCallback = *const fn (?*anyopaque, u32) callconv(.c) void;
@@ -540,7 +540,10 @@ pub const Surface = struct {
         wait_after_command: bool = false,
 
         /// Whether command execution should use the macOS login shell wrapper.
-        use_login_shell: bool = true,
+        use_login_shell: bool = false,
+
+        /// True when use_login_shell should override the app configuration.
+        use_login_shell_set: bool = false,
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
@@ -665,7 +668,9 @@ pub const Surface = struct {
         if (opts.wait_after_command) {
             config.@"wait-after-command" = true;
         }
-        config.@"macos-use-login-shell" = opts.use_login_shell;
+        if (opts.use_login_shell_set) {
+            config.@"macos-use-login-shell" = opts.use_login_shell;
+        }
 
         // Initialize our surface right away. We're given a view that is
         // ready to use.
@@ -2707,8 +2712,7 @@ pub const CAPI = struct {
     ) void {
         surface.data_callback = callback;
         surface.data_callback_userdata = userdata;
-        surface.core_surface.io.data_callback = callback;
-        surface.core_surface.io.data_callback_userdata = userdata;
+        surface.core_surface.io.setDataCallback(callback, userdata);
     }
 
     /// Send raw PTY bytes directly to the child process.

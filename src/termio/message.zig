@@ -82,6 +82,18 @@ pub const Message = union(enum) {
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
 
+    /// Raw write where the data fits in the union. This bypasses terminal
+    /// linefeed mode.
+    write_raw_small: WriteReq.Small,
+
+    /// Raw write where the data pointer is stable. This bypasses terminal
+    /// linefeed mode.
+    write_raw_stable: WriteReq.Stable,
+
+    /// Raw write where the data is allocated and must be freed. This bypasses
+    /// terminal linefeed mode.
+    write_raw_alloc: WriteReq.Alloc,
+
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
     /// be used for stable pointers which can be manually set to write_stable.
@@ -90,6 +102,16 @@ pub const Message = union(enum) {
             .stable => unreachable,
             .small => |v| Message{ .write_small = v },
             .alloc => |v| Message{ .write_alloc = v },
+        };
+    }
+
+    /// Return a raw write request for the given data. This bypasses terminal
+    /// linefeed mode and otherwise follows writeReq allocation behavior.
+    pub fn writeReqRaw(alloc: Allocator, data: anytype) !Message {
+        return switch (try WriteReq.init(alloc, data)) {
+            .stable => unreachable,
+            .small => |v| Message{ .write_raw_small = v },
+            .alloc => |v| Message{ .write_raw_alloc = v },
         };
     }
 

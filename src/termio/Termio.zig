@@ -25,6 +25,11 @@ const log = std.log.scoped(.io_exec);
 
 pub const DataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 
+const DataCallbackState = struct {
+    callback: ?DataCallback,
+    userdata: ?*anyopaque,
+};
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -59,6 +64,7 @@ renderer_endpoint_mutex: std.Thread.Mutex = .{},
 surface_mailbox: apprt.surface.Mailbox,
 
 /// Optional callback notified with raw PTY output before terminal parsing.
+data_callback_mutex: std.Thread.Mutex = .{},
 data_callback: ?DataCallback = null,
 data_callback_userdata: ?*anyopaque = null,
 
@@ -412,6 +418,29 @@ pub fn queueMessage(
     self.mailbox.notify();
 }
 
+/// Set the callback notified with raw PTY output before terminal parsing.
+pub fn setDataCallback(
+    self: *Termio,
+    callback: ?DataCallback,
+    userdata: ?*anyopaque,
+) void {
+    self.data_callback_mutex.lock();
+    defer self.data_callback_mutex.unlock();
+
+    self.data_callback = callback;
+    self.data_callback_userdata = userdata;
+}
+
+fn dataCallback(self: *Termio) DataCallbackState {
+    self.data_callback_mutex.lock();
+    defer self.data_callback_mutex.unlock();
+
+    return .{
+        .callback = self.data_callback,
+        .userdata = self.data_callback_userdata,
+    };
+}
+
 /// Queue a write directly to the pty.
 ///
 /// If you're using termio.Thread, this must ONLY be called from the
@@ -750,8 +779,9 @@ fn processOutputWithScreenChange(
     buf: []const u8,
     notify_screen_change: bool,
 ) void {
-    if (self.data_callback) |callback| {
-        callback(self.data_callback_userdata, buf.ptr, buf.len);
+    const data_callback = self.dataCallback();
+    if (data_callback.callback) |callback| {
+        callback(data_callback.userdata, buf.ptr, buf.len);
     }
 
     // We are modifying terminal state from here on out and we need

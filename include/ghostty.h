@@ -491,6 +491,7 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   bool use_login_shell;
+  bool use_login_shell_set;
   ghostty_surface_context_e context;
 } ghostty_surface_config_s;
 

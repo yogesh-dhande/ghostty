@@ -957,6 +957,9 @@ fn queueIo(
             .write_small,
             .write_stable,
             .write_alloc,
+            .write_raw_small,
+            .write_raw_stable,
+            .write_raw_alloc,
             => return,
 
             else => {},
@@ -970,7 +973,7 @@ fn queueIo(
 /// text and paste semantics and is intended for external session control.
 pub fn sendInputRaw(self: *Surface, data: []const u8) !void {
     if (data.len == 0) return;
-    self.queueIo(try termio.Message.writeReq(
+    self.queueIo(try termio.Message.writeReqRaw(
         self.alloc,
         data,
     ), .unlocked);

@@ -83,6 +83,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const Self = @This();
 
         pub const API = GraphicsAPI;
+        pub const SurfaceRebind = if (@hasDecl(GraphicsAPI, "SurfaceRebind"))
+            GraphicsAPI.SurfaceRebind
+        else
+            struct {};
 
         const Target = GraphicsAPI.Target;
         const Buffer = GraphicsAPI.Buffer;
@@ -833,6 +837,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.shaders.deinit(self.alloc);
         }
 
+        fn unusedPrepareSurfaceRebind(_: *Self, _: *apprt.Surface) void {}
+        fn unusedDeinitSurfaceRebind(_: *Self, _: *SurfaceRebind) void {}
+        fn unusedSurfaceRebind(_: *apprt.Surface, _: *SurfaceRebind) void {}
+        fn unusedPreparedSurfaceRebind(_: *SurfaceRebind) void {}
+
         fn initShaders(self: *Self) !void {
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -893,12 +902,46 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
-        pub fn rebindSurface(self: *Self, surface: *apprt.Surface) !void {
+        /// Prepare any fallible surface rebind resources before the renderer
+        /// thread is stopped. After this succeeds, rebindSurface must not fail.
+        pub fn prepareSurfaceRebind(
+            self: *Self,
+            surface: *apprt.Surface,
+        ) !SurfaceRebind {
+            if (comptime @hasDecl(GraphicsAPI, "prepareSurfaceRebind")) {
+                return try self.api.prepareSurfaceRebind(surface);
+            } else {
+                unusedPrepareSurfaceRebind(self, surface);
+                return .{};
+            }
+        }
+
+        pub fn deinitSurfaceRebind(
+            self: *Self,
+            rebind: *SurfaceRebind,
+        ) void {
+            if (comptime @hasDecl(GraphicsAPI, "deinitSurfaceRebind")) {
+                self.api.deinitSurfaceRebind(rebind);
+            } else {
+                unusedDeinitSurfaceRebind(self, rebind);
+            }
+        }
+
+        pub fn rebindSurface(
+            self: *Self,
+            surface: *apprt.Surface,
+            rebind: *SurfaceRebind,
+        ) void {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
-            if (@hasDecl(GraphicsAPI, "rebindSurface")) {
-                try self.api.rebindSurface(surface);
+            if (comptime @hasDecl(GraphicsAPI, "rebindSurfacePrepared")) {
+                self.api.rebindSurfacePrepared(surface, rebind);
+            } else if (comptime @hasDecl(GraphicsAPI, "rebindSurface")) {
+                unusedPreparedSurfaceRebind(rebind);
+                self.api.rebindSurface(surface) catch unreachable;
+            } else {
+                unusedSurfaceRebind(surface, rebind);
             }
 
             self.markDirty();

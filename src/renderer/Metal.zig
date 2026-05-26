@@ -68,6 +68,11 @@ const ViewInfo = struct {
     scaleFactor: f64,
 };
 
+pub const SurfaceRebind = struct {
+    info: ViewInfo,
+    layer: IOSurfaceLayer,
+};
+
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     comptime switch (builtin.os.tag) {
         .macos, .ios => {},
@@ -134,22 +139,53 @@ pub fn loopEnter(self: *Metal) void {
 }
 
 pub fn rebindSurface(self: *Metal, surface: *apprt.Surface) !void {
+    var rebind = try self.prepareSurfaceRebind(surface);
+    errdefer self.deinitSurfaceRebind(&rebind);
+    self.rebindSurfacePrepared(surface, &rebind);
+}
+
+pub fn prepareSurfaceRebind(
+    self: *Metal,
+    surface: *apprt.Surface,
+) !SurfaceRebind {
+    _ = self;
+
     const info = viewInfo(surface);
+    return .{
+        .info = info,
+        .layer = try IOSurfaceLayer.init(),
+    };
+}
+
+pub fn deinitSurfaceRebind(
+    self: *Metal,
+    rebind: *SurfaceRebind,
+) void {
+    _ = self;
+
+    rebind.layer.release();
+}
+
+pub fn rebindSurfacePrepared(
+    self: *Metal,
+    surface: *apprt.Surface,
+    rebind: *SurfaceRebind,
+) void {
+    _ = surface;
+
     self.layer.setDisplayCallback(null, null);
     detachLayer(self.view, self.layer);
-    var layer = try IOSurfaceLayer.init();
-    errdefer layer.release();
-    attachLayer(info.view, &layer, info.scaleFactor);
+    attachLayer(rebind.info.view, &rebind.layer, rebind.info.scaleFactor);
     if (self.display_callback_renderer) |renderer| {
-        layer.setDisplayCallback(
+        rebind.layer.setDisplayCallback(
             @ptrCast(&displayCallback),
             @ptrCast(renderer),
         );
     }
 
     self.layer.release();
-    self.layer = layer;
-    self.view = info.view;
+    self.layer = rebind.layer;
+    self.view = rebind.info.view;
 }
 
 fn displayCallback(renderer: *Renderer) align(8) void {

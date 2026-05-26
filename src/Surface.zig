@@ -873,9 +873,84 @@ pub fn deinit(self: *Surface) void {
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
 }
 
+const RendererThreadStart = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    thread: ?*rendererpkg.Thread = null,
+    canceled: bool = false,
+    consumed: bool = false,
+
+    fn threadMain(self: *RendererThreadStart) void {
+        self.mutex.lock();
+        while (self.thread == null and !self.canceled) {
+            self.cond.wait(&self.mutex);
+        }
+
+        const thread = self.thread;
+        self.consumed = true;
+        self.cond.signal();
+        self.mutex.unlock();
+
+        if (thread) |t| rendererpkg.Thread.threadMain(t);
+    }
+
+    fn start(self: *RendererThreadStart, thread: *rendererpkg.Thread) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        std.debug.assert(!self.canceled);
+        self.thread = thread;
+        self.cond.signal();
+        while (!self.consumed) self.cond.wait(&self.mutex);
+    }
+
+    fn cancel(self: *RendererThreadStart) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.canceled = true;
+        self.cond.signal();
+        while (!self.consumed) self.cond.wait(&self.mutex);
+    }
+};
+
 /// Rebind the renderer to a replacement runtime surface without restarting
 /// the underlying PTY or terminal state.
 pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
+    // The config is refreshed from the stopped renderer thread below before
+    // the replacement thread starts. Avoid reading the live thread config here
+    // because a config reload may be mutating it concurrently.
+    const placeholder_config: rendererpkg.Thread.DerivedConfig = .{
+        .custom_shader_animation = .true,
+    };
+    var render_thread = try rendererpkg.Thread.initWithDerivedConfig(
+        self.alloc,
+        placeholder_config,
+        rt_surface,
+        &self.renderer,
+        &self.renderer_state,
+        .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
+    );
+    var render_thread_installed = false;
+    defer if (!render_thread_installed) render_thread.deinit();
+
+    var renderer_rebind = try self.renderer.prepareSurfaceRebind(rt_surface);
+    var renderer_rebind_installed = false;
+    defer if (!renderer_rebind_installed) self.renderer.deinitSurfaceRebind(&renderer_rebind);
+
+    var renderer_thread_start: RendererThreadStart = .{};
+    var renderer_thr = try std.Thread.spawn(
+        .{},
+        RendererThreadStart.threadMain,
+        .{&renderer_thread_start},
+    );
+    renderer_thr.setName("renderer") catch {};
+    var renderer_thr_started = false;
+    defer if (!renderer_thr_started) {
+        renderer_thread_start.cancel();
+        renderer_thr.join();
+    };
+
     self.beginRendererRebind();
     var renderer_rebinding = true;
     defer if (renderer_rebinding) self.endRendererRebind();
@@ -888,23 +963,14 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
     // safe to mutate while we swap the host surface.
     self.renderer.threadEnter(self.rt_surface) catch unreachable;
 
-    const thread_config = self.renderer_thread.config;
-    var render_thread = try rendererpkg.Thread.initWithDerivedConfig(
-        self.alloc,
-        thread_config,
-        rt_surface,
-        &self.renderer,
-        &self.renderer_state,
-        .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
-    );
-    var render_thread_installed = false;
-    defer if (!render_thread_installed) render_thread.deinit();
-    // Preserve the renderer thread's last-drained focus state. A pending focus
-    // message may still be in the old mailbox and must drive renderer.setFocus
-    // after it is drained into the replacement thread.
+    // Preserve renderer thread state after the old thread can no longer process
+    // messages. Config reloads processed during rebind must carry forward, and
+    // pending focus messages may still be drained into the replacement thread.
+    render_thread.config = self.renderer_thread.config;
     render_thread.flags = self.renderer_thread.flags;
 
-    try self.renderer.rebindSurface(rt_surface);
+    self.renderer.rebindSurface(rt_surface, &renderer_rebind);
+    renderer_rebind_installed = true;
 
     self.renderer_state.mutex.lock();
     var old_render_thread = self.renderer_thread;
@@ -916,15 +982,12 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
         &old_render_thread,
     );
     render_thread_installed = true;
-    old_render_thread.deinit();
     self.renderer_state.mutex.unlock();
 
-    self.renderer_thr = try std.Thread.spawn(
-        .{},
-        rendererpkg.Thread.threadMain,
-        .{&self.renderer_thread},
-    );
-    self.renderer_thr.setName("renderer") catch {};
+    renderer_thread_start.start(&self.renderer_thread);
+    renderer_thr_started = true;
+    self.renderer_thr = renderer_thr;
+    old_render_thread.deinit();
 
     self.endRendererRebind();
     renderer_rebinding = false;
@@ -958,11 +1021,16 @@ fn queueIo(
         switch (msg) {
             .write_small,
             .write_stable,
-            .write_alloc,
             .write_raw_small,
             .write_raw_stable,
-            .write_raw_alloc,
             => return,
+
+            .write_alloc,
+            .write_raw_alloc,
+            => |v| {
+                v.alloc.free(v.data);
+                return;
+            },
 
             else => {},
         }

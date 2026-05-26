@@ -2421,7 +2421,9 @@ pub const CAPI = struct {
         font_size.points = clamped_points;
         session.surface.core_surface.setFontSize(font_size) catch |err| {
             log.err("error setting session font size err={}", .{err});
+            return;
         };
+        session.surface.core_surface.font_size_adjusted = true;
         var flags = session.notifySizeIfChanged();
         flags = flags.unionWith(.{ .screen = true });
         session.notifyStateChange(flags);

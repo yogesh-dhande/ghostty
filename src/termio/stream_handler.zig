@@ -40,6 +40,9 @@ pub const StreamHandler = struct {
     /// a repaint should happen.
     renderer_wakeup: xev.Async,
 
+    /// Serializes renderer endpoint reads with renderer thread replacement.
+    renderer_endpoint_mutex: *std.Thread.Mutex,
+
     /// The default cursor state. This is used with CSI q. This is
     /// set to true when we're currently in the default cursor state.
     default_cursor: bool = true,
@@ -102,6 +105,9 @@ pub const StreamHandler = struct {
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.
     pub inline fn queueRender(self: *StreamHandler) !void {
+        self.renderer_endpoint_mutex.lock();
+        defer self.renderer_endpoint_mutex.unlock();
+
         try self.renderer_wakeup.notify();
     }
 
@@ -148,28 +154,33 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: renderer.Message,
     ) void {
-        // See termio.Mailbox.send for more details on how this works.
+        while (true) {
+            // See termio.Mailbox.send for more details on how this works.
+            self.renderer_endpoint_mutex.lock();
 
-        // Try instant first. If it works then we can return.
-        if (self.renderer_mailbox.push(msg, .{ .instant = {} }) > 0) {
-            return;
+            // Try instant first. If it works then we can return.
+            if (self.renderer_mailbox.push(msg, .{ .instant = {} }) > 0) {
+                self.renderer_endpoint_mutex.unlock();
+                return;
+            }
+
+            // Instant would have blocked. Wake up the renderer to allow it
+            // to process the message, then release both locks before waiting
+            // so a host rebind can retarget IO to a replacement endpoint.
+            self.renderer_wakeup.notify() catch |err| {
+                // This is an EXTREMELY unlikely case. We still don't return
+                // and attempt to send the message because its most likely
+                // that everything is fine, but log in case a freeze happens.
+                log.warn(
+                    "failed to notify renderer err={}",
+                    .{err},
+                );
+            };
+            self.renderer_endpoint_mutex.unlock();
+            self.renderer_state.mutex.unlock();
+            std.Thread.sleep(std.time.ns_per_ms);
+            self.renderer_state.mutex.lock();
         }
-
-        // Instant would have blocked. Release the renderer mutex,
-        // wake up the renderer to allow it to process the message,
-        // and then try again.
-        self.renderer_state.mutex.unlock();
-        defer self.renderer_state.mutex.lock();
-        self.renderer_wakeup.notify() catch |err| {
-            // This is an EXTREMELY unlikely case. We still don't return
-            // and attempt to send the message because its most likely
-            // that everything is fine, but log in case a freeze happens.
-            log.warn(
-                "failed to notify renderer, may deadlock err={}",
-                .{err},
-            );
-        };
-        _ = self.renderer_mailbox.push(msg, .{ .forever = {} });
     }
 
     pub fn vt(

@@ -52,6 +52,9 @@ renderer_wakeup: xev.Async,
 /// The mailbox for notifying the renderer of things.
 renderer_mailbox: *renderer.Thread.Mailbox,
 
+/// Serializes renderer endpoint reads with renderer thread replacement.
+renderer_endpoint_mutex: std.Thread.Mutex = .{},
+
 /// The mailbox for communicating with the surface.
 surface_mailbox: apprt.surface.Mailbox,
 
@@ -287,6 +290,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
+        .renderer_endpoint_mutex = &self.renderer_endpoint_mutex,
         .size = &self.size,
         .terminal = &self.terminal,
         .osc_color_report_format = opts.config.osc_color_report_format,
@@ -308,6 +312,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
+        .renderer_endpoint_mutex = .{},
         .surface_mailbox = opts.surface_mailbox,
         .size = opts.size,
         .backend = backend,
@@ -429,10 +434,39 @@ pub fn setRendererEndpoint(
     renderer_wakeup: xev.Async,
     renderer_mailbox: *renderer.Thread.Mailbox,
 ) void {
+    self.renderer_endpoint_mutex.lock();
+    defer self.renderer_endpoint_mutex.unlock();
+
     self.renderer_wakeup = renderer_wakeup;
     self.renderer_mailbox = renderer_mailbox;
     self.terminal_stream.handler.renderer_wakeup = renderer_wakeup;
     self.terminal_stream.handler.renderer_mailbox = renderer_mailbox;
+}
+
+/// Notify the current renderer endpoint.
+pub fn notifyRenderer(self: *Termio) !void {
+    self.renderer_endpoint_mutex.lock();
+    defer self.renderer_endpoint_mutex.unlock();
+
+    try self.renderer_wakeup.notify();
+}
+
+/// Send a renderer message without blocking endpoint replacement.
+fn sendRendererMessage(self: *Termio, msg: renderer.Message) void {
+    while (true) {
+        self.renderer_endpoint_mutex.lock();
+        if (self.renderer_mailbox.push(msg, .{ .instant = {} }) > 0) {
+            self.renderer_wakeup.notify() catch {};
+            self.renderer_endpoint_mutex.unlock();
+            return;
+        }
+
+        self.renderer_wakeup.notify() catch |err| {
+            log.warn("failed to notify renderer err={}", .{err});
+        };
+        self.renderer_endpoint_mutex.unlock();
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
 }
 
 /// Update the configuration.
@@ -516,8 +550,7 @@ pub fn resize(
     }
 
     // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
-    self.renderer_wakeup.notify() catch {};
+    self.sendRendererMessage(.{ .resize = size });
 }
 
 /// Make a size report.
@@ -555,6 +588,10 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     self.terminal.modes.set(.synchronized_output, false);
+
+    self.renderer_endpoint_mutex.lock();
+    defer self.renderer_endpoint_mutex.unlock();
+
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -625,11 +662,13 @@ pub fn scrollViewport(
 
 /// Jump the viewport to the prompt.
 pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
-    {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
-        self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
-    }
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+
+    self.renderer_endpoint_mutex.lock();
+    defer self.renderer_endpoint_mutex.unlock();
 
     try self.renderer_wakeup.notify();
 }
@@ -707,6 +746,9 @@ fn processOutputLocked(
         }
 
         self.last_cursor_reset = now;
+        self.renderer_endpoint_mutex.lock();
+        defer self.renderer_endpoint_mutex.unlock();
+
         _ = self.renderer_mailbox.push(.{
             .reset_cursor_blink = {},
         }, .{ .instant = {} });

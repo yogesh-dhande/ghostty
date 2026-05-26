@@ -916,11 +916,20 @@ pub const Surface = struct {
 
     pub fn setHost(self: *Surface, host: SurfaceHost) !void {
         const scale_factor = @max(1, if (std.math.isNan(host.scale_factor)) 1 else host.scale_factor);
-        self.platform = try .init(host.platform_tag, host.platform);
+        const platform = try Platform.init(host.platform_tag, host.platform);
+        const old_platform = self.platform;
+        const old_content_scale = self.content_scale;
+
+        self.platform = platform;
         self.content_scale = .{
             .x = @floatCast(scale_factor),
             .y = @floatCast(scale_factor),
         };
+        errdefer {
+            self.platform = old_platform;
+            self.content_scale = old_content_scale;
+        }
+
         try self.core_surface.rebindRendererHost(self);
         self.updateContentScale(scale_factor, scale_factor);
     }
@@ -1536,8 +1545,6 @@ pub const CAPI = struct {
                 if (existing_session != self) try renderer_handle.detach();
             }
 
-            try self.ensureRendererAttached(renderer_handle);
-            renderer_handle.attached_session = self;
             try self.promoteRenderer(renderer_handle);
         }
 
@@ -1557,24 +1564,48 @@ pub const CAPI = struct {
         }
 
         pub fn promoteRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            const old_session = renderer_handle.attached_session;
+            const old_role = renderer_handle.role;
+            const was_registered = self.indexOfRenderer(renderer_handle) != null;
+            errdefer {
+                if (!was_registered) self.removeRenderer(renderer_handle);
+                renderer_handle.attached_session = old_session;
+                renderer_handle.role = old_role;
+            }
+
             try self.ensureRendererAttached(renderer_handle);
-            renderer_handle.attached_session = self;
 
             if (self.owner_renderer) |existing_owner| {
                 if (existing_owner == renderer_handle) {
+                    renderer_handle.attached_session = self;
                     renderer_handle.role = .owner;
                     return;
                 }
-                existing_owner.role = .viewer;
             }
 
             try self.surface.setHost(renderer_handle.host);
-            self.notifyStateChange(self.notifySizeIfChanged());
+            if (self.owner_renderer) |existing_owner| existing_owner.role = .viewer;
             self.owner_renderer = renderer_handle;
+            renderer_handle.attached_session = self;
             renderer_handle.role = .owner;
+            self.notifyStateChange(self.notifySizeIfChanged());
         }
 
         pub fn detachRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session != self) return;
+
+            if (self.owner_renderer == renderer_handle) {
+                try self.surface.setHost(self.parked_host);
+                self.notifyStateChange(self.notifySizeIfChanged());
+                self.owner_renderer = null;
+            }
+
+            self.removeRenderer(renderer_handle);
+            renderer_handle.attached_session = null;
+            renderer_handle.role = .detached;
+        }
+
+        pub fn detachRendererForFree(self: *Session, renderer_handle: *Renderer) !void {
             if (renderer_handle.attached_session != self) return;
 
             if (self.owner_renderer == renderer_handle) {
@@ -1691,18 +1722,30 @@ pub const CAPI = struct {
             try session.detachRenderer(self);
         }
 
+        pub fn detachForFree(self: *Renderer) !void {
+            const session = self.attached_session orelse return;
+            try session.detachRendererForFree(self);
+        }
+
         pub fn takeOwnership(self: *Renderer) !void {
             const session = self.attached_session orelse return error.RendererDetached;
             try session.promoteRenderer(self);
         }
 
         pub fn setHost(self: *Renderer, host: SurfaceHost) !void {
-            self.host = host;
             if (self.attached_session) |session| {
-                if (self.role != .owner) return;
+                if (self.role != .owner) {
+                    self.host = host;
+                    return;
+                }
+
                 try session.surface.setHost(host);
+                self.host = host;
                 session.notifyStateChange(session.notifySizeIfChanged());
+                return;
             }
+
+            self.host = host;
         }
 
         pub fn isOwner(self: *const Renderer) bool {
@@ -2457,7 +2500,7 @@ pub const CAPI = struct {
     }
 
     export fn ghostty_renderer_free(renderer_handle: *Renderer) void {
-        renderer_handle.detach() catch |err| {
+        renderer_handle.detachForFree() catch |err| {
             log.err("error detaching renderer during free err={}", .{err});
             return;
         };

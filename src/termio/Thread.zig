@@ -357,7 +357,7 @@ fn drainMailbox(
     // Trigger a redraw after we've drained so we don't waste cyces
     // messaging a redraw.
     if (redraw) {
-        try io.renderer_wakeup.notify();
+        try io.notifyRenderer();
     }
 }
 

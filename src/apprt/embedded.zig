@@ -25,6 +25,15 @@ const String = @import("../main_c.zig").String;
 
 const log = std.log.scoped(.embedded_window);
 
+fn sanitizeProcessExitCode(exit_code: i32) u32 {
+    return if (exit_code < 0) 1 else @intCast(exit_code);
+}
+
+fn sanitizeFontSize(points: f32) ?f32 {
+    if (!std.math.isFinite(points)) return null;
+    return std.math.clamp(points, 1.0, 255.0);
+}
+
 pub const SurfaceDataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const SurfaceReceiveBufferCallback = termio.HostManaged.ReceiveBufferCallback;
 pub const SurfaceReceiveResizeCallback = termio.HostManaged.ReceiveResizeCallback;
@@ -671,9 +680,11 @@ pub const Surface = struct {
 
         // If our options requested a specific font-size, set that.
         if (opts.font_size != 0) {
-            var font_size = self.core_surface.font_size;
-            font_size.points = opts.font_size;
-            try self.core_surface.setFontSize(font_size);
+            if (sanitizeFontSize(opts.font_size)) |points| {
+                var font_size = self.core_surface.font_size;
+                font_size.points = points;
+                try self.core_surface.setFontSize(font_size);
+            }
         }
     }
 
@@ -2047,7 +2058,7 @@ pub const CAPI = struct {
     export fn ghostty_surface_process_exit(surface: *Surface, exit_code: i32) void {
         _ = surface.core_surface.io.surface_mailbox.push(.{
             .child_exited = .{
-                .exit_code = @intCast(@max(exit_code, 0)),
+                .exit_code = sanitizeProcessExitCode(exit_code),
                 .runtime_ms = 0,
             },
         }, .{ .forever = {} });
@@ -2399,9 +2410,10 @@ pub const CAPI = struct {
 
     export fn ghostty_session_set_font_size(session: *Session, points: f32) void {
         if (points <= 0) return;
+        const clamped_points = sanitizeFontSize(points) orelse return;
 
         var font_size = session.surface.core_surface.font_size;
-        font_size.points = points;
+        font_size.points = clamped_points;
         session.surface.core_surface.setFontSize(font_size) catch |err| {
             log.err("error setting session font size err={}", .{err});
         };

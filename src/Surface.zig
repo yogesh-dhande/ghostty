@@ -94,6 +94,11 @@ renderer_thread: rendererpkg.Thread,
 /// The actual thread
 renderer_thr: std.Thread,
 
+/// Serializes cross-thread renderer endpoint producers with renderer
+/// thread replacement.
+renderer_endpoint_mutex: std.Thread.Mutex = .{},
+renderer_endpoint_rebinding: bool = false,
+
 /// Mouse state.
 mouse: Mouse,
 
@@ -871,6 +876,10 @@ pub fn deinit(self: *Surface) void {
 /// Rebind the renderer to a replacement runtime surface without restarting
 /// the underlying PTY or terminal state.
 pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
+    self.beginRendererRebind();
+    var renderer_rebinding = true;
+    defer if (renderer_rebinding) self.endRendererRebind();
+
     self.renderer_thread.stop.notify() catch |err|
         log.err("error notifying renderer thread to stop during rebind err={}", .{err});
     self.renderer_thr.join();
@@ -913,6 +922,9 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
         .{&self.renderer_thread},
     );
     self.renderer_thr.setName("renderer") catch {};
+
+    self.endRendererRebind();
+    renderer_rebinding = false;
 }
 
 /// Close this surface. This will trigger the runtime to start the
@@ -1531,9 +1543,9 @@ fn passwordInput(self: *Surface, v: bool) !void {
 
 fn searchCallback(event: terminal.search.Thread.Event, ud: ?*anyopaque) void {
     // IMPORTANT: This function is run on the SEARCH THREAD! It is NOT SAFE
-    // to access anything other than values that never change on the surface.
-    // The surface is guaranteed to be valid for the lifetime of the search
-    // thread.
+    // to access anything other than values that never change on the surface,
+    // or helpers that synchronize mutable cross-thread state. The surface is
+    // guaranteed to be valid for the lifetime of the search thread.
     const self: *Surface = @ptrCast(@alignCast(ud.?));
     self.searchCallback_(event) catch |err| {
         log.warn("error in search callback err={}", .{err});
@@ -1555,14 +1567,12 @@ fn searchCallback_(
             const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
             for (matches) |*m| m.* = try m.clone(alloc);
 
-            _ = self.renderer_thread.mailbox.push(
+            self.queueRendererMessageFromAnyThread(
                 .{ .search_viewport_matches = .{
                     .arena = arena,
                     .matches = matches,
                 } },
-                .forever,
             );
-            try self.renderer_thread.wakeup.notify();
         },
 
         .selected_match => |selected_| {
@@ -1573,12 +1583,11 @@ fn searchCallback_(
                 const alloc = arena.allocator();
                 const match = try sel.highlight.clone(alloc);
 
-                _ = self.renderer_thread.mailbox.push(
+                self.queueRendererMessageFromAnyThread(
                     .{ .search_selected_match = .{
                         .arena = arena,
                         .match = match,
                     } },
-                    .forever,
                 );
 
                 // Send the selected index to the surface mailbox
@@ -1588,9 +1597,8 @@ fn searchCallback_(
                 );
             } else {
                 // Reset our selected match
-                _ = self.renderer_thread.mailbox.push(
+                self.queueRendererMessageFromAnyThread(
                     .{ .search_selected_match = null },
-                    .forever,
                 );
 
                 // Reset the selected index
@@ -1599,8 +1607,6 @@ fn searchCallback_(
                     .forever,
                 );
             }
-
-            try self.renderer_thread.wakeup.notify();
         },
 
         .total_matches => |total| {
@@ -1612,18 +1618,15 @@ fn searchCallback_(
 
         // When we quit, tell our renderer to reset any search state.
         .quit => {
-            _ = self.renderer_thread.mailbox.push(
+            self.queueRendererMessageFromAnyThread(
                 .{ .search_selected_match = null },
-                .forever,
             );
-            _ = self.renderer_thread.mailbox.push(
+            self.queueRendererMessageFromAnyThread(
                 .{ .search_viewport_matches = .{
                     .arena = .init(self.alloc),
                     .matches = &.{},
                 } },
-                .forever,
             );
-            try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
             _ = self.surfaceMailbox().push(
@@ -2559,6 +2562,49 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 /// practical.
 fn queueRender(self: *Surface) !void {
     try self.renderer_thread.wakeup.notify();
+}
+
+fn beginRendererRebind(self: *Surface) void {
+    self.renderer_endpoint_mutex.lock();
+    defer self.renderer_endpoint_mutex.unlock();
+
+    self.renderer_endpoint_rebinding = true;
+}
+
+fn endRendererRebind(self: *Surface) void {
+    self.renderer_endpoint_mutex.lock();
+    defer self.renderer_endpoint_mutex.unlock();
+
+    self.renderer_endpoint_rebinding = false;
+}
+
+/// Queue a renderer message from a producer that can run concurrently with
+/// renderer host rebinding.
+pub fn queueRendererMessageFromAnyThread(
+    self: *Surface,
+    msg: rendererpkg.Message,
+) void {
+    while (true) {
+        self.renderer_endpoint_mutex.lock();
+
+        if (self.renderer_endpoint_rebinding) {
+            self.renderer_endpoint_mutex.unlock();
+            std.Thread.sleep(std.time.ns_per_ms);
+            continue;
+        }
+
+        if (self.renderer_thread.mailbox.push(msg, .{ .instant = {} }) > 0) {
+            self.renderer_thread.wakeup.notify() catch |err|
+                log.warn("failed to notify renderer err={}", .{err});
+            self.renderer_endpoint_mutex.unlock();
+            return;
+        }
+
+        self.renderer_thread.wakeup.notify() catch |err|
+            log.warn("failed to notify renderer err={}", .{err});
+        self.renderer_endpoint_mutex.unlock();
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
 }
 
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {

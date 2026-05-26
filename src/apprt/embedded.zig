@@ -2501,7 +2501,10 @@ pub const CAPI = struct {
 
     export fn ghostty_renderer_free(renderer_handle: *Renderer) void {
         renderer_handle.detachForFree() catch |err| {
-            log.err("error detaching renderer during free err={}", .{err});
+            log.err(
+                "error detaching renderer during free; renderer not freed err={}",
+                .{err},
+            );
             return;
         };
         global.alloc.destroy(renderer_handle);
@@ -3002,11 +3005,7 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            _ = surface.renderer_thread.mailbox.push(
-                .{ .macos_display_id = display_id },
-                .{ .forever = {} },
-            );
-            surface.renderer_thread.wakeup.notify() catch {};
+            surface.queueRendererMessageFromAnyThread(.{ .macos_display_id = display_id });
         }
 
         export fn ghostty_session_set_display_id(session: *Session, display_id: u32) void {

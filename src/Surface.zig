@@ -899,8 +899,10 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
     );
     var render_thread_installed = false;
     defer if (!render_thread_installed) render_thread.deinit();
+    // Preserve the renderer thread's last-drained focus state. A pending focus
+    // message may still be in the old mailbox and must drive renderer.setFocus
+    // after it is drained into the replacement thread.
     render_thread.flags = self.renderer_thread.flags;
-    render_thread.flags.focused = self.focused;
 
     try self.renderer.rebindSurface(rt_surface);
 

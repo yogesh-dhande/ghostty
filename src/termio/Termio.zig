@@ -613,8 +613,12 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Update PTY-backed processes before resizing the terminal. Host-managed
+    // resize callbacks run after the terminal grid is updated because hosts
+    // may synchronously feed output back into Ghostty.
+    try self.backend.resizeBeforeTerminal(grid_size, size.terminal());
+
+    var report_size = false;
 
     // Enter the critical area that we want to keep small
     {
@@ -636,14 +640,32 @@ pub fn resize(
         // immediately for a resize. This is allowed by the spec.
         self.terminal.modes.set(.synchronized_output, false);
 
-        // If we have size reporting enabled we need to send a report.
-        if (self.terminal.modes.get(.in_band_size_reports)) {
-            try self.sizeReportLocked(td, .mode_2048);
-        }
+        // Capture the mode that was active for this resize. The report write is
+        // delayed until host-managed resize callbacks have run.
+        report_size = self.terminal.modes.get(.in_band_size_reports);
     }
 
     // Mail the renderer so that it can update the GPU and re-render
     self.sendRendererMessage(.{ .resize = size });
+
+    // Notify host-managed backends after the terminal grid and renderer resize
+    // message are updated so synchronous host output parses against the new
+    // dimensions.
+    try self.backend.resizeAfterTerminal(grid_size, size.terminal());
+
+    // In-band size reports must be emitted after host-managed resize callbacks
+    // so the host-owned PTY has its winsize updated before receiving the report.
+    if (report_size and self.backend.isHostManaged()) {
+        report_size = report_size: {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+
+            break :report_size self.terminal.modes.get(.in_band_size_reports);
+        };
+    }
+    if (report_size) {
+        try self.sizeReport(td, .mode_2048);
+    }
 }
 
 /// Make a size report.

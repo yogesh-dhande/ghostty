@@ -42,6 +42,13 @@ pub const Backend = union(Kind) {
         }
     }
 
+    pub fn isHostManaged(self: *const Backend) bool {
+        return switch (self.*) {
+            .exec => false,
+            .host_managed => true,
+        };
+    }
+
     pub fn threadEnter(
         self: *Backend,
         alloc: Allocator,
@@ -72,13 +79,24 @@ pub const Backend = union(Kind) {
         }
     }
 
-    pub fn resize(
+    pub fn resizeBeforeTerminal(
         self: *Backend,
         grid_size: renderer.GridSize,
         screen_size: renderer.ScreenSize,
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.resize(grid_size, screen_size),
+            .host_managed => {},
+        }
+    }
+
+    pub fn resizeAfterTerminal(
+        self: *Backend,
+        grid_size: renderer.GridSize,
+        screen_size: renderer.ScreenSize,
+    ) !void {
+        switch (self.*) {
+            .exec => {},
             .host_managed => |*host_managed| try host_managed.resize(grid_size, screen_size),
         }
     }

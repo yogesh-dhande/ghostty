@@ -72,6 +72,8 @@ pub fn resize(
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
 ) !void {
+    // Backend dispatch calls this after the terminal grid has been resized so
+    // synchronous host output is parsed against the new dimensions.
     const callback = self.receive_resize orelse return;
     callback(
         self.userdata,

@@ -263,6 +263,12 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     // ourselves and the thread data so we can thread that through (pun intended).
     var cb: CallbackData = .{ .self = self, .io = io };
 
+    // Host-managed callbacks may synchronously feed output back into Ghostty
+    // during threadEnter initial input, before the mailbox is activated.
+    std.debug.assert(current_callback == null);
+    current_callback = &cb;
+    defer current_callback = null;
+
     // Run our thread start/end callbacks. This allows the implementation
     // to hook into the event loop as needed. The thread data is created
     // on the stack here so that it has a stable pointer throughout the
@@ -270,10 +276,6 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     try io.threadEnter(self, &cb.data);
     defer cb.data.deinit();
     defer io.threadExit(&cb.data);
-
-    std.debug.assert(current_callback == null);
-    current_callback = &cb;
-    defer current_callback = null;
 
     // Start the async handlers.
     mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);

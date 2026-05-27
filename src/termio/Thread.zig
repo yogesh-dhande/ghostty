@@ -23,6 +23,8 @@ const renderer = @import("../renderer.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.io_thread);
 
+threadlocal var current_callback: ?*CallbackData = null;
+
 /// This stores the information that is coalesced.
 const Coalesce = struct {
     /// The number of milliseconds to coalesce certain messages like resize for.
@@ -135,6 +137,7 @@ pub fn deinit(self: *Thread) void {
 pub fn threadMain(self: *Thread, io: *termio.Termio) void {
     // Call child function so we can use errors...
     self.threadMain_(io) catch |err| {
+        io.mailbox.deactivateAndDrain();
         log.warn("error in io thread err={}", .{err});
 
         // Use an arena to simplify memory management below
@@ -268,9 +271,15 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     defer cb.data.deinit();
     defer io.threadExit(&cb.data);
 
+    std.debug.assert(current_callback == null);
+    current_callback = &cb;
+    defer current_callback = null;
+
     // Start the async handlers.
     mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
     self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+    io.mailbox.activate();
+    defer io.mailbox.deactivateAndDrain();
 
     // Run
     log.debug("starting IO thread", .{});
@@ -285,6 +294,123 @@ const CallbackData = struct {
     data: termio.Termio.ThreadData = undefined,
 };
 
+/// Process host-managed output from this terminal's IO thread by queueing it
+/// behind pending mailbox messages and draining until it completes. Returns
+/// false when the caller is not on the IO thread for the provided termio.
+pub fn processOutputOnCurrentThread(
+    io: *termio.Termio,
+    data: []const u8,
+    notify_screen_change: bool,
+) anyerror!bool {
+    const cb = current_callback orelse return false;
+    if (cb.io != io) return false;
+
+    var output: termio.Message.BlockingOutput = .{
+        .data = data,
+        .notify_screen_change = notify_screen_change,
+    };
+    try cb.self.queueBlockingOutputOnCurrentThread(cb, &output);
+    return true;
+}
+
+/// Queue a host-managed process exit from this terminal's IO thread by placing
+/// it behind pending mailbox messages and draining until it is delivered.
+/// Returns false when the caller is not on the IO thread for the provided
+/// termio.
+pub fn queueProcessExitOnCurrentThread(
+    io: *termio.Termio,
+    exit_code: u32,
+    runtime_ms: u64,
+) anyerror!bool {
+    const cb = current_callback orelse return false;
+    if (cb.io != io) return false;
+
+    var process_exit: termio.Message.BlockingProcessExit = .{
+        .data = .{
+            .exit_code = exit_code,
+            .runtime_ms = runtime_ms,
+        },
+    };
+    try cb.self.queueBlockingProcessExitOnCurrentThread(cb, &process_exit);
+    return true;
+}
+
+fn queueBlockingOutputOnCurrentThread(
+    self: *Thread,
+    cb: *CallbackData,
+    output: *termio.Message.BlockingOutput,
+) anyerror!void {
+    if (self.flags.drain) return error.TermioDraining;
+
+    const queue = cb.io.mailbox.spsc.queue;
+    var redraw = false;
+    var first_err: ?anyerror = null;
+
+    while (queue.push(.{
+        .pty_output_blocking = output,
+    }, .{ .instant = {} }) == 0) {
+        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    while (!output.isDone()) {
+        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    output.wait() catch |err| {
+        if (first_err == null) first_err = err;
+    };
+    if (redraw) try cb.io.notifyRenderer();
+    if (first_err) |err| return err;
+}
+
+fn queueBlockingProcessExitOnCurrentThread(
+    self: *Thread,
+    cb: *CallbackData,
+    process_exit: *termio.Message.BlockingProcessExit,
+) anyerror!void {
+    if (self.flags.drain) return error.TermioDraining;
+
+    const queue = cb.io.mailbox.spsc.queue;
+    var redraw = false;
+    var first_err: ?anyerror = null;
+
+    while (queue.push(.{
+        .process_exit_blocking = process_exit,
+    }, .{ .instant = {} }) == 0) {
+        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    while (!process_exit.isDone()) {
+        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    process_exit.wait() catch |err| {
+        if (first_err == null) first_err = err;
+    };
+    if (redraw) {
+        cb.io.notifyRenderer() catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+    if (first_err) |err| return err;
+}
+
 /// Drain the mailbox, handling all the messages in our terminal implementation.
 fn drainMailbox(
     self: *Thread,
@@ -292,12 +418,10 @@ fn drainMailbox(
 ) !void {
     // We assert when starting the thread that this is the state
     const mailbox = cb.io.mailbox.spsc.queue;
-    const io = cb.io;
-    const data = &cb.data;
 
     // If we're draining, we just drain the mailbox and return.
     if (self.flags.drain) {
-        while (mailbox.pop()) |_| {}
+        while (mailbox.pop()) |message| message.deinit();
         return;
     }
 
@@ -305,77 +429,158 @@ fn drainMailbox(
     // expectation is that all our message handlers will be non-blocking
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
+    var first_err: ?anyerror = null;
     while (mailbox.pop()) |message| {
         // If we have a message we always redraw
         redraw = true;
 
         log.debug("mailbox message={s}", .{@tagName(message)});
-        switch (message) {
-            .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
-            .crash => @panic("crash request, crashing intentionally"),
-            .change_config => |config| {
-                defer config.alloc.destroy(config.ptr);
-                try io.changeConfig(data, config.ptr);
-            },
-            .inspector => |v| self.flags.has_inspector = v,
-            .resize => |v| self.handleResize(cb, v),
-            .size_report => |v| try io.sizeReport(data, v),
-            .clear_screen => |v| try io.clearScreen(data, v.history),
-            .scroll_viewport => |v| io.scrollViewport(v),
-            .selection_scroll => |v| {
-                if (v) {
-                    self.startScrollTimer(cb);
-                } else {
-                    self.stopScrollTimer();
-                }
-            },
-            .jump_to_prompt => |v| try io.jumpToPrompt(v),
-            .start_synchronized_output => self.startSynchronizedOutput(cb),
-            .linefeed_mode => |v| self.flags.linefeed_mode = v,
-            .focused => |v| try io.focusGained(data, v),
-            .write_small => |v| try io.queueWrite(
-                data,
-                v.data[0..v.len],
-                self.flags.linefeed_mode,
-            ),
-            .write_stable => |v| try io.queueWrite(
-                data,
-                v,
-                self.flags.linefeed_mode,
-            ),
-            .write_alloc => |v| {
-                defer v.alloc.free(v.data);
-                try io.queueWrite(
-                    data,
-                    v.data,
-                    self.flags.linefeed_mode,
-                );
-            },
-            .write_raw_small => |v| try io.queueWrite(
-                data,
-                v.data[0..v.len],
-                false,
-            ),
-            .write_raw_stable => |v| try io.queueWrite(
-                data,
-                v,
-                false,
-            ),
-            .write_raw_alloc => |v| {
-                defer v.alloc.free(v.data);
-                try io.queueWrite(
-                    data,
-                    v.data,
-                    false,
-                );
-            },
-        }
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
     }
 
     // Trigger a redraw after we've drained so we don't waste cyces
     // messaging a redraw.
     if (redraw) {
-        try io.notifyRenderer();
+        cb.io.notifyRenderer() catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    if (first_err) |err| return err;
+}
+
+fn handleMessage(
+    self: *Thread,
+    cb: *CallbackData,
+    message: termio.Message,
+) anyerror!void {
+    const io = cb.io;
+    const data = &cb.data;
+
+    switch (message) {
+        .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
+        .crash => @panic("crash request, crashing intentionally"),
+        .change_config => |config| {
+            defer config.alloc.destroy(config.ptr);
+            try io.changeConfig(data, config.ptr);
+        },
+        .inspector => |v| self.flags.has_inspector = v,
+        .resize => |v| self.handleResize(cb, v),
+        .size_report => |v| try io.sizeReport(data, v),
+        .clear_screen => |v| try io.clearScreen(data, v.history),
+        .scroll_viewport => |v| io.scrollViewport(v),
+        .selection_scroll => |v| {
+            if (v) {
+                self.startScrollTimer(cb);
+            } else {
+                self.stopScrollTimer();
+            }
+        },
+        .jump_to_prompt => |v| try io.jumpToPrompt(v),
+        .start_synchronized_output => self.startSynchronizedOutput(cb),
+        .linefeed_mode => |v| self.flags.linefeed_mode = v,
+        .focused => |v| try io.focusGained(data, v),
+        .process_exit => |v| self.handleProcessExit(cb, v),
+        .process_exit_blocking => |v| {
+            self.handleProcessExit(cb, v.data);
+            v.complete(null);
+        },
+        .pty_output_blocking => |v| {
+            self.processHostOutput(
+                cb,
+                v.data,
+                v.notify_screen_change,
+            ) catch |err| {
+                v.complete(err);
+                return err;
+            };
+            v.complete(null);
+        },
+        .pty_output_small => |v| try self.processHostOutput(cb, v.data[0..v.len], true),
+        .pty_output_stable => |v| try self.processHostOutput(cb, v, true),
+        .pty_output_alloc => |v| {
+            defer v.alloc.free(v.data);
+            try self.processHostOutput(cb, v.data, true);
+        },
+        .write_small => |v| try io.queueWrite(
+            data,
+            v.data[0..v.len],
+            self.flags.linefeed_mode,
+        ),
+        .write_stable => |v| try io.queueWrite(
+            data,
+            v,
+            self.flags.linefeed_mode,
+        ),
+        .write_alloc => |v| {
+            defer v.alloc.free(v.data);
+            try io.queueWrite(
+                data,
+                v.data,
+                self.flags.linefeed_mode,
+            );
+        },
+        .write_raw_small => |v| try io.queueWrite(
+            data,
+            v.data[0..v.len],
+            false,
+        ),
+        .write_raw_stable => |v| try io.queueWrite(
+            data,
+            v,
+            false,
+        ),
+        .write_raw_alloc => |v| {
+            defer v.alloc.free(v.data);
+            try io.queueWrite(
+                data,
+                v.data,
+                false,
+            );
+        },
+    }
+}
+
+fn handleProcessExit(
+    self: *Thread,
+    cb: *CallbackData,
+    process_exit: termio.Message.ProcessExit,
+) void {
+    self.flushCoalescedResize(cb);
+    _ = cb.io.surface_mailbox.push(.{
+        .child_exited = .{
+            .exit_code = process_exit.exit_code,
+            .runtime_ms = process_exit.runtime_ms,
+        },
+    }, .{ .forever = {} });
+}
+
+fn processHostOutput(
+    self: *Thread,
+    cb: *CallbackData,
+    data: []const u8,
+    notify_screen_change: bool,
+) anyerror!void {
+    self.flushCoalescedResize(cb);
+
+    const messages_alloc = cb.io.terminal_stream.handler.alloc;
+    var messages: std.ArrayListUnmanaged(termio.Message) = .empty;
+    defer messages.deinit(messages_alloc);
+
+    cb.io.processOutputCaptureMessages(data, notify_screen_change, &messages);
+
+    var next: usize = 0;
+    errdefer {
+        while (next < messages.items.len) : (next += 1) {
+            messages.items[next].deinit();
+        }
+    }
+    while (next < messages.items.len) {
+        const message = messages.items[next];
+        next += 1;
+        try self.handleMessage(cb, message);
     }
 }
 
@@ -429,6 +634,15 @@ fn syncResetCallback(
     return .disarm;
 }
 
+fn flushCoalescedResize(self: *Thread, cb: *CallbackData) void {
+    if (self.coalesce_data.resize) |v| {
+        self.coalesce_data.resize = null;
+        cb.io.resize(&cb.data, v) catch |err| {
+            log.warn("error during resize err={}", .{err});
+        };
+    }
+}
+
 fn coalesceCallback(
     cb_: ?*CallbackData,
     _: *xev.Loop,
@@ -444,13 +658,7 @@ fn coalesceCallback(
     };
 
     const cb = cb_ orelse return .disarm;
-
-    if (cb.self.coalesce_data.resize) |v| {
-        cb.self.coalesce_data.resize = null;
-        cb.io.resize(&cb.data, v) catch |err| {
-            log.warn("error during resize err={}", .{err});
-        };
-    }
+    cb.self.flushCoalescedResize(cb);
 
     return .disarm;
 }

@@ -15,6 +15,8 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
 
+threadlocal var termio_message_capture: ?*std.ArrayListUnmanaged(termio.Message) = null;
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
@@ -142,8 +144,30 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (termio_message_capture) |queue| {
+            queue.append(self.alloc, msg) catch |err| {
+                log.warn("failed to capture termio message err={}", .{err});
+                msg.deinit();
+            };
+            return;
+        }
+
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
+    }
+
+    pub fn beginTermioMessageCapture(
+        self: *StreamHandler,
+        messages: *std.ArrayListUnmanaged(termio.Message),
+    ) void {
+        _ = self;
+        std.debug.assert(termio_message_capture == null);
+        termio_message_capture = messages;
+    }
+
+    pub fn endTermioMessageCapture(self: *StreamHandler) void {
+        _ = self;
+        termio_message_capture = null;
     }
 
     /// Send a renderer message and unlock the renderer state mutex

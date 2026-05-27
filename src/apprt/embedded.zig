@@ -1510,6 +1510,7 @@ pub const CAPI = struct {
         parked_host: SurfaceHost,
         renderers: std.ArrayListUnmanaged(*Renderer) = .{},
         owner_renderer: ?*Renderer = null,
+        state_mutex: std.Thread.Mutex = .{},
         state_callback: ?SessionStateCallback = null,
         state_callback_userdata: ?*anyopaque = null,
         state_revision: u64 = 0,
@@ -1542,6 +1543,7 @@ pub const CAPI = struct {
                 .parked_host = parked_host,
                 .renderers = .{},
                 .owner_renderer = null,
+                .state_mutex = .{},
                 .state_callback = null,
                 .state_callback_userdata = null,
                 .state_revision = 0,
@@ -1672,19 +1674,42 @@ pub const CAPI = struct {
             callback: ?SessionStateCallback,
             userdata: ?*anyopaque,
         ) void {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+
             self.state_callback = callback;
             self.state_callback_userdata = userdata;
         }
 
         pub fn notifyStateChange(self: *Session, flags: SessionStateFlags) void {
             if (flags.bits() == 0) return;
-            self.state_revision +%= 1;
-            self.pending_state_flags = self.pending_state_flags.unionWith(flags);
-            const callback = self.state_callback orelse return;
-            callback(self.state_callback_userdata, flags.bits());
+
+            var callback: ?SessionStateCallback = null;
+            var userdata: ?*anyopaque = null;
+            {
+                self.state_mutex.lock();
+                defer self.state_mutex.unlock();
+
+                self.state_revision +%= 1;
+                self.pending_state_flags = self.pending_state_flags.unionWith(flags);
+                callback = self.state_callback;
+                userdata = self.state_callback_userdata;
+            }
+
+            if (callback) |cb| cb(userdata, flags.bits());
+        }
+
+        pub fn stateRevision(self: *Session) u64 {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+
+            return self.state_revision;
         }
 
         pub fn takePendingStateFlags(self: *Session) SessionStateFlags {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+
             const pending = self.pending_state_flags;
             self.pending_state_flags = .{};
             return pending;
@@ -1692,6 +1717,9 @@ pub const CAPI = struct {
 
         fn notifyForegroundProcessIfChanged(self: *Session) SessionStateFlags {
             const current = self.currentForegroundPID();
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+
             if (current == self.last_known_foreground_pid) return .{};
             self.last_known_foreground_pid = current;
             return .{ .foreground_process = true };
@@ -1699,6 +1727,9 @@ pub const CAPI = struct {
 
         fn notifySizeIfChanged(self: *Session) SessionStateFlags {
             const current = self.currentSurfaceSize();
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+
             if (std.meta.eql(current, self.last_known_surface_size)) return .{};
             self.last_known_surface_size = current;
             return .{ .size = true };
@@ -2057,16 +2088,14 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         const slice = ptr orelse return;
-        surface.core_surface.io.processOutput(slice[0..len]);
+        surface.core_surface.io.processOutputBlocking(slice[0..len], true) catch |err| {
+            log.err("error processing surface output err={}", .{err});
+            return;
+        };
     }
 
     export fn ghostty_surface_process_exit(surface: *Surface, exit_code: i32) void {
-        _ = surface.core_surface.io.surface_mailbox.push(.{
-            .child_exited = .{
-                .exit_code = sanitizeProcessExitCode(exit_code),
-                .runtime_ms = 0,
-            },
-        }, .{ .forever = {} });
+        surface.core_surface.io.queueProcessExit(sanitizeProcessExitCode(exit_code), 0);
     }
 
     /// Returns the config to use for surfaces that inherit from this one.
@@ -2438,7 +2467,7 @@ pub const CAPI = struct {
     }
 
     export fn ghostty_session_state_revision(session: *Session) u64 {
-        return session.state_revision;
+        return session.stateRevision();
     }
 
     export fn ghostty_session_take_pending_state_flags(session: *Session) u32 {
@@ -2502,7 +2531,10 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         const slice = ptr orelse return;
-        session.surface.core_surface.io.processOutputNoScreenChange(slice[0..len]);
+        session.surface.core_surface.io.processOutputBlocking(slice[0..len], false) catch |err| {
+            log.err("error processing session output err={}", .{err});
+            return;
+        };
         session.notifyScreenMutation();
     }
 

@@ -7,14 +7,84 @@ const MessageData = @import("../datastruct/main.zig").MessageData;
 
 /// The messages that can be sent to an IO thread.
 ///
-/// This is not a tiny structure (~40 bytes at the time of writing this comment),
-/// but the messages are IO thread sends are also very few. At the current size
-/// we can queue 26,000 messages before consuming a MB of RAM.
+/// This is not a tiny structure (~40 bytes at the time of writing this comment).
+/// At the current size we can queue 26,000 messages before consuming a MB of
+/// RAM, which matters for host-managed output traffic.
 pub const Message = union(enum) {
     /// Represents a write request. Magic number comes from the largest
     /// other union value. It can be upped if we add a larger union member
     /// in the future.
     pub const WriteReq = MessageData(u8, 38);
+
+    pub const ProcessExit = struct {
+        exit_code: u32,
+        runtime_ms: u64,
+    };
+
+    pub const BlockingOutput = struct {
+        data: []const u8,
+        notify_screen_change: bool,
+        mutex: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+        done: bool = false,
+        err: ?anyerror = null,
+
+        pub fn complete(self: *BlockingOutput, err: ?anyerror) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.err = err;
+            self.done = true;
+            self.cond.signal();
+        }
+
+        pub fn wait(self: *BlockingOutput) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (!self.done) self.cond.wait(&self.mutex);
+            if (self.err) |err| return err;
+        }
+
+        pub fn isDone(self: *BlockingOutput) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            return self.done;
+        }
+    };
+
+    pub const BlockingProcessExit = struct {
+        data: ProcessExit,
+        mutex: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+        done: bool = false,
+        err: ?anyerror = null,
+
+        pub fn complete(self: *BlockingProcessExit, err: ?anyerror) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.err = err;
+            self.done = true;
+            self.cond.signal();
+        }
+
+        pub fn wait(self: *BlockingProcessExit) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (!self.done) self.cond.wait(&self.mutex);
+            if (self.err) |err| return err;
+        }
+
+        pub fn isDone(self: *BlockingProcessExit) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            return self.done;
+        }
+    };
 
     /// Request a color scheme report is sent to the pty.
     color_scheme_report: struct {
@@ -73,6 +143,15 @@ pub const Message = union(enum) {
     /// The surface gained or lost focus.
     focused: bool,
 
+    /// The host-managed child process has exited.
+    process_exit: ProcessExit,
+
+    process_exit_blocking: *BlockingProcessExit,
+
+    /// PTY output supplied by a host-managed embedder that must be processed
+    /// before the caller returns.
+    pty_output_blocking: *BlockingOutput,
+
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 
@@ -94,6 +173,18 @@ pub const Message = union(enum) {
     /// terminal linefeed mode.
     write_raw_alloc: WriteReq.Alloc,
 
+    /// PTY output supplied by a host-managed embedder where the data fits in
+    /// the union.
+    pty_output_small: WriteReq.Small,
+
+    /// PTY output supplied by a host-managed embedder where the data pointer
+    /// is stable.
+    pty_output_stable: WriteReq.Stable,
+
+    /// PTY output supplied by a host-managed embedder where the data is
+    /// allocated and must be freed.
+    pty_output_alloc: WriteReq.Alloc,
+
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
     /// be used for stable pointers which can be manually set to write_stable.
@@ -113,6 +204,33 @@ pub const Message = union(enum) {
             .small => |v| Message{ .write_raw_small = v },
             .alloc => |v| Message{ .write_raw_alloc = v },
         };
+    }
+
+    /// Return a PTY output request for host-managed output bytes.
+    pub fn outputReq(alloc: Allocator, data: anytype) !Message {
+        return switch (try WriteReq.init(alloc, data)) {
+            .stable => unreachable,
+            .small => |v| Message{ .pty_output_small = v },
+            .alloc => |v| Message{ .pty_output_alloc = v },
+        };
+    }
+
+    /// Release any memory owned by this message if it will not be handled.
+    pub fn deinit(self: Message) void {
+        switch (self) {
+            .change_config => |config| {
+                config.ptr.deinit();
+                config.alloc.destroy(config.ptr);
+            },
+            .process_exit_blocking => |v| v.complete(error.TermioDraining),
+            .pty_output_blocking => |v| v.complete(error.TermioDraining),
+            .write_alloc,
+            .write_raw_alloc,
+            .pty_output_alloc,
+            => |v| v.alloc.free(v.data),
+
+            else => {},
+        }
     }
 
     /// The types of size reports that we support.

@@ -775,7 +775,11 @@ pub const StreamHandler = struct {
             // We need to start a timer to prevent the emulator being hung
             // forever.
             .synchronized_output => {
-                if (enabled) self.messageWriter(.{ .start_synchronized_output = {} });
+                if (enabled) {
+                    self.messageWriter(.{ .start_synchronized_output = {} });
+                } else {
+                    try self.queueRender();
+                }
             },
 
             .linefeed => {

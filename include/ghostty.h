@@ -60,6 +60,7 @@ typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
 typedef void* ghostty_session_t;
 typedef void* ghostty_renderer_t;
+typedef void* ghostty_mirror_t;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -543,6 +544,15 @@ typedef struct {
   size_t cell_count;
   ghostty_terminal_snapshot_cell_s* cells;
 } ghostty_terminal_snapshot_s;
+
+typedef struct {
+  uint32_t version;
+  uint64_t session_revision;
+  uint64_t owner_epoch;
+  uint16_t columns;
+  uint16_t rows;
+  ghostty_terminal_snapshot_s snapshot;
+} ghostty_render_frame_s;
 
 // Config types
 
@@ -1237,6 +1247,8 @@ GHOSTTY_API bool ghostty_surface_export_snapshot(ghostty_surface_t,
 GHOSTTY_API ghostty_session_config_s ghostty_session_config_new();
 GHOSTTY_API ghostty_session_t ghostty_session_new(ghostty_app_t,
                                                      const ghostty_session_config_s*);
+GHOSTTY_API ghostty_session_t ghostty_session_new_headless(ghostty_app_t,
+                                                              const ghostty_session_config_s*);
 GHOSTTY_API void ghostty_session_free(ghostty_session_t);
 GHOSTTY_API ghostty_surface_t ghostty_session_surface(ghostty_session_t);
 GHOSTTY_API void ghostty_session_refresh(ghostty_session_t);
@@ -1244,6 +1256,7 @@ GHOSTTY_API void ghostty_session_set_content_scale(ghostty_session_t, double, do
 GHOSTTY_API void ghostty_session_set_focus(ghostty_session_t, bool);
 GHOSTTY_API void ghostty_session_set_occlusion(ghostty_session_t, bool);
 GHOSTTY_API void ghostty_session_set_size(ghostty_session_t, uint32_t, uint32_t);
+GHOSTTY_API void ghostty_session_set_grid_size(ghostty_session_t, uint16_t, uint16_t);
 GHOSTTY_API void ghostty_session_set_font_size(ghostty_session_t, float);
 GHOSTTY_API ghostty_surface_size_s ghostty_session_size(ghostty_session_t);
 GHOSTTY_API uint64_t ghostty_session_foreground_pid(ghostty_session_t);
@@ -1266,15 +1279,25 @@ GHOSTTY_API void ghostty_session_send_input_raw(ghostty_session_t,
                                                    uintptr_t);
 GHOSTTY_API bool ghostty_session_export_snapshot(ghostty_session_t,
                                                     ghostty_terminal_snapshot_s*);
+GHOSTTY_API bool ghostty_session_export_render_frame(ghostty_session_t,
+                                                        ghostty_render_frame_s*);
+GHOSTTY_API void ghostty_render_frame_free(ghostty_render_frame_s*);
+
+GHOSTTY_API ghostty_mirror_t ghostty_mirror_new(ghostty_app_t,
+                                                   const ghostty_surface_host_s*,
+                                                   const ghostty_session_config_s*);
+GHOSTTY_API bool ghostty_mirror_apply_render_frame(ghostty_mirror_t,
+                                                      const ghostty_render_frame_s*);
+GHOSTTY_API ghostty_surface_t ghostty_mirror_surface(ghostty_mirror_t);
+GHOSTTY_API bool ghostty_mirror_set_host(ghostty_mirror_t,
+                                            const ghostty_surface_host_s*);
+GHOSTTY_API void ghostty_mirror_free(ghostty_mirror_t);
 
 GHOSTTY_API ghostty_renderer_t ghostty_renderer_new(const ghostty_surface_host_s*);
 GHOSTTY_API void ghostty_renderer_free(ghostty_renderer_t);
 GHOSTTY_API bool ghostty_renderer_attach(ghostty_renderer_t, ghostty_session_t);
-GHOSTTY_API bool ghostty_renderer_attach_viewer(ghostty_renderer_t,
-                                                   ghostty_session_t);
 GHOSTTY_API bool ghostty_renderer_detach(ghostty_renderer_t);
 GHOSTTY_API ghostty_surface_t ghostty_renderer_surface(ghostty_renderer_t);
-GHOSTTY_API bool ghostty_renderer_take_ownership(ghostty_renderer_t);
 GHOSTTY_API bool ghostty_renderer_set_host(ghostty_renderer_t,
                                               const ghostty_surface_host_s*);
 GHOSTTY_API ghostty_session_t ghostty_renderer_session(ghostty_renderer_t);

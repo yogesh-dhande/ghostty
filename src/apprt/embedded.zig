@@ -1504,6 +1504,133 @@ pub const CAPI = struct {
         }
     };
 
+    const RenderFrame = extern struct {
+        version: u32 = 1,
+        session_revision: u64 = 0,
+        owner_epoch: u64 = 0,
+        columns: u16 = 0,
+        rows: u16 = 0,
+        snapshot: Snapshot = .{},
+
+        pub fn deinit(self: *RenderFrame) void {
+            self.snapshot.deinit();
+            self.columns = 0;
+            self.rows = 0;
+        }
+    };
+
+    fn unpackRGB(rgb: u32) terminal.color.RGB {
+        return .{
+            .r = @intCast((rgb >> 16) & 0xFF),
+            .g = @intCast((rgb >> 8) & 0xFF),
+            .b = @intCast(rgb & 0xFF),
+        };
+    }
+
+    fn styleForSnapshotCell(cell: SnapshotCell, snapshot: Snapshot) terminal.Style {
+        var result: terminal.Style = .{};
+        const foreground = unpackRGB(cell.foreground_rgb);
+        const background = unpackRGB(cell.background_rgb);
+        if (!foreground.eql(unpackRGB(snapshot.default_foreground_rgb))) {
+            result.fg_color = .{ .rgb = foreground };
+        }
+        if (!background.eql(unpackRGB(snapshot.default_background_rgb))) {
+            result.bg_color = .{ .rgb = background };
+        }
+        result.flags.bold = (cell.flags & SnapshotFlags.bold) != 0;
+        result.flags.italic = (cell.flags & SnapshotFlags.italic) != 0;
+        result.flags.faint = (cell.flags & SnapshotFlags.faint) != 0;
+        result.flags.inverse = (cell.flags & SnapshotFlags.inverse) != 0;
+        result.flags.invisible = (cell.flags & SnapshotFlags.invisible) != 0;
+        result.flags.strikethrough = (cell.flags & SnapshotFlags.strikethrough) != 0;
+        result.flags.underline = if ((cell.flags & SnapshotFlags.underline) != 0) .single else .none;
+        return result;
+    }
+
+    fn cellForSnapshotCell(cell: SnapshotCell) terminal.Cell {
+        if (cell.codepoint == 0) return .{};
+        var result = terminal.Cell.init(@intCast(cell.codepoint));
+        if ((cell.flags & SnapshotFlags.spacer) != 0) {
+            result.wide = .spacer_tail;
+        }
+        return result;
+    }
+
+    fn writeSnapshotCell(
+        screen: *terminal.Screen,
+        page: *terminal.Page,
+        row: *terminal.page.Row,
+        dst: *terminal.Cell,
+        cell: SnapshotCell,
+        snapshot: Snapshot,
+    ) !void {
+        var next_cell = cellForSnapshotCell(cell);
+        const next_style = styleForSnapshotCell(cell, snapshot);
+        if (!next_style.default()) {
+            const style_id = try page.styles.add(page.memory, next_style);
+            next_cell.style_id = style_id;
+            row.styled = true;
+        }
+        if (next_cell.codepoint() != 0 or !next_style.default()) {
+            dst.* = next_cell;
+        } else if (!unpackRGB(cell.background_rgb).eql(unpackRGB(snapshot.default_background_rgb))) {
+            dst.* = .{
+                .content_tag = .bg_color_rgb,
+                .content = .{ .color_rgb = .{
+                    .r = @intCast((cell.background_rgb >> 16) & 0xFF),
+                    .g = @intCast((cell.background_rgb >> 8) & 0xFF),
+                    .b = @intCast(cell.background_rgb & 0xFF),
+                } },
+            };
+        }
+        row.dirty = true;
+        screen.dirty.selection = true;
+    }
+
+    fn applySnapshotToSurface(surface: *Surface, snapshot: Snapshot) !void {
+        if (snapshot.columns == 0 or snapshot.rows == 0) return error.InvalidRenderFrame;
+        const expected_cell_count = @as(usize, snapshot.columns) * @as(usize, snapshot.rows);
+        if (snapshot.cell_count < expected_cell_count or snapshot.cells == null) return error.InvalidRenderFrame;
+
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const terminal_state = core_surface.renderer_state.terminal;
+        try terminal_state.resize(
+            global.alloc,
+            @intCast(snapshot.columns),
+            @intCast(snapshot.rows),
+        );
+        terminal_state.fullReset();
+        terminal_state.colors.foreground.set(unpackRGB(snapshot.default_foreground_rgb));
+        terminal_state.colors.background.set(unpackRGB(snapshot.default_background_rgb));
+        terminal_state.flags.dirty.clear = true;
+        terminal_state.flags.dirty.palette = true;
+
+        const screen = terminal_state.screens.active;
+        const page = &screen.pages.pages.last.?.data;
+        const rows = page.rows.ptr(page.memory)[0..snapshot.rows];
+        const frame_cells = snapshot.cells.?[0..expected_cell_count];
+
+        for (rows, 0..) |*row, row_index| {
+            const cells = row.cells.ptr(page.memory)[0..snapshot.columns];
+            screen.clearCells(page, row, cells);
+            row.* = .{ .cells = row.cells, .dirty = true };
+            const frame_row = frame_cells[row_index * snapshot.columns .. (row_index + 1) * snapshot.columns];
+            for (cells, frame_row) |*dst, frame_cell| {
+                try writeSnapshotCell(screen, page, row, dst, frame_cell, snapshot);
+            }
+        }
+
+        screen.cursorAbsolute(
+            @min(snapshot.cursor_column, snapshot.columns - 1),
+            @min(snapshot.cursor_row, snapshot.rows - 1),
+        );
+        terminal_state.modes.set(.cursor_visible, snapshot.cursor_visible);
+        screen.cursor.page_row.dirty = true;
+    }
+
     const Session = struct {
         app: *App,
         surface: *Surface,
@@ -1813,6 +1940,49 @@ pub const CAPI = struct {
 
         pub fn isOwner(self: *const Renderer) bool {
             return self.role == .owner;
+        }
+    };
+
+    const Mirror = struct {
+        app: *App,
+        session: *Session,
+        renderer: *Renderer,
+
+        pub fn init(
+            self: *Mirror,
+            app: *App,
+            host: SurfaceHost,
+            config: SessionConfig,
+        ) !void {
+            var mirror_config = config;
+            mirror_config.surface.platform_tag = host.platform_tag;
+            mirror_config.surface.platform = host.platform;
+            mirror_config.surface.scale_factor = host.scale_factor;
+            mirror_config.parked_host = host;
+
+            const session = try global.alloc.create(Session);
+            errdefer global.alloc.destroy(session);
+            try session.init(app, mirror_config);
+            errdefer session.deinit();
+
+            const renderer_handle = try global.alloc.create(Renderer);
+            errdefer global.alloc.destroy(renderer_handle);
+            renderer_handle.* = .{
+                .host = host,
+                .attached_session = null,
+            };
+            try session.attachRenderer(renderer_handle);
+
+            self.* = .{
+                .app = app,
+                .session = session,
+                .renderer = renderer_handle,
+            };
+        }
+
+        pub fn deinit(self: *Mirror) void {
+            ghostty_renderer_free(self.renderer);
+            ghostty_session_free(self.session);
         }
     };
 
@@ -2407,6 +2577,13 @@ pub const CAPI = struct {
         return session;
     }
 
+    export fn ghostty_session_new_headless(
+        app: *App,
+        config: *const SessionConfig,
+    ) ?*Session {
+        return ghostty_session_new(app, config);
+    }
+
     export fn ghostty_session_free(session: *Session) void {
         session.deinit();
         global.alloc.destroy(session);
@@ -2440,6 +2617,15 @@ pub const CAPI = struct {
         flags = flags.unionWith(.{ .screen = true });
         flags = flags.unionWith(session.notifyForegroundProcessIfChanged());
         session.notifyStateChange(flags);
+    }
+
+    export fn ghostty_session_set_grid_size(session: *Session, columns: u16, rows: u16) void {
+        const current_size = ghostty_session_size(session);
+        const cell_width = if (current_size.cell_width_px > 0) current_size.cell_width_px else 9;
+        const cell_height = if (current_size.cell_height_px > 0) current_size.cell_height_px else 18;
+        const width_px = @as(u32, columns) * @as(u32, cell_width);
+        const height_px = @as(u32, rows) * @as(u32, cell_height);
+        ghostty_session_set_size(session, width_px, height_px);
     }
 
     export fn ghostty_session_set_font_size(session: *Session, points: f32) void {
@@ -2531,7 +2717,7 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         const slice = ptr orelse return;
-        session.surface.core_surface.io.processOutputBlocking(slice[0..len], false) catch |err| {
+        session.surface.core_surface.io.processOutputBlocking(slice[0..len], true) catch |err| {
             log.err("error processing session output err={}", .{err});
             return;
         };
@@ -2552,6 +2738,73 @@ pub const CAPI = struct {
         result: *Snapshot,
     ) bool {
         return exportSnapshotFromSurface(session.surface, result);
+    }
+
+    export fn ghostty_session_export_render_frame(
+        session: *Session,
+        result: *RenderFrame,
+    ) bool {
+        result.* = .{};
+        if (!ghostty_session_export_snapshot(session, &result.snapshot)) return false;
+        result.version = 1;
+        result.session_revision = session.stateRevision();
+        result.owner_epoch = 0;
+        result.columns = result.snapshot.columns;
+        result.rows = result.snapshot.rows;
+        return true;
+    }
+
+    export fn ghostty_render_frame_free(frame: *RenderFrame) void {
+        frame.deinit();
+    }
+
+    export fn ghostty_mirror_new(
+        app: *App,
+        host: *const SurfaceHost,
+        config: *const SessionConfig,
+    ) ?*Mirror {
+        const mirror = global.alloc.create(Mirror) catch |err| {
+            log.err("error allocating mirror err={}", .{err});
+            return null;
+        };
+        mirror.init(app, host.*, config.*) catch |err| {
+            log.err("error initializing mirror err={}", .{err});
+            global.alloc.destroy(mirror);
+            return null;
+        };
+        return mirror;
+    }
+
+    export fn ghostty_mirror_apply_render_frame(
+        mirror: *Mirror,
+        frame: *const RenderFrame,
+    ) bool {
+        if (frame.version != 1) return false;
+        applySnapshotToSurface(mirror.session.surface, frame.snapshot) catch |err| {
+            log.err("error applying mirror render frame err={}", .{err});
+            return false;
+        };
+        mirror.session.surface.core_surface.draw() catch |err| {
+            log.err("error redrawing mirror render frame err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_mirror_surface(mirror: *Mirror) *Surface {
+        return mirror.session.surface;
+    }
+
+    export fn ghostty_mirror_set_host(
+        mirror: *Mirror,
+        host: *const SurfaceHost,
+    ) bool {
+        return ghostty_renderer_set_host(mirror.renderer, host);
+    }
+
+    export fn ghostty_mirror_free(mirror: *Mirror) void {
+        mirror.deinit();
+        global.alloc.destroy(mirror);
     }
 
     export fn ghostty_renderer_new(host: *const SurfaceHost) ?*Renderer {
@@ -2588,17 +2841,6 @@ pub const CAPI = struct {
         return true;
     }
 
-    export fn ghostty_renderer_attach_viewer(
-        renderer_handle: *Renderer,
-        session: *Session,
-    ) bool {
-        session.attachViewer(renderer_handle) catch |err| {
-            log.err("error attaching viewer renderer err={}", .{err});
-            return false;
-        };
-        return true;
-    }
-
     export fn ghostty_renderer_detach(renderer_handle: *Renderer) bool {
         renderer_handle.detach() catch |err| {
             log.err("error detaching renderer err={}", .{err});
@@ -2610,14 +2852,6 @@ pub const CAPI = struct {
     export fn ghostty_renderer_surface(renderer_handle: *Renderer) ?*Surface {
         const session = renderer_handle.attached_session orelse return null;
         return session.surface;
-    }
-
-    export fn ghostty_renderer_take_ownership(renderer_handle: *Renderer) bool {
-        renderer_handle.takeOwnership() catch |err| {
-            log.err("error promoting renderer ownership err={}", .{err});
-            return false;
-        };
-        return true;
     }
 
     export fn ghostty_renderer_set_host(

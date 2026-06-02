@@ -458,6 +458,16 @@ pub const SurfaceHost = extern struct {
         _ = std.meta.intToEnum(PlatformTag, self.platform_tag) catch return false;
         return true;
     }
+
+    pub fn eql(self: SurfaceHost, other: SurfaceHost) bool {
+        if (self.platform_tag != other.platform_tag) return false;
+        if (self.scale_factor != other.scale_factor) return false;
+        const tag = std.meta.intToEnum(PlatformTag, self.platform_tag) catch return false;
+        return switch (tag) {
+            .macos => self.platform.macos.nsview == other.platform.macos.nsview,
+            .ios => self.platform.ios.uiview == other.platform.ios.uiview,
+        };
+    }
 };
 
 pub const SurfaceIOBackend = enum(c_int) {
@@ -1724,6 +1734,18 @@ pub const CAPI = struct {
             if (renderer_handle.role == .detached) renderer_handle.role = .viewer;
         }
 
+        pub fn attachInitialOwnerRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session) |existing_session| {
+                if (existing_session != self) try renderer_handle.detach();
+            }
+
+            try self.ensureRendererAttached(renderer_handle);
+            if (self.owner_renderer) |existing_owner| existing_owner.role = .viewer;
+            self.owner_renderer = renderer_handle;
+            renderer_handle.attached_session = self;
+            renderer_handle.role = .owner;
+        }
+
         pub fn promoteRenderer(self: *Session, renderer_handle: *Renderer) !void {
             const old_session = renderer_handle.attached_session;
             const old_role = renderer_handle.role;
@@ -1924,6 +1946,11 @@ pub const CAPI = struct {
 
         pub fn setHost(self: *Renderer, host: SurfaceHost) !void {
             if (self.attached_session) |session| {
+                if (self.host.eql(host)) {
+                    self.host = host;
+                    return;
+                }
+
                 if (self.role != .owner) {
                     self.host = host;
                     return;
@@ -1971,7 +1998,7 @@ pub const CAPI = struct {
                 .host = host,
                 .attached_session = null,
             };
-            try session.attachRenderer(renderer_handle);
+            try session.attachInitialOwnerRenderer(renderer_handle);
 
             self.* = .{
                 .app = app,

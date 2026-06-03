@@ -1865,11 +1865,26 @@ pub const ScrollViewport = union(Tag) {
 
 /// Scroll the viewport of the terminal grid.
 pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
+    const before_offset = self.screens.active.pages.scrollbar().offset;
     self.screens.active.scroll(switch (behavior) {
         .top => .{ .top = {} },
         .bottom => .{ .active = {} },
         .delta => |delta| .{ .delta_row = delta },
     });
+    const after_offset = self.screens.active.pages.scrollbar().offset;
+
+    if (after_offset == before_offset) return;
+    const scroll_rows = if (after_offset > before_offset)
+        after_offset - before_offset
+    else
+        before_offset - after_offset;
+    if (scroll_rows >= @as(usize, self.rows)) return;
+
+    const delta_rows: i32 = if (after_offset > before_offset)
+        -@as(i32, @intCast(scroll_rows))
+    else
+        @as(i32, @intCast(scroll_rows));
+    self.recordRenderScrollRect(0, self.rows, 0, self.cols, delta_rows, 0);
 }
 
 /// To be called before shifting a row (as in insertLines and deleteLines)
@@ -4943,6 +4958,39 @@ test "Terminal: print writes to bottom if scrolled" {
         .x = t.screens.active.cursor.x,
         .y = t.screens.active.cursor.y,
     } }));
+}
+
+test "Terminal: scrollViewport records render scroll rect for scrollback" {
+    var t = try init(testing.allocator, .{
+        .cols = 1,
+        .rows = 4,
+        .max_scrollback = 20,
+    });
+    defer t.deinit(testing.allocator);
+
+    for ("abcdef") |c| try t.print(c);
+    t.clearPendingRenderScrollRects();
+
+    t.scrollViewport(.{ .delta = -1 });
+    var rects = t.pendingRenderScrollRects();
+    try testing.expectEqual(@as(usize, 1), rects.len);
+    try testing.expectEqual(@as(size.CellCountInt, 0), rects[0].row_start);
+    try testing.expectEqual(@as(size.CellCountInt, 4), rects[0].row_count);
+    try testing.expectEqual(@as(size.CellCountInt, 0), rects[0].column_start);
+    try testing.expectEqual(@as(size.CellCountInt, 1), rects[0].column_count);
+    try testing.expectEqual(@as(i32, 1), rects[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), rects[0].delta_columns);
+
+    t.clearPendingRenderScrollRects();
+    t.scrollViewport(.{ .delta = 1 });
+    rects = t.pendingRenderScrollRects();
+    try testing.expectEqual(@as(usize, 1), rects.len);
+    try testing.expectEqual(@as(i32, -1), rects[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), rects[0].delta_columns);
+
+    t.clearPendingRenderScrollRects();
+    t.scrollViewport(.{ .delta = 1 });
+    try testing.expectEqual(@as(usize, 0), t.pendingRenderScrollRects().len);
 }
 
 test "Terminal: print charset" {

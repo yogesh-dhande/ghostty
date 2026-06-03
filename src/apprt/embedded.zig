@@ -1494,6 +1494,15 @@ pub const CAPI = struct {
         flags: u16 = 0,
     };
 
+    const SnapshotScrollRect = extern struct {
+        row_start: u16 = 0,
+        row_count: u16 = 0,
+        column_start: u16 = 0,
+        column_count: u16 = 0,
+        delta_rows: i32 = 0,
+        delta_columns: i32 = 0,
+    };
+
     const Snapshot = extern struct {
         columns: u16 = 0,
         rows: u16 = 0,
@@ -1504,6 +1513,8 @@ pub const CAPI = struct {
         default_background_rgb: u32 = 0,
         cell_count: usize = 0,
         cells: ?[*]SnapshotCell = null,
+        scroll_rect_count: usize = 0,
+        scroll_rects: ?[*]SnapshotScrollRect = null,
 
         pub fn deinit(self: *Snapshot) void {
             if (self.cells) |ptr| {
@@ -1511,6 +1522,11 @@ pub const CAPI = struct {
                 self.cells = null;
             }
             self.cell_count = 0;
+            if (self.scroll_rects) |ptr| {
+                global.alloc.free(ptr[0..self.scroll_rect_count]);
+                self.scroll_rects = null;
+            }
+            self.scroll_rect_count = 0;
         }
     };
 
@@ -2497,6 +2513,32 @@ pub const CAPI = struct {
         }
 
         const cursor = render_state.cursor.viewport;
+        const pending_scroll_rects = if (terminal_state.pendingRenderScrollRectsOverflowed())
+            &[_]terminal.Terminal.RenderScrollRect{}
+        else
+            terminal_state.pendingRenderScrollRects();
+        var copied_scroll_rects: []SnapshotScrollRect = &.{};
+        var scroll_rect_count = pending_scroll_rects.len;
+        if (pending_scroll_rects.len > 0) {
+            copied_scroll_rects = global.alloc.alloc(SnapshotScrollRect, pending_scroll_rects.len) catch |err| blk: {
+                log.warn("error allocating snapshot scroll rects err={}", .{err});
+                scroll_rect_count = 0;
+                break :blk &.{};
+            };
+            if (scroll_rect_count > 0) {
+                for (pending_scroll_rects, 0..) |operation, index| {
+                    copied_scroll_rects[index] = .{
+                        .row_start = operation.row_start,
+                        .row_count = operation.row_count,
+                        .column_start = operation.column_start,
+                        .column_count = operation.column_count,
+                        .delta_rows = operation.delta_rows,
+                        .delta_columns = operation.delta_columns,
+                    };
+                }
+            }
+        }
+
         result.* = .{
             .columns = columns,
             .rows = rows,
@@ -2507,7 +2549,10 @@ pub const CAPI = struct {
             .default_background_rgb = packRGB(default_bg),
             .cell_count = cell_count,
             .cells = if (cell_count > 0) copied_cells.ptr else null,
+            .scroll_rect_count = scroll_rect_count,
+            .scroll_rects = if (scroll_rect_count > 0) copied_scroll_rects.ptr else null,
         };
+        terminal_state.clearPendingRenderScrollRects();
         return true;
     }
 

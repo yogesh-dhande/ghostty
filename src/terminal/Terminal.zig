@@ -62,6 +62,12 @@ height_px: u32 = 0,
 /// The current scrolling region.
 scrolling_region: ScrollingRegion,
 
+/// Scroll operations that happened since the last embedded snapshot export.
+/// These are only a render hint; the exported snapshot remains authoritative.
+pending_render_scroll_rects: [64]RenderScrollRect = undefined,
+pending_render_scroll_rect_count: u8 = 0,
+pending_render_scroll_rect_overflow: bool = false,
+
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
 
@@ -181,6 +187,90 @@ pub const ScrollingRegion = struct {
     left: size.CellCountInt,
     right: size.CellCountInt,
 };
+
+pub const RenderScrollRect = struct {
+    row_start: size.CellCountInt,
+    row_count: size.CellCountInt,
+    column_start: size.CellCountInt,
+    column_count: size.CellCountInt,
+    delta_rows: i32,
+    delta_columns: i32,
+};
+
+pub fn pendingRenderScrollRects(self: *const Terminal) []const RenderScrollRect {
+    const count: usize = @intCast(self.pending_render_scroll_rect_count);
+    return self.pending_render_scroll_rects[0..count];
+}
+
+pub fn pendingRenderScrollRectsOverflowed(self: *const Terminal) bool {
+    return self.pending_render_scroll_rect_overflow;
+}
+
+pub fn clearPendingRenderScrollRects(self: *Terminal) void {
+    self.pending_render_scroll_rect_count = 0;
+    self.pending_render_scroll_rect_overflow = false;
+}
+
+fn recordRenderScrollRect(
+    self: *Terminal,
+    row_start: size.CellCountInt,
+    row_count: size.CellCountInt,
+    column_start: size.CellCountInt,
+    column_count: size.CellCountInt,
+    delta_rows: i32,
+    delta_columns: i32,
+) void {
+    if (self.pending_render_scroll_rect_overflow) return;
+    if (row_count == 0 or column_count == 0) return;
+    if (delta_rows == 0 and delta_columns == 0) return;
+
+    const row_end = @as(usize, row_start) + @as(usize, row_count);
+    const column_end = @as(usize, column_start) + @as(usize, column_count);
+    if (row_end > self.rows or column_end > self.cols) return;
+    if (delta_rows != 0 and @as(u32, @abs(delta_rows)) >= @as(u32, row_count)) return;
+    if (delta_columns != 0 and @as(u32, @abs(delta_columns)) >= @as(u32, column_count)) return;
+
+    if (self.pending_render_scroll_rect_count > 0) {
+        const last_index: usize = @intCast(self.pending_render_scroll_rect_count - 1);
+        const last = &self.pending_render_scroll_rects[last_index];
+        if (last.row_start == row_start and
+            last.row_count == row_count and
+            last.column_start == column_start and
+            last.column_count == column_count and
+            last.delta_columns == 0 and
+            delta_columns == 0 and
+            last.delta_rows != 0 and
+            delta_rows != 0 and
+            (last.delta_rows > 0) == (delta_rows > 0))
+        {
+            const combined_delta_rows = last.delta_rows + delta_rows;
+            if (@as(u32, @abs(combined_delta_rows)) >= @as(u32, row_count)) {
+                self.pending_render_scroll_rect_count = 0;
+                self.pending_render_scroll_rect_overflow = true;
+                return;
+            }
+            last.delta_rows = combined_delta_rows;
+            return;
+        }
+    }
+
+    const operation_index: usize = @intCast(self.pending_render_scroll_rect_count);
+    if (operation_index >= self.pending_render_scroll_rects.len) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+
+    self.pending_render_scroll_rects[operation_index] = .{
+        .row_start = row_start,
+        .row_count = row_count,
+        .column_start = column_start,
+        .column_count = column_count,
+        .delta_rows = delta_rows,
+        .delta_columns = delta_columns,
+    };
+    self.pending_render_scroll_rect_count += 1;
+}
 
 pub const Options = struct {
     cols: size.CellCountInt,
@@ -1484,6 +1574,14 @@ pub fn index(self: *Terminal) !void {
             self.scrolling_region.left == 0 and
             self.scrolling_region.right == self.cols - 1)
         {
+            self.recordRenderScrollRect(
+                0,
+                self.scrolling_region.bottom + 1,
+                0,
+                self.cols,
+                -1,
+                0,
+            );
             try screen.cursorScrollAbove();
             return;
         }
@@ -1506,6 +1604,14 @@ pub fn index(self: *Terminal) !void {
 
         // Otherwise use a fast path function from PageList to efficiently
         // scroll the contents of the scrolling region.
+        self.recordRenderScrollRect(
+            self.scrolling_region.top,
+            self.scrolling_region.bottom - self.scrolling_region.top + 1,
+            0,
+            self.cols,
+            -1,
+            0,
+        );
 
         // Preserve old cursor just for assertions
         const old_cursor = screen.cursor;
@@ -1703,6 +1809,14 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
         // Clamp count to the scroll region height.
         const region_height = self.scrolling_region.bottom + 1;
         const adjusted_count = @min(count, region_height);
+        self.recordRenderScrollRect(
+            0,
+            self.scrolling_region.bottom + 1,
+            0,
+            self.cols,
+            -@as(i32, @intCast(adjusted_count)),
+            0,
+        );
 
         // TODO: Create an optimized version that can scroll N times
         // This isn't critical because in most cases, scrollUp is used
@@ -1874,6 +1988,14 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+    self.recordRenderScrollRect(
+        self.screens.active.cursor.y,
+        @intCast(rem),
+        self.scrolling_region.left,
+        self.scrolling_region.right - self.scrolling_region.left + 1,
+        @as(i32, @intCast(adjusted_count)),
+        0,
+    );
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
@@ -2074,6 +2196,14 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+    self.recordRenderScrollRect(
+        self.screens.active.cursor.y,
+        @intCast(rem),
+        self.scrolling_region.left,
+        self.scrolling_region.right - self.scrolling_region.left + 1,
+        -@as(i32, @intCast(adjusted_count)),
+        0,
+    );
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.

@@ -534,6 +534,15 @@ typedef struct {
 } ghostty_terminal_snapshot_cell_s;
 
 typedef struct {
+  uint16_t row_start;
+  uint16_t row_count;
+  uint16_t column_start;
+  uint16_t column_count;
+  int32_t delta_rows;
+  int32_t delta_columns;
+} ghostty_render_scroll_rect_s;
+
+typedef struct {
   uint16_t columns;
   uint16_t rows;
   uint16_t cursor_column;
@@ -543,6 +552,8 @@ typedef struct {
   uint32_t default_background_rgb;
   size_t cell_count;
   ghostty_terminal_snapshot_cell_s* cells;
+  size_t scroll_rect_count;
+  ghostty_render_scroll_rect_s* scroll_rects;
 } ghostty_terminal_snapshot_s;
 
 typedef struct {

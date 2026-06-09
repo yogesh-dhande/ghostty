@@ -1480,6 +1480,8 @@ pub const CAPI = struct {
         const strikethrough: u16 = 1 << 6;
         const underline: u16 = 1 << 7;
         const spacer: u16 = 1 << 10;
+        const row_wrap: u16 = 1 << 11;
+        const row_wrap_continuation: u16 = 1 << 12;
     };
 
     const SessionConfig = extern struct {
@@ -1644,6 +1646,11 @@ pub const CAPI = struct {
             screen.clearCells(page, row, cells);
             row.* = .{ .cells = row.cells, .dirty = true };
             const frame_row = frame_cells[row_index * snapshot.columns .. (row_index + 1) * snapshot.columns];
+            if (frame_row.len > 0) {
+                const row_flags = frame_row[0].flags;
+                row.wrap = (row_flags & SnapshotFlags.row_wrap) != 0;
+                row.wrap_continuation = (row_flags & SnapshotFlags.row_wrap_continuation) != 0;
+            }
             for (cells, frame_row) |*dst, frame_cell| {
                 try writeSnapshotCell(screen, page, row, dst, frame_cell, snapshot);
             }
@@ -2439,6 +2446,13 @@ pub const CAPI = struct {
         return flags;
     }
 
+    fn snapshotFlagsForRow(row: terminal.page.Row) u16 {
+        var flags: u16 = 0;
+        if (row.wrap) flags |= SnapshotFlags.row_wrap;
+        if (row.wrap_continuation) flags |= SnapshotFlags.row_wrap_continuation;
+        return flags;
+    }
+
     fn exportSnapshotFromSurface(
         surface: *Surface,
         result: *Snapshot,
@@ -2483,6 +2497,7 @@ pub const CAPI = struct {
         errdefer if (cell_count > 0) global.alloc.free(copied_cells);
 
         const row_data = render_state.row_data.slice();
+        const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
         const palette = &render_state.colors.palette;
         const default_fg = render_state.colors.foreground;
@@ -2493,6 +2508,7 @@ pub const CAPI = struct {
             const cells_slice = row_cells[row_index].slice();
             const raws = cells_slice.items(.raw);
             const styles = cells_slice.items(.style);
+            const row_flags = snapshotFlagsForRow(row_rows[row_index]);
 
             for (0..columns) |column_index| {
                 const raw = raws[column_index];
@@ -2506,7 +2522,7 @@ pub const CAPI = struct {
                     .codepoint = if (raw.hasText()) @intCast(raw.codepoint()) else 0,
                     .foreground_rgb = packRGB(foreground),
                     .background_rgb = packRGB(background),
-                    .flags = snapshotFlagsForCell(raw, style),
+                    .flags = snapshotFlagsForCell(raw, style) | row_flags,
                 };
                 cell_index += 1;
             }

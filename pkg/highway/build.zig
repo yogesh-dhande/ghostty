@@ -25,6 +25,10 @@ pub fn build(b: *std.Build) !void {
     // Our highway package is free of libc at runtime (uses no symbols)
     // but does require libc headers at compile time.
     lib.linkLibC();
+    if (target.result.os.tag.isDarwin()) {
+        const apple_sdk = @import("apple_sdk");
+        try apple_sdk.addPaths(b, lib);
+    }
 
     lib.addIncludePath(b.path("src/cpp"));
     if (upstream_) |upstream| {

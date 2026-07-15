@@ -25,7 +25,7 @@ const oni = @import("oniguruma");
 /// There are many complicated cases where these heuristics break down, but
 /// handling them well requires a non-regex approach.
 const url_schemes =
-    \\https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:
+    \\https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:|spaces://
 ;
 
 const ipv6_url_pattern =
@@ -188,6 +188,10 @@ test "url regex" {
         .{
             .input = "match tel://+12123456789 phone numbers",
             .expect = "tel://+12123456789",
+        },
+        .{
+            .input = "open spaces://terminal/6D2A81F3?device=mac-mini in Spaces",
+            .expect = "spaces://terminal/6D2A81F3?device=mac-mini",
         },
         .{
             .input = "match with query url https://example.com?query=1&other=2 and more text.",

@@ -1025,6 +1025,10 @@ pub const Surface = struct {
             return;
         };
 
+        // Modifier state must be refreshed even when the position is later
+        // deduplicated so subsequent mouse events use the current modifiers.
+        self.core_surface.modsChanged(mods);
+
         // There are cases where the platform reports a mouse motion event
         // without the cursor actually moving. For example, on macOS, updating
         // the window title can trigger a phantom mouse-move event at the same

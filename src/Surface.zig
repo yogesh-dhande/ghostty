@@ -1721,11 +1721,12 @@ fn searchCallback_(
 /// Call this when modifiers change. This is safe to call even if modifiers
 /// match the previous state.
 ///
-/// This is not publicly exported because modifier changes happen implicitly
-/// on mouse callbacks, key callbacks, etc.
+/// This is public to apprts that deduplicate mouse movement before forwarding
+/// cursor position callbacks. It is not exported through the C API because
+/// modifier changes otherwise happen implicitly on mouse and key callbacks.
 ///
 /// The renderer state mutex MUST NOT be held.
-fn modsChanged(self: *Surface, mods: input.Mods) void {
+pub fn modsChanged(self: *Surface, mods: input.Mods) void {
     // The only place we keep track of mods currently is on the mouse.
     if (!self.mouse.mods.equal(mods)) {
         // The mouse mods only contain binding modifiers since we don't

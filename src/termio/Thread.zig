@@ -14,7 +14,8 @@ pub const Thread = @This();
 const std = @import("std");
 const ArenaAllocator = std.heap.ArenaAllocator;
 const builtin = @import("builtin");
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const termio = @import("../termio.zig");
@@ -150,8 +151,8 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
         // the error to the surface thread and let the apprt deal with it
         // in some way but this works for now. Without this, the user would
         // just see a blank terminal window.
-        io.renderer_state.mutex.lock();
-        defer io.renderer_state.mutex.unlock();
+        io.renderer_state.mutex.lockUncancelable(global.io());
+        defer io.renderer_state.mutex.unlock(global.io());
         const t = io.renderer_state.terminal;
 
         // Hide the cursor
@@ -348,10 +349,10 @@ fn queueBlockingOutputOnCurrentThread(
     var redraw = false;
     var first_err: ?anyerror = null;
 
-    while (queue.push(.{
+    while (queue.push(global.io(), .{
         .pty_output_blocking = output,
     }, .{ .instant = {} }) == 0) {
-        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
         redraw = true;
         self.handleMessage(cb, message) catch |err| {
             if (first_err == null) first_err = err;
@@ -359,7 +360,7 @@ fn queueBlockingOutputOnCurrentThread(
     }
 
     while (!output.isDone()) {
-        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
         redraw = true;
         self.handleMessage(cb, message) catch |err| {
             if (first_err == null) first_err = err;
@@ -384,10 +385,10 @@ fn queueBlockingProcessExitOnCurrentThread(
     var redraw = false;
     var first_err: ?anyerror = null;
 
-    while (queue.push(.{
+    while (queue.push(global.io(), .{
         .process_exit_blocking = process_exit,
     }, .{ .instant = {} }) == 0) {
-        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
         redraw = true;
         self.handleMessage(cb, message) catch |err| {
             if (first_err == null) first_err = err;
@@ -395,7 +396,7 @@ fn queueBlockingProcessExitOnCurrentThread(
     }
 
     while (!process_exit.isDone()) {
-        const message = queue.pop() orelse return error.TermioMailboxUnavailable;
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
         redraw = true;
         self.handleMessage(cb, message) catch |err| {
             if (first_err == null) first_err = err;
@@ -423,7 +424,7 @@ fn drainMailbox(
 
     // If we're draining, we just drain the mailbox and return.
     if (self.flags.drain) {
-        while (mailbox.pop()) |message| message.deinit();
+        while (mailbox.pop(global.io())) |message| message.deinit();
         return;
     }
 
@@ -432,7 +433,7 @@ fn drainMailbox(
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
     var first_err: ?anyerror = null;
-    while (mailbox.pop()) |message| {
+    while (mailbox.pop(global.io())) |message| {
         // If we have a message we always redraw
         redraw = true;
 

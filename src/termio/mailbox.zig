@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const renderer = @import("../renderer.zig");
 const termio = @import("../termio.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
@@ -32,7 +33,7 @@ pub const Mailbox = union(enum) {
         wakeup: xev.Async,
         active: std.atomic.Value(bool) = .init(false),
         closed: bool = false,
-        cond_active: std.Thread.Condition = .{},
+        cond_active: std.Io.Condition = .init,
     },
 
     /// Init the SPSC writer.
@@ -64,7 +65,7 @@ pub const Mailbox = union(enum) {
     pub fn send(
         self: *Mailbox,
         msg: termio.Message,
-        mutex: ?*std.Thread.Mutex,
+        mutex: ?*std.Io.Mutex,
     ) void {
         _ = self.sendTracked(msg, mutex);
     }
@@ -74,13 +75,13 @@ pub const Mailbox = union(enum) {
     pub fn sendTracked(
         self: *Mailbox,
         msg: termio.Message,
-        mutex: ?*std.Thread.Mutex,
+        mutex: ?*std.Io.Mutex,
     ) bool {
         switch (self.*) {
             .spsc => |*mb| send: {
                 // Try to write to the queue with an instant timeout. This is the
                 // fast path because we can queue without a lock.
-                if (mb.queue.push(msg, .{ .instant = {} }) > 0) break :send;
+                if (mb.queue.push(global.io(), msg, .{ .instant = {} }) > 0) break :send;
 
                 // If we enter this conditional, the queue is full. We wake up
                 // the writer thread so that it can process messages to clear up
@@ -100,9 +101,9 @@ pub const Mailbox = union(enum) {
                 // are other messages in the writer queue (resize, focus) that
                 // could acquire the lock. This is why we have to release our lock
                 // here.
-                if (mutex) |m| m.unlock();
-                defer if (mutex) |m| m.lock();
-                if (mb.queue.push(msg, .{ .forever = {} }) == 0) return false;
+                if (mutex) |m| m.unlock(global.io());
+                defer if (mutex) |m| m.lockUncancelable(global.io());
+                if (mb.queue.push(global.io(), msg, .{ .forever = {} }) == 0) return false;
             },
         }
 
@@ -117,9 +118,10 @@ pub const Mailbox = union(enum) {
     ) bool {
         switch (self.*) {
             .spsc => |*mb| {
+                const io = global.io();
                 const queue = mb.queue;
-                queue.mutex.lock();
-                defer queue.mutex.unlock();
+                queue.mutex.lockUncancelable(io);
+                defer queue.mutex.unlock(io);
 
                 if (!mb.active.load(.acquire)) return false;
                 if (queue.len == queue.data.len) return false;
@@ -134,7 +136,7 @@ pub const Mailbox = union(enum) {
                 mb.wakeup.notify() catch |err| {
                     queue.write = old_write;
                     queue.len -= 1;
-                    if (queue.not_full_waiters > 0) queue.cond_not_full.signal();
+                    if (queue.not_full_waiters > 0) queue.cond_not_full.signal(io);
 
                     log.warn("failed to wake up writer, data will be dropped err={}", .{err});
                     return false;
@@ -154,12 +156,13 @@ pub const Mailbox = union(enum) {
     ) bool {
         switch (self.*) {
             .spsc => |*mb| {
+                const io = global.io();
                 const queue = mb.queue;
-                queue.mutex.lock();
-                defer queue.mutex.unlock();
+                queue.mutex.lockUncancelable(io);
+                defer queue.mutex.unlock(io);
 
                 while (!mb.active.load(.acquire) and !mb.closed) {
-                    mb.cond_active.wait(&queue.mutex);
+                    mb.cond_active.waitUncancelable(io, &queue.mutex);
                 }
                 if (mb.closed) return false;
 
@@ -170,7 +173,7 @@ pub const Mailbox = union(enum) {
                     };
 
                     queue.not_full_waiters += 1;
-                    queue.cond_not_full.wait(&queue.mutex);
+                    queue.cond_not_full.waitUncancelable(io, &queue.mutex);
                     queue.not_full_waiters -= 1;
 
                     if (mb.closed) return false;
@@ -186,7 +189,7 @@ pub const Mailbox = union(enum) {
                 mb.wakeup.notify() catch |err| {
                     queue.write = old_write;
                     queue.len -= 1;
-                    if (queue.not_full_waiters > 0) queue.cond_not_full.signal();
+                    if (queue.not_full_waiters > 0) queue.cond_not_full.signal(io);
 
                     log.warn("failed to wake up writer, data will be dropped err={}", .{err});
                     return false;
@@ -202,10 +205,11 @@ pub const Mailbox = union(enum) {
     pub fn activate(self: *Mailbox) void {
         switch (self.*) {
             .spsc => |*mb| {
-                mb.queue.mutex.lock();
-                defer mb.queue.mutex.unlock();
+                const io = global.io();
+                mb.queue.mutex.lockUncancelable(io);
+                defer mb.queue.mutex.unlock(io);
                 mb.active.store(true, .release);
-                mb.cond_active.broadcast();
+                mb.cond_active.broadcast(io);
             },
         }
     }
@@ -214,14 +218,15 @@ pub const Mailbox = union(enum) {
     pub fn deactivateAndDrain(self: *Mailbox) void {
         switch (self.*) {
             .spsc => |*mb| {
-                mb.queue.mutex.lock();
+                const io = global.io();
+                mb.queue.mutex.lockUncancelable(io);
                 mb.closed = true;
                 mb.active.store(false, .release);
-                mb.cond_active.broadcast();
-                mb.queue.cond_not_full.broadcast();
-                mb.queue.mutex.unlock();
+                mb.cond_active.broadcast(io);
+                mb.queue.cond_not_full.broadcast(io);
+                mb.queue.mutex.unlock(io);
 
-                while (mb.queue.pop()) |msg| msg.deinit();
+                while (mb.queue.pop(io)) |msg| msg.deinit();
             },
         }
     }

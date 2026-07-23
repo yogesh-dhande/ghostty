@@ -4,6 +4,7 @@ const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
 const MessageData = @import("../datastruct/main.zig").MessageData;
+const global = @import("../global.zig");
 
 /// The messages that can be sent to an IO thread.
 ///
@@ -24,31 +25,34 @@ pub const Message = union(enum) {
     pub const BlockingOutput = struct {
         data: []const u8,
         notify_screen_change: bool,
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
         done: bool = false,
         err: ?anyerror = null,
 
         pub fn complete(self: *BlockingOutput, err: ?anyerror) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
             self.err = err;
             self.done = true;
-            self.cond.signal();
+            self.cond.signal(io);
         }
 
         pub fn wait(self: *BlockingOutput) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
-            while (!self.done) self.cond.wait(&self.mutex);
+            while (!self.done) self.cond.waitUncancelable(io, &self.mutex);
             if (self.err) |err| return err;
         }
 
         pub fn isDone(self: *BlockingOutput) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
             return self.done;
         }
@@ -56,31 +60,34 @@ pub const Message = union(enum) {
 
     pub const BlockingProcessExit = struct {
         data: ProcessExit,
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
         done: bool = false,
         err: ?anyerror = null,
 
         pub fn complete(self: *BlockingProcessExit, err: ?anyerror) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
             self.err = err;
             self.done = true;
-            self.cond.signal();
+            self.cond.signal(io);
         }
 
         pub fn wait(self: *BlockingProcessExit) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
-            while (!self.done) self.cond.wait(&self.mutex);
+            while (!self.done) self.cond.waitUncancelable(io, &self.mutex);
             if (self.err) |err| return err;
         }
 
         pub fn isDone(self: *BlockingProcessExit) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
 
             return self.done;
         }

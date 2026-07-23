@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
+const global = @import("../global.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
@@ -376,9 +377,10 @@ pub const App = struct {
         _: apprt.ipc.Target,
         comptime action: apprt.ipc.Action.Key,
         _: apprt.ipc.Action.Value(action),
-    ) (Allocator.Error || std.posix.WriteError || apprt.ipc.Errors)!bool {
+    ) (Allocator.Error || apprt.ipc.Errors)!bool {
         switch (action) {
             .new_window => return false,
+            .toggle_quick_terminal => return false,
         }
     }
 };
@@ -414,7 +416,7 @@ pub const Platform = union(PlatformTag) {
 
     /// Initialize a Platform a tag and configuration from the C ABI.
     pub fn init(tag_int: c_int, c_platform: C) !Platform {
-        const tag = try std.meta.intToEnum(PlatformTag, tag_int);
+        const tag = std.enums.fromInt(PlatformTag, tag_int) orelse return error.InvalidEnumTag;
         return switch (tag) {
             .macos => if (MacOS != void) macos: {
                 const config = c_platform.macos;
@@ -455,14 +457,14 @@ pub const SurfaceHost = extern struct {
     scale_factor: f64 = 1,
 
     pub fn isValid(self: SurfaceHost) bool {
-        _ = std.meta.intToEnum(PlatformTag, self.platform_tag) catch return false;
+        _ = std.enums.fromInt(PlatformTag, self.platform_tag) orelse return false;
         return true;
     }
 
     pub fn eql(self: SurfaceHost, other: SurfaceHost) bool {
         if (self.platform_tag != other.platform_tag) return false;
         if (self.scale_factor != other.scale_factor) return false;
-        const tag = std.meta.intToEnum(PlatformTag, self.platform_tag) catch return false;
+        const tag = std.enums.fromInt(PlatformTag, self.platform_tag) orelse return false;
         return switch (tag) {
             .macos => self.platform.macos.nsview == other.platform.macos.nsview,
             .ios => self.platform.ios.uiview == other.platform.ios.uiview,
@@ -589,16 +591,16 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
-                var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
+                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
                     log.warn(
                         "error opening requested working directory dir={s} err={}",
                         .{ wd, err },
                     );
                     break :wd;
                 };
-                defer dir.close();
+                defer dir.close(global.io());
 
-                const stat = dir.stat() catch |err| {
+                const stat = dir.stat(global.io()) catch |err| {
                     log.warn(
                         "failed to stat requested working directory dir={s} err={}",
                         .{ wd, err },
@@ -1107,32 +1109,32 @@ pub const Surface = struct {
         };
     }
 
-    pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
-        const alloc = self.app.core_app.alloc;
-        var env = try internal_os.getEnvMap(alloc);
+    pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
+        _ = self;
+        var env = try global.environMap();
         errdefer env.deinit();
 
         if (comptime builtin.target.os.tag.isDarwin()) {
             if (env.get("__XCODE_BUILT_PRODUCTS_DIR_PATHS") != null) {
-                env.remove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
-                env.remove("__XPC_DYLD_LIBRARY_PATH");
-                env.remove("DYLD_FRAMEWORK_PATH");
-                env.remove("DYLD_INSERT_LIBRARIES");
-                env.remove("DYLD_LIBRARY_PATH");
-                env.remove("LD_LIBRARY_PATH");
-                env.remove("SECURITYSESSIONID");
-                env.remove("XPC_SERVICE_NAME");
+                _ = env.orderedRemove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
+                _ = env.orderedRemove("__XPC_DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("DYLD_FRAMEWORK_PATH");
+                _ = env.orderedRemove("DYLD_INSERT_LIBRARIES");
+                _ = env.orderedRemove("DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("LD_LIBRARY_PATH");
+                _ = env.orderedRemove("SECURITYSESSIONID");
+                _ = env.orderedRemove("XPC_SERVICE_NAME");
             }
 
             // Remove this so that running `ghostty` within Ghostty works.
-            env.remove("GHOSTTY_MAC_LAUNCH_SOURCE");
+            _ = env.orderedRemove("GHOSTTY_MAC_LAUNCH_SOURCE");
 
             // If we were launched from the desktop then we want to
             // remove the LANGUAGE env var so that we don't inherit
             // our translation settings for Ghostty. If we aren't from
             // the desktop then we didn't set our LANGUAGE var so we
             // don't need to remove it.
-            if (internal_os.launchedFromDesktop()) env.remove("LANGUAGE");
+            if (internal_os.launchedFromDesktop()) _ = env.orderedRemove("LANGUAGE");
         }
 
         return env;
@@ -1170,7 +1172,7 @@ pub const Inspector = struct {
     content_scale: f64 = 1,
 
     /// Our previous instant used to calculate delta time for animations.
-    instant: ?std.time.Instant = null,
+    instant: ?std.Io.Timestamp = null,
 
     const Backend = enum {
         metal,
@@ -1399,9 +1401,9 @@ pub const Inspector = struct {
         const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         // Determine our delta time
-        const now = try std.time.Instant.now();
+        const now: std.Io.Timestamp = .now(global.io(), .awake);
         io.DeltaTime = if (self.instant) |prev| delta: {
-            const since_ns: f64 = @floatFromInt(now.since(prev));
+            const since_ns: f64 = @floatFromInt(prev.durationTo(now).toNanoseconds());
             const ns_per_s: f64 = @floatFromInt(std.time.ns_per_s);
             const since_s: f32 = @floatCast(since_ns / ns_per_s);
             break :delta @max(0.00001, since_s);
@@ -1412,8 +1414,6 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
-    const global = &@import("../global.zig").state;
-
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
@@ -1470,7 +1470,7 @@ pub const CAPI = struct {
 
         pub fn deinit(self: *Text) void {
             if (self.text) |ptr| {
-                global.alloc.free(ptr[0..self.text_len :0]);
+                global.alloc().free(ptr[0..self.text_len :0]);
             }
         }
     };
@@ -1524,12 +1524,12 @@ pub const CAPI = struct {
 
         pub fn deinit(self: *Snapshot) void {
             if (self.cells) |ptr| {
-                global.alloc.free(ptr[0..self.cell_count]);
+                global.alloc().free(ptr[0..self.cell_count]);
                 self.cells = null;
             }
             self.cell_count = 0;
             if (self.scroll_rects) |ptr| {
-                global.alloc.free(ptr[0..self.scroll_rect_count]);
+                global.alloc().free(ptr[0..self.scroll_rect_count]);
                 self.scroll_rects = null;
             }
             self.scroll_rect_count = 0;
@@ -1625,14 +1625,16 @@ pub const CAPI = struct {
         if (snapshot.cell_count < expected_cell_count or snapshot.cells == null) return error.InvalidRenderFrame;
 
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
 
         const terminal_state = core_surface.renderer_state.terminal;
         try terminal_state.resize(
-            global.alloc,
-            @intCast(snapshot.columns),
-            @intCast(snapshot.rows),
+            global.alloc(),
+            .{
+                .cols = @intCast(snapshot.columns),
+                .rows = @intCast(snapshot.rows),
+            },
         );
         terminal_state.fullReset();
         terminal_state.colors.foreground.set(unpackRGB(snapshot.default_foreground_rgb));
@@ -1641,7 +1643,7 @@ pub const CAPI = struct {
         terminal_state.flags.dirty.palette = true;
 
         const screen = terminal_state.screens.active;
-        const page = &screen.pages.pages.last.?.data;
+        const page = screen.pages.pages.last.?.page();
         const rows = page.rows.ptr(page.memory)[0..snapshot.rows];
         const frame_cells = snapshot.cells.?[0..expected_cell_count];
 
@@ -1672,9 +1674,9 @@ pub const CAPI = struct {
         app: *App,
         surface: *Surface,
         parked_host: SurfaceHost,
-        renderers: std.ArrayListUnmanaged(*Renderer) = .{},
+        renderers: std.ArrayListUnmanaged(*Renderer) = .empty,
         owner_renderer: ?*Renderer = null,
-        state_mutex: std.Thread.Mutex = .{},
+        state_mutex: std.Io.Mutex = .init,
         state_callback: ?SessionStateCallback = null,
         state_callback_userdata: ?*anyopaque = null,
         state_revision: u64 = 0,
@@ -1705,9 +1707,9 @@ pub const CAPI = struct {
                 .app = app,
                 .surface = surface,
                 .parked_host = parked_host,
-                .renderers = .{},
+                .renderers = .empty,
                 .owner_renderer = null,
-                .state_mutex = .{},
+                .state_mutex = .init,
                 .state_callback = null,
                 .state_callback_userdata = null,
                 .state_revision = 0,
@@ -1732,7 +1734,7 @@ pub const CAPI = struct {
                 renderer_handle.attached_session = null;
                 renderer_handle.role = .detached;
             }
-            self.renderers.deinit(global.alloc);
+            self.renderers.deinit(global.alloc());
             self.owner_renderer = null;
             self.surface.setSessionStateCallback(null, null);
             self.app.closeSurface(self.surface);
@@ -1850,8 +1852,8 @@ pub const CAPI = struct {
             callback: ?SessionStateCallback,
             userdata: ?*anyopaque,
         ) void {
-            self.state_mutex.lock();
-            defer self.state_mutex.unlock();
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
 
             self.state_callback = callback;
             self.state_callback_userdata = userdata;
@@ -1863,8 +1865,8 @@ pub const CAPI = struct {
             var callback: ?SessionStateCallback = null;
             var userdata: ?*anyopaque = null;
             {
-                self.state_mutex.lock();
-                defer self.state_mutex.unlock();
+                self.state_mutex.lockUncancelable(global.io());
+                defer self.state_mutex.unlock(global.io());
 
                 self.state_revision +%= 1;
                 self.pending_state_flags = self.pending_state_flags.unionWith(flags);
@@ -1876,15 +1878,15 @@ pub const CAPI = struct {
         }
 
         pub fn stateRevision(self: *Session) u64 {
-            self.state_mutex.lock();
-            defer self.state_mutex.unlock();
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
 
             return self.state_revision;
         }
 
         pub fn takePendingStateFlags(self: *Session) SessionStateFlags {
-            self.state_mutex.lock();
-            defer self.state_mutex.unlock();
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
 
             const pending = self.pending_state_flags;
             self.pending_state_flags = .{};
@@ -1893,8 +1895,8 @@ pub const CAPI = struct {
 
         fn notifyForegroundProcessIfChanged(self: *Session) SessionStateFlags {
             const current = self.currentForegroundPID();
-            self.state_mutex.lock();
-            defer self.state_mutex.unlock();
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
 
             if (current == self.last_known_foreground_pid) return .{};
             self.last_known_foreground_pid = current;
@@ -1903,8 +1905,8 @@ pub const CAPI = struct {
 
         fn notifySizeIfChanged(self: *Session) SessionStateFlags {
             const current = self.currentSurfaceSize();
-            self.state_mutex.lock();
-            defer self.state_mutex.unlock();
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
 
             if (std.meta.eql(current, self.last_known_surface_size)) return .{};
             self.last_known_surface_size = current;
@@ -1929,7 +1931,7 @@ pub const CAPI = struct {
 
         fn ensureRendererAttached(self: *Session, renderer_handle: *Renderer) !void {
             if (self.indexOfRenderer(renderer_handle) != null) return;
-            try self.renderers.append(global.alloc, renderer_handle);
+            try self.renderers.append(global.alloc(), renderer_handle);
         }
 
         fn indexOfRenderer(self: *const Session, renderer_handle: *Renderer) ?usize {
@@ -2014,13 +2016,13 @@ pub const CAPI = struct {
             mirror_config.surface.scale_factor = host.scale_factor;
             mirror_config.parked_host = host;
 
-            const session = try global.alloc.create(Session);
-            errdefer global.alloc.destroy(session);
+            const session = try global.alloc().create(Session);
+            errdefer global.alloc().destroy(session);
             try session.init(app, mirror_config);
             errdefer session.deinit();
 
-            const renderer_handle = try global.alloc.create(Renderer);
-            errdefer global.alloc.destroy(renderer_handle);
+            const renderer_handle = try global.alloc().create(Renderer);
+            errdefer global.alloc().destroy(renderer_handle);
             renderer_handle.* = .{
                 .host = host,
                 .attached_session = null,
@@ -2145,12 +2147,12 @@ pub const CAPI = struct {
         opts: *const apprt.runtime.App.Options,
         config: *const Config,
     ) !*App {
-        const core_app = try CoreApp.create(global.alloc);
+        const core_app = try CoreApp.create(global.alloc());
         errdefer core_app.destroy();
 
         // Create our runtime app
-        var app = try global.alloc.create(App);
-        errdefer global.alloc.destroy(app);
+        var app = try global.alloc().create(App);
+        errdefer global.alloc().destroy(app);
         try app.init(core_app, config, opts.*);
         errdefer app.terminate();
 
@@ -2173,7 +2175,7 @@ pub const CAPI = struct {
     export fn ghostty_app_free(v: *App) void {
         const core_app = v.core_app;
         v.terminate();
-        global.alloc.destroy(v);
+        global.alloc().destroy(v);
         core_app.destroy();
     }
 
@@ -2255,13 +2257,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the app.
     export fn ghostty_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
-            log.warn(
-                "invalid color scheme to ghostty_surface_set_color_scheme value={}",
-                .{scheme_raw},
-            );
-            return;
-        };
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
 
         v.core_app.colorSchemeEvent(v, scheme) catch |err| {
             log.err("error setting color scheme err={}", .{err});
@@ -2363,8 +2359,8 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
 
         // If we don't have a selection, do nothing.
         const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
@@ -2383,8 +2379,8 @@ pub const CAPI = struct {
         sel: Selection,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         const core_sel = sel.core(
             surface.core_surface.renderer_state.terminal.screens.active,
@@ -2402,7 +2398,7 @@ pub const CAPI = struct {
 
         // Get our text directly from the core surface.
         const text = core_surface.dumpTextLocked(
-            global.alloc,
+            global.alloc(),
             core_sel,
         ) catch |err| {
             log.warn("error reading text err={}", .{err});
@@ -2464,8 +2460,8 @@ pub const CAPI = struct {
         result.* = .{};
 
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
 
         const terminal_state = core_surface.renderer_state.terminal;
         const screen = terminal_state.screens.active;
@@ -2473,9 +2469,9 @@ pub const CAPI = struct {
         const previous_screen_dirty = screen.dirty;
 
         var render_state: terminal.RenderState = .empty;
-        defer render_state.deinit(global.alloc);
+        defer render_state.deinit(global.alloc());
 
-        render_state.update(global.alloc, terminal_state) catch |err| {
+        render_state.update(global.alloc(), terminal_state) catch |err| {
             log.warn("error exporting terminal snapshot err={}", .{err});
             return false;
         };
@@ -2492,13 +2488,13 @@ pub const CAPI = struct {
         const cell_count: usize = @as(usize, columns) * @as(usize, rows);
 
         var copied_cells: []SnapshotCell = if (cell_count > 0)
-            global.alloc.alloc(SnapshotCell, cell_count) catch |err| {
+            global.alloc().alloc(SnapshotCell, cell_count) catch |err| {
                 log.warn("error allocating snapshot cells err={}", .{err});
                 return false;
             }
         else
             &.{};
-        errdefer if (cell_count > 0) global.alloc.free(copied_cells);
+        errdefer if (cell_count > 0) global.alloc().free(copied_cells);
 
         const row_data = render_state.row_data.slice();
         const row_rows = row_data.items(.raw);
@@ -2540,7 +2536,7 @@ pub const CAPI = struct {
         var copied_scroll_rects: []SnapshotScrollRect = &.{};
         var scroll_rect_count = pending_scroll_rects.len;
         if (pending_scroll_rects.len > 0) {
-            copied_scroll_rects = global.alloc.alloc(SnapshotScrollRect, pending_scroll_rects.len) catch |err| blk: {
+            copied_scroll_rects = global.alloc().alloc(SnapshotScrollRect, pending_scroll_rects.len) catch |err| blk: {
                 log.warn("error allocating snapshot scroll rects err={}", .{err});
                 scroll_rect_count = 0;
                 break :blk &.{};
@@ -2657,13 +2653,13 @@ pub const CAPI = struct {
         app: *App,
         config: *const SessionConfig,
     ) ?*Session {
-        const session = global.alloc.create(Session) catch |err| {
+        const session = global.alloc().create(Session) catch |err| {
             log.err("error allocating session err={}", .{err});
             return null;
         };
         session.init(app, config.*) catch |err| {
             log.err("error initializing session err={}", .{err});
-            global.alloc.destroy(session);
+            global.alloc().destroy(session);
             return null;
         };
         return session;
@@ -2678,7 +2674,7 @@ pub const CAPI = struct {
 
     export fn ghostty_session_free(session: *Session) void {
         session.deinit();
-        global.alloc.destroy(session);
+        global.alloc().destroy(session);
     }
 
     export fn ghostty_session_surface(session: *Session) *Surface {
@@ -2855,13 +2851,13 @@ pub const CAPI = struct {
         host: *const SurfaceHost,
         config: *const SessionConfig,
     ) ?*Mirror {
-        const mirror = global.alloc.create(Mirror) catch |err| {
+        const mirror = global.alloc().create(Mirror) catch |err| {
             log.err("error allocating mirror err={}", .{err});
             return null;
         };
         mirror.init(app, host.*, config.*) catch |err| {
             log.err("error initializing mirror err={}", .{err});
-            global.alloc.destroy(mirror);
+            global.alloc().destroy(mirror);
             return null;
         };
         return mirror;
@@ -2896,11 +2892,11 @@ pub const CAPI = struct {
 
     export fn ghostty_mirror_free(mirror: *Mirror) void {
         mirror.deinit();
-        global.alloc.destroy(mirror);
+        global.alloc().destroy(mirror);
     }
 
     export fn ghostty_renderer_new(host: *const SurfaceHost) ?*Renderer {
-        const renderer_handle = global.alloc.create(Renderer) catch |err| {
+        const renderer_handle = global.alloc().create(Renderer) catch |err| {
             log.err("error allocating renderer err={}", .{err});
             return null;
         };
@@ -2919,7 +2915,7 @@ pub const CAPI = struct {
             );
             return;
         };
-        global.alloc.destroy(renderer_handle);
+        global.alloc().destroy(renderer_handle);
     }
 
     export fn ghostty_renderer_attach(
@@ -2971,14 +2967,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
-            log.warn(
-                "invalid color scheme to ghostty_surface_set_color_scheme value={}",
-                .{scheme_raw},
-            );
-            return;
-        };
-
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
         surface.colorSchemeCallback(scheme);
     }
 
@@ -3155,17 +3144,7 @@ pub const CAPI = struct {
         stage_raw: u32,
         pressure: f64,
     ) void {
-        const stage = std.meta.intToEnum(
-            input.MousePressureStage,
-            stage_raw,
-        ) catch {
-            log.warn(
-                "invalid mouse pressure stage value={}",
-                .{stage_raw},
-            );
-            return;
-        };
-
+        const stage = std.enums.fromInt(input.MousePressureStage, stage_raw) orelse return;
         surface.mousePressureCallback(stage, pressure);
     }
 
@@ -3421,8 +3400,8 @@ pub const CAPI = struct {
             // read the font face. It should not be deferred since
             // we're loading the primary face.
             const grid = ptr.core_surface.renderer.font_grid;
-            grid.lock.lockShared();
-            defer grid.lock.unlockShared();
+            grid.lock.lockSharedUncancelable(global.io());
+            defer grid.lock.unlockShared(global.io());
 
             const collection = &grid.resolver.collection;
             const face = collection.getFace(.{}) catch return null;
@@ -3459,8 +3438,8 @@ pub const CAPI = struct {
             result: *Text,
         ) bool {
             const surface = &ptr.core_surface;
-            surface.renderer_state.mutex.lock();
-            defer surface.renderer_state.mutex.unlock();
+            surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer surface.renderer_state.mutex.unlock(global.io());
 
             // Get our word selection
             const sel = sel: {

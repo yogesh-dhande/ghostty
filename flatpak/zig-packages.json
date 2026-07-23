@@ -85,9 +85,9 @@
   },
   {
     "type": "archive",
-    "url": "https://deps.files.ghostty.org/libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz",
-    "dest": "vendor/p/libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs",
-    "sha256": "6003ea6b96e4a518a128f932327d79a11bd30996b13b73baeb29916379487dd7"
+    "url": "https://github.com/mitchellh/libxev/archive/46fa9b74bafb0b9c151a8035fdb6b01ec68581e4.tar.gz",
+    "dest": "vendor/p/libxev-0.0.0-86vtc0IbEwDsp-ljrhdEWhf2TYBvSrqqgNAPQwtfX8Eg",
+    "sha256": "c83117af6f027b554a81f91b7c878c08800cc52d9a1d4fe697c5a20c6eb237ae"
   },
   {
     "type": "archive",

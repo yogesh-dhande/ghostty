@@ -682,6 +682,7 @@ pub fn init(
                 .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
                 .resources_dir = global.resourcesDir().host(),
                 .term = config.term,
+                .use_login_shell = config.@"macos-use-login-shell",
                 .rt_pre_exec_info = .init(config),
                 .rt_post_fork_info = .init(config),
             });

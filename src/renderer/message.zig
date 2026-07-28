@@ -97,6 +97,12 @@ pub const Message = union(enum) {
         };
     }
 
+    /// Release everything an undelivered message owns.
+    ///
+    /// Only call this on a message that was never handed to a renderer thread:
+    /// the handlers take ownership of these allocations (search results become
+    /// the renderer's current matches, a config becomes its config), so calling
+    /// this on a delivered message double-frees.
     pub fn deinit(self: *const Message) void {
         switch (self.*) {
             .change_config => |v| {
@@ -105,7 +111,19 @@ pub const Message = union(enum) {
                 v.alloc.destroy(v.thread);
             },
 
-            else => {},
+            .search_viewport_matches => |v| v.arena.deinit(),
+
+            .search_selected_match => |v| if (v) |m| m.arena.deinit(),
+
+            .crash,
+            .focus,
+            .visible,
+            .reset_cursor_blink,
+            .font_grid,
+            .resize,
+            .inspector,
+            .macos_display_id,
+            => {},
         }
     }
 };

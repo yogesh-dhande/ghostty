@@ -145,57 +145,74 @@ pub fn ScrollbackCompression(comptime Host: type) type {
     };
 }
 
-test "ScrollbackCompression: an idle host loop compresses cold scrollback" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = global.io();
+/// A minimal host for the tests below: an event loop plus the terminal state
+/// the scheduler compresses. This is the same contract the IO thread satisfies
+/// for a headless session.
+const TestHost = struct {
+    loop: xev.Loop,
+    state: State,
+    enabled: bool = true,
+    compression: ScrollbackCompression(TestHost) = undefined,
 
-    // A minimal host: an event loop plus the terminal state the scheduler
-    // compresses. This is the same contract the IO thread satisfies for a
-    // headless session.
-    const Host = struct {
-        const Self = @This();
-        loop: xev.Loop,
-        state: State,
-        compression: ScrollbackCompression(Self) = undefined,
+    fn init(terminal: *terminalpkg.Terminal, mutex: *std.Io.Mutex) !TestHost {
+        return .{
+            .loop = try xev.Loop.init(.{}),
+            .state = .{ .mutex = mutex, .terminal = terminal },
+        };
+    }
 
-        pub fn compressionScheduler(self: *Self) *ScrollbackCompression(Self) {
-            return &self.compression;
-        }
-        pub fn compressionLoop(self: *Self) *xev.Loop {
-            return &self.loop;
-        }
-        pub fn compressionState(self: *Self) *State {
-            return &self.state;
-        }
-        pub fn compressionEnabled(self: *Self) bool {
-            _ = self;
-            return true;
-        }
-    };
+    fn deinit(self: *TestHost) void {
+        self.compression.deinit();
+        self.loop.deinit();
+    }
 
-    var term = try terminalpkg.Terminal.init(io, alloc, .{
+    pub fn compressionScheduler(self: *TestHost) *ScrollbackCompression(TestHost) {
+        return &self.compression;
+    }
+    pub fn compressionLoop(self: *TestHost) *xev.Loop {
+        return &self.loop;
+    }
+    pub fn compressionState(self: *TestHost) *State {
+        return &self.state;
+    }
+    pub fn compressionEnabled(self: *TestHost) bool {
+        return self.enabled;
+    }
+};
+
+/// A terminal carrying enough cold scrollback that there is history to compress.
+fn testTerminalWithScrollback(
+    alloc: std.mem.Allocator,
+    line_count: usize,
+) !terminalpkg.Terminal {
+    var term = try terminalpkg.Terminal.init(global.io(), alloc, .{
         .cols = 80,
         .rows = 24,
         .max_scrollback = 10 * 1024 * 1024,
     });
-    defer term.deinit(alloc);
+    errdefer term.deinit(alloc);
 
-    // Fill enough scrollback that there is cold history to compress.
-    for (0..2000) |i| {
+    for (0..line_count) |i| {
         var buf: [64]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "scrollback line {d}\r\n", .{i}) catch unreachable;
         try term.printString(line);
     }
 
+    return term;
+}
+
+test "ScrollbackCompression: an idle host loop compresses cold scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = global.io();
+
+    var term = try testTerminalWithScrollback(alloc, 2000);
+    defer term.deinit(alloc);
+
     var mutex: std.Io.Mutex = .init;
-    var host: Host = .{
-        .loop = try xev.Loop.init(.{}),
-        .state = .{ .mutex = &mutex, .terminal = &term },
-    };
-    defer host.loop.deinit();
+    var host: TestHost = try .init(&term, &mutex);
+    defer host.deinit();
     host.compression = try .init();
-    defer host.compression.deinit();
 
     // The first wake records activity and arms the idle timer; running the loop
     // to completion drives every scheduled step through to `.complete`. If the
@@ -216,4 +233,40 @@ test "ScrollbackCompression: an idle host loop compresses cold scrollback" {
     const text = try term.plainString(alloc);
     defer alloc.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "scrollback line 1999") != null);
+}
+
+test "ScrollbackCompression: re-enabling compression needs resetActivity to schedule again" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var term = try testTerminalWithScrollback(alloc, 2000);
+    defer term.deinit(alloc);
+
+    var mutex: std.Io.Mutex = .init;
+    var host: TestHost = try .init(&term, &mutex);
+    defer host.deinit();
+    host.compression = try .init();
+
+    // Compress to completion so the scheduler holds the current activity token.
+    host.compression.wake(&host);
+    try host.loop.run(.until_done);
+    try testing.expect(host.compression.completion.state() == .dead);
+
+    // Disabled: wakes do nothing at all, so the held token goes stale.
+    host.enabled = false;
+    host.compression.wake(&host);
+    try testing.expect(host.compression.completion.state() == .dead);
+
+    // Re-enabled with no terminal activity in between, the held token still
+    // matches and the scheduler decides there is nothing to reconsider. This is
+    // why the config transition has to reset it rather than rely on a wake.
+    host.enabled = true;
+    host.compression.wake(&host);
+    try testing.expect(host.compression.completion.state() == .dead);
+
+    // Resetting the token makes the very next wake arm the timer again.
+    host.compression.resetActivity();
+    host.compression.wake(&host);
+    try testing.expect(host.compression.completion.state() == .active);
+    try host.loop.run(.until_done);
 }

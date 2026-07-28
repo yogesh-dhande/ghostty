@@ -542,6 +542,17 @@ pub fn setRendererEndpointAndDrain(
     old_renderer_thread.drainMailboxTo(renderer_mailbox);
 }
 
+/// Wake this session's scrollback compression scheduler.
+///
+/// A rendered session schedules compression on its renderer thread, which wakes
+/// on every terminal mutation, so it has no scheduler here and this is a null
+/// check. A headless session has no renderer thread at all, so its IO thread
+/// owns the scheduler and this shared parse path is what signals it.
+fn wakeCompression(self: *Termio) void {
+    if (self.renderer_mailbox != null) return;
+    termio.Thread.wakeCompressionForTermio(self);
+}
+
 /// Notify the current renderer endpoint.
 pub fn notifyRenderer(self: *Termio) !void {
     self.renderer_endpoint_mutex.lockUncancelable(global.io());
@@ -864,6 +875,11 @@ pub fn processOutputCaptureMessages(
         callback(data_callback.userdata, buf.ptr, buf.len);
     }
 
+    // Registered before the state lock so it runs after the unlock: the wake
+    // reads the terminal's activity token under a try-lock and would otherwise
+    // always find it contended.
+    defer self.wakeCompression();
+
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
@@ -895,7 +911,9 @@ fn processOutputWithScreenChange(
     }
 
     // We are modifying terminal state from here on out and we need
-    // the lock to grab our read data.
+    // the lock to grab our read data. The compression wake is registered first
+    // so it runs after the unlock; see processOutputCaptureMessages.
+    defer self.wakeCompression();
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.processOutputLocked(buf, notify_screen_change);

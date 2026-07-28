@@ -485,7 +485,6 @@ fn drainMailbox(
     // Trigger a redraw after we've drained so we don't waste cyces
     // messaging a redraw.
     if (redraw) {
-        self.wakeCompression(cb);
         cb.io.notifyRenderer() catch |err| {
             if (first_err == null) first_err = err;
         };
@@ -507,7 +506,15 @@ fn handleMessage(
         .crash => @panic("crash request, crashing intentionally"),
         .change_config => |config| {
             defer config.alloc.destroy(config.ptr);
+            const compression_was_enabled = io.config.scrollback_compression;
             try io.changeConfig(data, config.ptr);
+
+            // A newly enabled scheduler holds a stale activity token, so its
+            // next wake would decide nothing changed and never compress the
+            // history that accumulated while compression was off.
+            if (!compression_was_enabled and io.config.scrollback_compression) {
+                if (self.compression) |*compression| compression.resetActivity();
+            }
         },
         .inspector => |v| self.flags.has_inspector = v,
         .resize => |v| self.handleResize(cb, v),
@@ -727,6 +734,10 @@ fn wakeupCallback(
     cb.self.drainMailbox(cb) catch |err|
         log.err("error draining mailbox err={}", .{err});
 
+    // Unconditional because a backend reader thread signals compression by
+    // notifying this async without publishing a message.
+    cb.self.wakeCompression(cb);
+
     return .rearm;
 }
 
@@ -806,6 +817,25 @@ fn selectionScrollCallback(
 /// Wake the scrollback compression scheduler, if this thread owns one.
 fn wakeCompression(self: *Thread, cb: *CallbackData) void {
     if (self.compression) |*compression| compression.wake(cb);
+}
+
+/// Wake a termio's scrollback compression scheduler from the shared terminal
+/// parse path, which runs on a different thread depending on the backend: a
+/// host-managed backend parses on this IO thread, while `Exec` parses on its
+/// own reader thread.
+///
+/// The scheduler's timer belongs to the IO thread's event loop, so a foreign
+/// thread must not touch it. It hands off through the mailbox wakeup async,
+/// which is threadsafe, and `wakeupCallback` performs the wake.
+pub fn wakeCompressionForTermio(io: *termio.Termio) void {
+    if (current_callback) |cb| {
+        if (cb.io == io) {
+            cb.self.wakeCompression(cb);
+            return;
+        }
+    }
+
+    io.mailbox.notify();
 }
 
 /// The compression scheduler is hosted on `CallbackData` because it needs both

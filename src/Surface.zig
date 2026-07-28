@@ -2721,8 +2721,14 @@ pub fn queueRendererMessageFromAnyThread(
     msg: rendererpkg.Message,
 ) void {
     // A headless surface has no renderer to drain this mailbox, so the retry
-    // loop below would never terminate.
-    if (self.headless) return;
+    // loop below would never terminate. Nothing will take ownership of what the
+    // message carries either, so release it here instead of leaking it. Search
+    // results are the reachable case: they arrive from the search thread with an
+    // arena per update.
+    if (self.headless) {
+        msg.deinit();
+        return;
+    }
 
     const io = global.io();
     while (true) {

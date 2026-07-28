@@ -276,10 +276,10 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     var cb: CallbackData = .{ .self = self, .io = io };
 
     // A headless session has no renderer thread to schedule scrollback
-    // compression, so this thread does it. The endpoint is fixed at termio
-    // init and only the rendered path ever replaces it.
+    // compression, so this thread does it. The flag is immutable, so this
+    // read cannot race a rendered session's endpoint rebinding.
     if (comptime terminalpkg.compression_enabled) {
-        if (io.renderer_mailbox == null) self.compression = try .init();
+        if (io.headless) self.compression = try .init();
     }
 
     // Host-managed callbacks may synchronously feed output back into Ghostty

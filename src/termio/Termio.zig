@@ -62,6 +62,12 @@ renderer_wakeup: ?xev.Async,
 /// session. Set and cleared together with `renderer_wakeup`.
 renderer_mailbox: ?*renderer.Thread.Mailbox,
 
+/// Whether this session was created without a renderer thread. Immutable after
+/// init — a headless session can never gain a renderer (rebind refuses it) — so
+/// hot paths may read this without holding `renderer_endpoint_mutex`, unlike
+/// `renderer_mailbox`, which endpoint rebinding mutates under that mutex.
+headless: bool,
+
 /// Serializes renderer endpoint reads with renderer thread replacement.
 renderer_endpoint_mutex: std.Io.Mutex = .init,
 
@@ -323,6 +329,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
+        .headless = opts.renderer_mailbox == null,
         .renderer_endpoint_mutex = .init,
         .surface_mailbox = opts.surface_mailbox,
         .size = opts.size,
@@ -545,11 +552,13 @@ pub fn setRendererEndpointAndDrain(
 /// Wake this session's scrollback compression scheduler.
 ///
 /// A rendered session schedules compression on its renderer thread, which wakes
-/// on every terminal mutation, so it has no scheduler here and this is a null
+/// on every terminal mutation, so it has no scheduler here and this is a flag
 /// check. A headless session has no renderer thread at all, so its IO thread
-/// owns the scheduler and this shared parse path is what signals it.
+/// owns the scheduler and this shared parse path is what signals it. The flag
+/// is immutable, so this hot path stays lock-free while renderer endpoint
+/// rebinding mutates `renderer_mailbox` under the endpoint mutex.
 fn wakeCompression(self: *Termio) void {
-    if (self.renderer_mailbox != null) return;
+    if (!self.headless) return;
     termio.Thread.wakeCompressionForTermio(self);
 }
 

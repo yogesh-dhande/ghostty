@@ -1542,6 +1542,11 @@ pub const CAPI = struct {
         cells: ?[*]SnapshotCell = null,
         scroll_rect_count: usize = 0,
         scroll_rects: ?[*]SnapshotScrollRect = null,
+        /// True when the terminal has any mouse tracking mode enabled. Mirrors need this to make
+        /// the same click-versus-selection decision the exporting terminal would make.
+        mouse_reporting_active: bool = false,
+        /// terminal.flags.mouse_shift_capture as 0 = unset, 1 = false, 2 = true.
+        mouse_shift_capture: u8 = 0,
 
         pub fn deinit(self: *Snapshot) void {
             if (self.cells) |ptr| {
@@ -1688,6 +1693,17 @@ pub const CAPI = struct {
             @min(snapshot.cursor_row, snapshot.rows - 1),
         );
         terminal_state.modes.set(.cursor_visible, snapshot.cursor_visible);
+        // Restore the exporting terminal's mouse tracking state so this surface arbitrates clicks
+        // exactly as the exporting one would: suppressing selection while an application tracks the
+        // mouse, and honoring an explicit shift-capture request. Every active tracking mode maps to
+        // .normal because a mirror has no write sink for the report it would encode; only whether
+        // tracking is on changes surface-local behavior.
+        terminal_state.flags.mouse_event = if (snapshot.mouse_reporting_active) .normal else .none;
+        terminal_state.flags.mouse_shift_capture = switch (snapshot.mouse_shift_capture) {
+            1 => .false,
+            2 => .true,
+            else => .null,
+        };
         screen.cursor.page_row.dirty = true;
     }
 
@@ -2588,6 +2604,12 @@ pub const CAPI = struct {
             .cells = if (cell_count > 0) copied_cells.ptr else null,
             .scroll_rect_count = scroll_rect_count,
             .scroll_rects = if (scroll_rect_count > 0) copied_scroll_rects.ptr else null,
+            .mouse_reporting_active = terminal_state.flags.mouse_event != .none,
+            .mouse_shift_capture = switch (terminal_state.flags.mouse_shift_capture) {
+                .null => 0,
+                .false => 1,
+                .true => 2,
+            },
         };
         terminal_state.clearPendingRenderScrollRects();
         return true;

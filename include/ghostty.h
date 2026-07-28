@@ -554,6 +554,8 @@ typedef struct {
   ghostty_terminal_snapshot_cell_s* cells;
   size_t scroll_rect_count;
   ghostty_render_scroll_rect_s* scroll_rects;
+  bool mouse_reporting_active;
+  uint8_t mouse_shift_capture;
 } ghostty_terminal_snapshot_s;
 
 typedef struct {

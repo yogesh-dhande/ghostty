@@ -1081,6 +1081,9 @@ pub fn draw(self: *Surface) !void {
 /// This will not affect the GUI. The GUI must use performAction to
 /// show/hide the inspector UI.
 pub fn activateInspector(self: *Surface) !void {
+    // The inspector renders through the surface's renderer; a headless
+    // surface has none, and Inspector.render reads the renderer thread.
+    if (self.headless) return;
     if (self.inspector != null) return;
 
     // Setup the inspector

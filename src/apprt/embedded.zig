@@ -3425,6 +3425,10 @@ pub const CAPI = struct {
                 return null;
             }
 
+            // A headless surface has no renderer to read the font grid from,
+            // and nothing to QuickLook in.
+            if (ptr.core_surface.headless) return null;
+
             // We'll need content scale so fail early if we can't get it.
             const content_scale = ptr.getContentScale() catch return null;
 

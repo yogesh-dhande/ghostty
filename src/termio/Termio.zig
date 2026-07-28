@@ -53,11 +53,14 @@ terminal: terminalpkg.Terminal,
 renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// a repaint should happen. Null for a headless session, which has no renderer
+/// thread: every renderer notification below then becomes a structural no-op
+/// rather than a send that nothing can ever drain.
+renderer_wakeup: ?xev.Async,
 
-/// The mailbox for notifying the renderer of things.
-renderer_mailbox: *renderer.Thread.Mailbox,
+/// The mailbox for notifying the renderer of things. Null for a headless
+/// session. Set and cleared together with `renderer_wakeup`.
+renderer_mailbox: ?*renderer.Thread.Mailbox,
 
 /// Serializes renderer endpoint reads with renderer thread replacement.
 renderer_endpoint_mutex: std.Io.Mutex = .init,
@@ -185,6 +188,7 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
+    scrollback_compression: bool,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -221,6 +225,7 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .conditional_state = config._conditional_state,
+            .scrollback_compression = config.@"scrollback-compression",
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -542,20 +547,28 @@ pub fn notifyRenderer(self: *Termio) !void {
     self.renderer_endpoint_mutex.lockUncancelable(global.io());
     defer self.renderer_endpoint_mutex.unlock(global.io());
 
-    try self.renderer_wakeup.notify();
+    const wakeup = self.renderer_wakeup orelse return;
+    try wakeup.notify();
 }
 
 /// Send a renderer message without blocking endpoint replacement.
 fn sendRendererMessage(self: *Termio, msg: renderer.Message) void {
     while (true) {
         self.renderer_endpoint_mutex.lockUncancelable(global.io());
-        if (self.renderer_mailbox.push(global.io(), msg, .{ .instant = {} }) > 0) {
-            self.renderer_wakeup.notify() catch {};
+        // A headless session has no renderer to drain this mailbox, so the
+        // retry below would spin forever and hang the IO thread (and, through
+        // processOutputBlocking, the host's PTY reader with it).
+        const mailbox = self.renderer_mailbox orelse {
+            self.renderer_endpoint_mutex.unlock(global.io());
+            return;
+        };
+        if (mailbox.push(global.io(), msg, .{ .instant = {} }) > 0) {
+            self.renderer_wakeup.?.notify() catch {};
             self.renderer_endpoint_mutex.unlock(global.io());
             return;
         }
 
-        self.renderer_wakeup.notify() catch |err| {
+        self.renderer_wakeup.?.notify() catch |err| {
             log.warn("failed to notify renderer err={}", .{err});
         };
         self.renderer_endpoint_mutex.unlock(global.io());
@@ -706,7 +719,7 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
     self.renderer_endpoint_mutex.lockUncancelable(global.io());
     defer self.renderer_endpoint_mutex.unlock(global.io());
 
-    self.renderer_wakeup.notify() catch {};
+    if (self.renderer_wakeup) |wakeup| wakeup.notify() catch {};
 }
 
 /// Clear the screen.
@@ -805,7 +818,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     self.renderer_endpoint_mutex.lockUncancelable(global.io());
     defer self.renderer_endpoint_mutex.unlock(global.io());
 
-    try self.renderer_wakeup.notify();
+    if (self.renderer_wakeup) |wakeup| try wakeup.notify();
 }
 
 /// Called when focus is gained or lost (when focus events are enabled)
@@ -915,7 +928,8 @@ fn processOutputLocked(
         self.renderer_endpoint_mutex.lockUncancelable(global.io());
         defer self.renderer_endpoint_mutex.unlock(global.io());
 
-        _ = self.renderer_mailbox.push(global.io(), .{
+        const mailbox = self.renderer_mailbox orelse break :cursor_reset;
+        _ = mailbox.push(global.io(), .{
             .reset_cursor_blink = {},
         }, .{ .instant = {} });
     }

@@ -36,12 +36,13 @@ pub const StreamHandler = struct {
     /// The shared render state
     renderer_state: *renderer.State,
 
-    /// The mailbox for notifying the renderer of things.
-    renderer_mailbox: *renderer.Thread.Mailbox,
+    /// The mailbox for notifying the renderer of things. Null for a headless
+    /// session, which has no renderer.
+    renderer_mailbox: ?*renderer.Thread.Mailbox,
 
     /// A handle to wake up the renderer. This hints to the renderer that
-    /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    /// a repaint should happen. Null for a headless session.
+    renderer_wakeup: ?xev.Async,
 
     /// Serializes renderer endpoint reads with renderer thread replacement.
     renderer_endpoint_mutex: *std.Io.Mutex,
@@ -105,7 +106,7 @@ pub const StreamHandler = struct {
         self.renderer_endpoint_mutex.lockUncancelable(global.io());
         defer self.renderer_endpoint_mutex.unlock(global.io());
 
-        try self.renderer_wakeup.notify();
+        if (self.renderer_wakeup) |wakeup| try wakeup.notify();
     }
 
     /// Change the configuration for this handler.
@@ -173,8 +174,15 @@ pub const StreamHandler = struct {
             // See termio.Mailbox.send for more details on how this works.
             self.renderer_endpoint_mutex.lockUncancelable(io);
 
+            // A headless session has no renderer to drain this mailbox, so
+            // the wait below would never be satisfied.
+            const mailbox = self.renderer_mailbox orelse {
+                self.renderer_endpoint_mutex.unlock(io);
+                return;
+            };
+
             // Try instant first. If it works then we can return.
-            if (self.renderer_mailbox.push(io, msg, .{ .instant = {} }) > 0) {
+            if (mailbox.push(io, msg, .{ .instant = {} }) > 0) {
                 self.renderer_endpoint_mutex.unlock(io);
                 return;
             }
@@ -182,7 +190,7 @@ pub const StreamHandler = struct {
             // Instant would have blocked. Wake up the renderer to allow it
             // to process the message, then release both locks before waiting
             // so a host rebind can retarget IO to a replacement endpoint.
-            self.renderer_wakeup.notify() catch |err| {
+            self.renderer_wakeup.?.notify() catch |err| {
                 // This is an EXTREMELY unlikely case. We still don't return
                 // and attempt to send the message because its most likely
                 // that everything is fine, but log in case a freeze happens.

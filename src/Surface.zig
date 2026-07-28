@@ -82,6 +82,13 @@ font_metrics: font.Metrics,
 /// a specific size.
 font_size_adjusted: bool,
 
+/// True when this surface has no renderer at all: no renderer thread, no
+/// graphics objects and no windowing-system view. Headless surfaces exist to
+/// host terminal state for a process that only reads that state, so `renderer`,
+/// `renderer_thread` and `renderer_thr` below are left undefined and every
+/// read of them is guarded by this flag.
+headless: bool,
+
 /// The renderer for this surface.
 renderer: Renderer,
 
@@ -500,8 +507,15 @@ pub fn init(
     var derived_config = try DerivedConfig.init(alloc, config);
     errdefer derived_config.deinit();
 
+    // Headless surfaces have no view to render into and nothing that consumes
+    // rendered output, so no renderer is built for them at all.
+    const headless: bool = if (comptime @hasDecl(apprt.runtime.Surface, "isHeadless"))
+        rt_surface.isHeadless()
+    else
+        false;
+
     // Initialize our renderer with our initialized surface.
-    try Renderer.surfaceInit(rt_surface);
+    if (!headless) try Renderer.surfaceInit(rt_surface);
 
     // Determine our DPI configurations so we can properly configure
     // font points to pixels and handle other high-DPI scaling factors.
@@ -559,7 +573,7 @@ pub fn init(
 
     // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
-    var renderer_impl = try Renderer.init(alloc, .{
+    var renderer_impl = if (headless) undefined else try Renderer.init(alloc, .{
         .config = try .init(alloc, config),
         .font_grid = font_grid,
         .size = size,
@@ -567,7 +581,7 @@ pub fn init(
         .rt_surface = rt_surface,
         .thread = &self.renderer_thread,
     });
-    errdefer renderer_impl.deinit();
+    errdefer if (!headless) renderer_impl.deinit();
 
     // The mutex used to protect our renderer state.
     const mutex = try alloc.create(std.Io.Mutex);
@@ -575,7 +589,7 @@ pub fn init(
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
-    var render_thread = try rendererpkg.Thread.init(
+    var render_thread = if (headless) undefined else try rendererpkg.Thread.init(
         alloc,
         config,
         rt_surface,
@@ -583,7 +597,7 @@ pub fn init(
         &self.renderer_state,
         app_mailbox,
     );
-    errdefer render_thread.deinit();
+    errdefer if (!headless) render_thread.deinit();
 
     // Create the IO thread
     var io_thread = try termio.Thread.init(alloc);
@@ -609,6 +623,7 @@ pub fn init(
         .font_size = font_size,
         .font_size_adjusted = false,
         .font_metrics = font_grid.metrics,
+        .headless = headless,
         .renderer = renderer_impl,
         .renderer_thread = render_thread,
         .renderer_state = .{
@@ -703,8 +718,8 @@ pub fn init(
             .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
+            .renderer_wakeup = if (headless) null else render_thread.wakeup,
+            .renderer_mailbox = if (headless) null else render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
     }
@@ -740,15 +755,15 @@ pub fn init(
 
     // Give the renderer one more opportunity to finalize any surface
     // setup on the main thread prior to spinning up the rendering thread.
-    try renderer_impl.finalizeSurfaceInit(rt_surface);
+    if (!headless) try renderer_impl.finalizeSurfaceInit(rt_surface);
 
     // Start our renderer thread
-    self.renderer_thr = try std.Thread.spawn(
+    if (!headless) self.renderer_thr = try std.Thread.spawn(
         .{},
         rendererpkg.Thread.threadMain,
         .{&self.renderer_thread},
     );
-    self.renderer_thr.setName(global.io(), "renderer") catch {};
+    if (!headless) self.renderer_thr.setName(global.io(), "renderer") catch {};
 
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
@@ -823,7 +838,7 @@ pub fn deinit(self: *Surface) void {
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
-    {
+    if (!self.headless) {
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
         self.renderer_thr.join();
@@ -841,8 +856,8 @@ pub fn deinit(self: *Surface) void {
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
-    self.renderer_thread.deinit();
-    self.renderer.deinit();
+    if (!self.headless) self.renderer_thread.deinit();
+    if (!self.headless) self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     self.io.deinit();
@@ -915,6 +930,9 @@ const RendererThreadStart = struct {
 /// Rebind the renderer to a replacement runtime surface without restarting
 /// the underlying PTY or terminal state.
 pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
+    // A headless surface has no renderer to rebind and no host to rebind to.
+    if (self.headless) return error.SurfaceIsHeadless;
+
     // The config is refreshed from the stopped renderer thread below before
     // the replacement thread starts. Avoid reading the live thread config here
     // because a config reload may be mutating it concurrently.
@@ -1052,6 +1070,8 @@ pub fn sendInputRaw(self: *Surface, data: []const u8) !void {
 /// is in the middle of animation (such as a resize, etc.) or when
 /// the render timer is managed manually by the apprt.
 pub fn draw(self: *Surface) !void {
+    if (self.headless) return;
+
     // Renderers are required to support `drawFrame` being called from
     // the main thread, so that they can update contents during resize.
     try self.renderer.drawFrame(true);
@@ -1080,7 +1100,7 @@ pub fn activateInspector(self: *Surface) !void {
     }
 
     // Notify our components we have an inspector active
-    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
+    if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
@@ -1097,7 +1117,7 @@ pub fn deactivateInspector(self: *Surface) void {
     }
 
     // Notify our components we have deactivated inspector
-    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
+    if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
     self.queueIo(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
@@ -1990,14 +2010,14 @@ pub fn updateConfig(
 
     // We need to store our configs in a heap-allocated pointer so that
     // our messages aren't huge.
-    var renderer_message = try rendererpkg.Message.initChangeConfig(self.alloc, config);
-    errdefer renderer_message.deinit();
+    var renderer_message = if (self.headless) null else try rendererpkg.Message.initChangeConfig(self.alloc, config);
+    errdefer if (renderer_message) |*v| v.deinit();
     var termio_config_ptr = try self.alloc.create(termio.Termio.DerivedConfig);
     errdefer self.alloc.destroy(termio_config_ptr);
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
-    _ = self.renderer_thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
+    if (renderer_message) |msg| _ = self.renderer_thread.mailbox.push(global.io(), msg, .{ .forever = {} });
     self.queueIo(.{
         .change_config = .{
             .alloc = self.alloc,
@@ -2651,7 +2671,11 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Notify our render thread of the new font stack. The renderer
     // MUST accept the new font grid and deref the old.
-    _ = self.renderer_thread.mailbox.push(global.io(), .{
+    // A headless surface has no renderer to accept the new grid, so it
+    // releases the old grid reference itself.
+    if (self.headless) {
+        self.app.font_grid_set.deref(self.font_grid_key);
+    } else _ = self.renderer_thread.mailbox.push(global.io(), .{
         .font_grid = .{
             .grid = font_grid,
             .set = &self.app.font_grid_set,
@@ -2672,6 +2696,7 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 /// isn't guaranteed to happen immediately but it will happen as soon as
 /// practical.
 fn queueRender(self: *Surface) !void {
+    if (self.headless) return;
     try self.renderer_thread.wakeup.notify();
 }
 
@@ -2695,6 +2720,10 @@ pub fn queueRendererMessageFromAnyThread(
     self: *Surface,
     msg: rendererpkg.Message,
 ) void {
+    // A headless surface has no renderer to drain this mailbox, so the retry
+    // loop below would never terminate.
+    if (self.headless) return;
+
     const io = global.io();
     while (true) {
         self.renderer_endpoint_mutex.lockUncancelable(io);
@@ -3546,6 +3575,9 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
 /// of focus state. This is used to pause rendering when the surface
 /// is not visible, and also re-render when it becomes visible again.
 pub fn occlusionCallback(self: *Surface, visible: bool) !void {
+    // Occlusion only exists to pause and resume rendering.
+    if (self.headless) return;
+
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
@@ -3570,7 +3602,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     self.focused = focused;
 
     // Notify our render thread of the new state
-    _ = self.renderer_thread.mailbox.push(global.io(), .{
+    if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{
         .focus = focused,
     }, .{ .forever = {} });
 
@@ -5807,7 +5839,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .main => @panic("crash binding action, crashing intentionally"),
 
             .render => {
-                _ = self.renderer_thread.mailbox.push(global.io(), .{ .crash = {} }, .{ .forever = {} });
+                if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{ .crash = {} }, .{ .forever = {} });
                 self.queueRender() catch |err| {
                     // Not a big deal if this fails.
                     log.warn("failed to notify renderer of crash message err={}", .{err});

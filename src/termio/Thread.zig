@@ -20,6 +20,8 @@ const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const termio = @import("../termio.zig");
 const renderer = @import("../renderer.zig");
+const terminalpkg = @import("../terminal/main.zig");
+const ScrollbackCompression = @import("../renderer/ScrollbackCompression.zig").ScrollbackCompression;
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.io_thread);
@@ -74,6 +76,14 @@ coalesce_data: Coalesce = .{},
 sync_reset: xev.Timer,
 sync_reset_c: xev.Completion = .{},
 sync_reset_cancel_c: xev.Completion = .{},
+
+/// Incremental scrollback compression scheduling for headless sessions.
+///
+/// A rendered surface schedules this on its renderer thread, which wakes on
+/// every terminal mutation. A headless session has no renderer thread, so the
+/// IO thread — the only thread that mutates the terminal for such a session —
+/// owns the same scheduler instead. Null for rendered surfaces.
+compression: ?Compression = null,
 
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
@@ -130,6 +140,7 @@ pub fn deinit(self: *Thread) void {
     self.scroll.deinit();
     self.coalesce.deinit();
     self.sync_reset.deinit();
+    if (self.compression) |*v| v.deinit();
     self.stop.deinit();
     self.loop.deinit();
 }
@@ -264,6 +275,13 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     // ourselves and the thread data so we can thread that through (pun intended).
     var cb: CallbackData = .{ .self = self, .io = io };
 
+    // A headless session has no renderer thread to schedule scrollback
+    // compression, so this thread does it. The endpoint is fixed at termio
+    // init and only the rendered path ever replaces it.
+    if (comptime terminalpkg.compression_enabled) {
+        if (io.renderer_mailbox == null) self.compression = try .init();
+    }
+
     // Host-managed callbacks may synchronously feed output back into Ghostty
     // during threadEnter initial input, before the mailbox is activated.
     std.debug.assert(current_callback == null);
@@ -295,6 +313,23 @@ const CallbackData = struct {
     self: *Thread,
     io: *termio.Termio,
     data: termio.Termio.ThreadData = undefined,
+
+    /// Accessors required by `ScrollbackCompression`.
+    pub fn compressionScheduler(self: *CallbackData) *Compression {
+        return &self.self.compression.?;
+    }
+
+    pub fn compressionLoop(self: *CallbackData) *xev.Loop {
+        return &self.self.loop;
+    }
+
+    pub fn compressionState(self: *CallbackData) *renderer.State {
+        return self.io.renderer_state;
+    }
+
+    pub fn compressionEnabled(self: *CallbackData) bool {
+        return self.io.config.scrollback_compression;
+    }
 };
 
 /// Process host-managed output from this terminal's IO thread by queueing it
@@ -370,7 +405,10 @@ fn queueBlockingOutputOnCurrentThread(
     output.wait() catch |err| {
         if (first_err == null) first_err = err;
     };
-    if (redraw) try cb.io.notifyRenderer();
+    if (redraw) {
+        self.wakeCompression(cb);
+        try cb.io.notifyRenderer();
+    }
     if (first_err) |err| return err;
 }
 
@@ -407,6 +445,7 @@ fn queueBlockingProcessExitOnCurrentThread(
         if (first_err == null) first_err = err;
     };
     if (redraw) {
+        self.wakeCompression(cb);
         cb.io.notifyRenderer() catch |err| {
             if (first_err == null) first_err = err;
         };
@@ -446,6 +485,7 @@ fn drainMailbox(
     // Trigger a redraw after we've drained so we don't waste cyces
     // messaging a redraw.
     if (redraw) {
+        self.wakeCompression(cb);
         cb.io.notifyRenderer() catch |err| {
             if (first_err == null) first_err = err;
         };
@@ -643,6 +683,10 @@ fn flushCoalescedResize(self: *Thread, cb: *CallbackData) void {
         cb.io.resize(&cb.data, v) catch |err| {
             log.warn("error during resize err={}", .{err});
         };
+
+        // A resize reflows the PageList, which is compression-relevant work
+        // that may not be followed by any further output.
+        self.wakeCompression(cb);
     }
 }
 
@@ -758,3 +802,13 @@ fn selectionScrollCallback(
 
     return .disarm;
 }
+
+/// Wake the scrollback compression scheduler, if this thread owns one.
+fn wakeCompression(self: *Thread, cb: *CallbackData) void {
+    if (self.compression) |*compression| compression.wake(cb);
+}
+
+/// The compression scheduler is hosted on `CallbackData` because it needs both
+/// this thread's event loop and the termio's renderer state, and `CallbackData`
+/// is the only stable pointer that has both.
+const Compression = ScrollbackCompression(CallbackData);

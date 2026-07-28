@@ -271,14 +271,15 @@ pub const App = struct {
         _ = self;
     }
 
-    /// Create a new surface for the app.
-    fn newSurface(self: *App, opts: Surface.Options) !*Surface {
+    /// Create a new surface for the app. A headless surface has no windowing
+    /// system view and no renderer; see `Surface.headless`.
+    fn newSurface(self: *App, opts: Surface.Options, headless: bool) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(self, opts);
+        try surface.init(self, opts, headless);
         errdefer surface.deinit();
 
         return surface;
@@ -479,7 +480,15 @@ pub const SurfaceIOBackend = enum(c_int) {
 
 pub const Surface = struct {
     app: *App,
-    platform: Platform,
+
+    /// The windowing system view this surface renders into. Null for a
+    /// headless surface, which has no view and no renderer to use one.
+    platform: ?Platform,
+
+    /// True when this surface hosts terminal state with no renderer at all.
+    /// See `Surface.headless` in the core surface.
+    headless: bool,
+
     userdata: ?*anyopaque = null,
     io_backend: SurfaceIOBackend = .exec,
     receive_userdata: ?*anyopaque = null,
@@ -561,10 +570,14 @@ pub const Surface = struct {
         context: apprt.surface.NewSurfaceContext = .window,
     };
 
-    pub fn init(self: *Surface, app: *App, opts: Options) !void {
+    pub fn init(self: *Surface, app: *App, opts: Options, headless: bool) !void {
         self.* = .{
             .app = app,
-            .platform = try .init(opts.platform_tag, opts.platform),
+            .platform = if (headless) null else try Platform.init(
+                opts.platform_tag,
+                opts.platform,
+            ),
+            .headless = headless,
             .userdata = opts.userdata,
             .io_backend = opts.backend,
             .receive_userdata = opts.receive_userdata,
@@ -759,6 +772,11 @@ pub const Surface = struct {
         func(self.userdata, process_alive);
     }
 
+    /// Read by the core surface to decide whether to build a renderer.
+    pub fn isHeadless(self: *const Surface) bool {
+        return self.headless;
+    }
+
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
         return self.content_scale;
     }
@@ -948,6 +966,9 @@ pub const Surface = struct {
     }
 
     pub fn setHost(self: *Surface, host: SurfaceHost) !void {
+        // A headless surface has no renderer to rebind onto a host view.
+        if (self.headless) return error.SurfaceIsHeadless;
+
         const scale_factor = @max(1, if (std.math.isNan(host.scale_factor)) 1 else host.scale_factor);
         const platform = try Platform.init(host.platform_tag, host.platform);
         const old_platform = self.platform;
@@ -1691,8 +1712,8 @@ pub const CAPI = struct {
             .cell_height_px = 0,
         },
 
-        pub fn init(self: *Session, app: *App, config: SessionConfig) !void {
-            const surface = try app.newSurface(config.surface);
+        pub fn init(self: *Session, app: *App, config: SessionConfig, headless: bool) !void {
+            const surface = try app.newSurface(config.surface, headless);
             const parked_host: SurfaceHost = if (config.parked_host.isValid()) .{
                 .platform_tag = config.parked_host.platform_tag,
                 .platform = config.parked_host.platform,
@@ -2018,7 +2039,7 @@ pub const CAPI = struct {
 
             const session = try global.alloc().create(Session);
             errdefer global.alloc().destroy(session);
-            try session.init(app, mirror_config);
+            try session.init(app, mirror_config, false);
             errdefer session.deinit();
 
             const renderer_handle = try global.alloc().create(Renderer);
@@ -2285,7 +2306,7 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
     ) !*Surface {
-        return try app.newSurface(opts.*);
+        return try app.newSurface(opts.*, false);
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -2649,15 +2670,16 @@ pub const CAPI = struct {
         };
     }
 
-    export fn ghostty_session_new(
+    fn sessionNew(
         app: *App,
         config: *const SessionConfig,
+        headless: bool,
     ) ?*Session {
         const session = global.alloc().create(Session) catch |err| {
             log.err("error allocating session err={}", .{err});
             return null;
         };
-        session.init(app, config.*) catch |err| {
+        session.init(app, config.*, headless) catch |err| {
             log.err("error initializing session err={}", .{err});
             global.alloc().destroy(session);
             return null;
@@ -2665,11 +2687,21 @@ pub const CAPI = struct {
         return session;
     }
 
+    export fn ghostty_session_new(
+        app: *App,
+        config: *const SessionConfig,
+    ) ?*Session {
+        return sessionNew(app, config, false);
+    }
+
+    /// A session with terminal state, a host-managed or exec IO backend and no
+    /// renderer: no renderer thread, no graphics objects and no platform view.
+    /// The platform and parked host fields of the config are ignored.
     export fn ghostty_session_new_headless(
         app: *App,
         config: *const SessionConfig,
     ) ?*Session {
-        return ghostty_session_new(app, config);
+        return sessionNew(app, config, true);
     }
 
     export fn ghostty_session_free(session: *Session) void {

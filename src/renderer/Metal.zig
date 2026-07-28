@@ -281,7 +281,9 @@ fn viewInfo(surface: *apprt.Surface) ViewInfo {
     return switch (apprt.runtime) {
         apprt.embedded => .{
             .scaleFactor = @floatCast(surface.content_scale.x),
-            .view = switch (surface.platform) {
+            // A renderer is only ever built for a surface with a platform
+            // view; headless surfaces never reach here.
+            .view = switch (surface.platform.?) {
                 .macos => |v| v.nsview,
                 .ios => |v| v.uiview,
             },

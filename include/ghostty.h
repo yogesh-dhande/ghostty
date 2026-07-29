@@ -526,12 +526,31 @@ typedef enum {
 
 typedef uint32_t ghostty_session_state_flags_t;
 
+// The most codepoints a snapshot cell's grapheme cluster carries, base included. A cell whose
+// cluster is longer is exported as its base codepoint alone.
+#define GHOSTTY_TERMINAL_SNAPSHOT_MAX_GRAPHEME_CODEPOINTS 16
+
 typedef struct {
   uint32_t codepoint;
   uint32_t foreground_rgb;
   uint32_t background_rgb;
   uint16_t flags;
+  // The cluster's codepoints beyond `codepoint` (combining marks, ZWJ members, variation
+  // selectors, regional indicators). Zero and NULL for the overwhelming majority of cells, which
+  // hold a single codepoint. On an exported snapshot these are owned by the snapshot and released
+  // by `ghostty_terminal_snapshot_free`.
+  uint16_t grapheme_extra_len;
+  uint32_t* grapheme_extras;
+  // 1-based index of this cell's OSC 8 hyperlink target in the snapshot's `links` table; 0 when
+  // the cell carries no link. Populated on export only — applying a snapshot ignores it.
+  uint32_t link_index;
 } ghostty_terminal_snapshot_cell_s;
+
+// A borrowed run of bytes owned by a snapshot and released by `ghostty_terminal_snapshot_free`.
+typedef struct {
+  const uint8_t* ptr;
+  size_t len;
+} ghostty_terminal_snapshot_string_s;
 
 typedef struct {
   uint16_t row_start;
@@ -556,6 +575,10 @@ typedef struct {
   ghostty_render_scroll_rect_s* scroll_rects;
   bool mouse_reporting_active;
   uint8_t mouse_shift_capture;
+  // The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes. A
+  // cell's `link_index` is 1-based into this table. Populated on export only.
+  size_t link_count;
+  ghostty_terminal_snapshot_string_s* links;
 } ghostty_terminal_snapshot_s;
 
 typedef struct {

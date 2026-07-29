@@ -1514,11 +1514,41 @@ pub const CAPI = struct {
         parked_host: SurfaceHost = .{},
     };
 
+    /// The most codepoints a snapshot cell's grapheme cluster carries, base included. A cell whose
+    /// cluster is longer (combining-mark spam, which no legitimate glyph needs) exports as its base
+    /// codepoint alone, which bounds both the per-cell copy the export makes and the work the apply
+    /// path does per cell.
+    const snapshot_max_grapheme_codepoints = 16;
+
     const SnapshotCell = extern struct {
         codepoint: u32 = 0,
         foreground_rgb: u32 = 0,
         background_rgb: u32 = 0,
         flags: u16 = 0,
+        /// The cluster's codepoints beyond `codepoint` (combining marks, ZWJ members, variation
+        /// selectors, regional indicators). Zero and null for the overwhelming majority of cells,
+        /// which hold a single codepoint. Owned by the Snapshot and released by its deinit.
+        grapheme_extra_len: u16 = 0,
+        grapheme_extras: ?[*]u32 = null,
+
+        /// The 1-based index of this cell's OSC 8 hyperlink target in the snapshot's link table;
+        /// zero when the cell carries no link. Export-only: `applySnapshotToSurface` ignores it.
+        link_index: u32 = 0,
+
+        /// The cell's cluster codepoints beyond the base, clamped to the documented cap. Both the
+        /// capacity pass and the write pass of `applySnapshotToSurface` read the extras through
+        /// here so they cannot disagree about how much a cell contributes.
+        fn graphemeExtras(self: SnapshotCell) []const u32 {
+            const ptr = self.grapheme_extras orelse return &.{};
+            const len = @min(self.grapheme_extra_len, snapshot_max_grapheme_codepoints - 1);
+            return ptr[0..len];
+        }
+    };
+
+    /// A borrowed run of bytes in a snapshot. Owned by the Snapshot and released by its deinit.
+    const SnapshotString = extern struct {
+        ptr: ?[*]const u8 = null,
+        len: usize = 0,
     };
 
     const SnapshotScrollRect = extern struct {
@@ -1547,10 +1577,16 @@ pub const CAPI = struct {
         mouse_reporting_active: bool = false,
         /// terminal.flags.mouse_shift_capture as 0 = unset, 1 = false, 2 = true.
         mouse_shift_capture: u8 = 0,
+        /// The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes.
+        /// A cell's `link_index` is 1-based into this table. Populated on export only.
+        link_count: usize = 0,
+        links: ?[*]SnapshotString = null,
 
         pub fn deinit(self: *Snapshot) void {
             if (self.cells) |ptr| {
-                global.alloc().free(ptr[0..self.cell_count]);
+                const cells = ptr[0..self.cell_count];
+                freeSnapshotCellGraphemes(cells);
+                global.alloc().free(cells);
                 self.cells = null;
             }
             self.cell_count = 0;
@@ -1559,6 +1595,13 @@ pub const CAPI = struct {
                 self.scroll_rects = null;
             }
             self.scroll_rect_count = 0;
+            if (self.links) |ptr| {
+                const links = ptr[0..self.link_count];
+                freeSnapshotLinkStrings(links);
+                global.alloc().free(links);
+                self.links = null;
+            }
+            self.link_count = 0;
         }
     };
 
@@ -1576,6 +1619,58 @@ pub const CAPI = struct {
             self.rows = 0;
         }
     };
+
+    /// Releases the grapheme extras every cell in the slice owns. Snapshot teardown and the export
+    /// path's failure exit both go through this, so a partially filled cell buffer cannot leak the
+    /// clusters already copied into it.
+    fn freeSnapshotCellGraphemes(cells: []SnapshotCell) void {
+        for (cells) |cell| {
+            const ptr = cell.grapheme_extras orelse continue;
+            global.alloc().free(ptr[0..cell.grapheme_extra_len]);
+        }
+    }
+
+    /// Releases the URI bytes every entry in a snapshot's link table owns, leaving the table itself
+    /// to the caller. Snapshot teardown and the export path's failure exit both go through this.
+    fn freeSnapshotLinkStrings(links: []const SnapshotString) void {
+        for (links) |link| {
+            const ptr = link.ptr orelse continue;
+            global.alloc().free(ptr[0..link.len]);
+        }
+    }
+
+    /// Releases everything a half-built snapshot export owns: the clusters of the `written` cells
+    /// already filled in, the cell buffer itself, and the link table accumulated so far. The export
+    /// returns a bool rather than an error union, so its failure exits unwind through here instead
+    /// of through `errdefer`.
+    fn abortSnapshotExport(
+        cells: []SnapshotCell,
+        written: usize,
+        links: *std.ArrayListUnmanaged(SnapshotString),
+    ) void {
+        freeSnapshotCellGraphemes(cells[0..written]);
+        if (cells.len > 0) global.alloc().free(cells);
+        freeSnapshotLinkStrings(links.items);
+        links.deinit(global.alloc());
+    }
+
+    /// The 1-based index of `uri` in a snapshot's link table, appending a copy of it when this is
+    /// the first cell to reference it. Deduplication is by URI bytes rather than by hyperlink id
+    /// because ids are page-local: the same link on two pages of one viewport has two ids, and two
+    /// unrelated links on different pages can share one.
+    fn snapshotLinkIndex(
+        links: *std.ArrayListUnmanaged(SnapshotString),
+        uri: []const u8,
+    ) !u32 {
+        for (links.items, 0..) |link, index| {
+            const existing = link.ptr orelse continue;
+            if (std.mem.eql(u8, existing[0..link.len], uri)) return @intCast(index + 1);
+        }
+        const copied = try global.alloc().dupe(u8, uri);
+        errdefer global.alloc().free(copied);
+        try links.append(global.alloc(), .{ .ptr = copied.ptr, .len = copied.len });
+        return @intCast(links.items.len);
+    }
 
     fn unpackRGB(rgb: u32) terminal.color.RGB {
         return .{
@@ -1614,6 +1709,37 @@ pub const CAPI = struct {
         return result;
     }
 
+    /// Writes a snapshot cell's cluster codepoints onto the cell just written, so a mirror renders
+    /// the whole grapheme rather than its base scalar.
+    ///
+    /// This uses `setGraphemes` (one exact allocation) rather than repeated `appendGrapheme` calls:
+    /// appending grows the cell's grapheme slice in place, which both holds the old and the new
+    /// allocation live at once and leaves the page's bitmap allocator fragmented, so a page sized
+    /// for exactly what the frame holds could still fail. `applySnapshotToSurface` sizes the page's
+    /// grapheme capacity for the sum of these exact allocations before writing any cell.
+    fn writeSnapshotCellGraphemes(
+        page: *terminal.Page,
+        row: *terminal.page.Row,
+        dst: *terminal.Cell,
+        cell: SnapshotCell,
+    ) !void {
+        const extras = cell.graphemeExtras();
+        if (extras.len == 0) return;
+
+        var cps: [snapshot_max_grapheme_codepoints - 1]u21 = undefined;
+        var len: usize = 0;
+        for (extras) |cp| {
+            // These arrive across a C ABI, so a value outside the Unicode range is representable
+            // here in a way it never is for terminal-internal data. It has no glyph and does not
+            // fit a u21, so the cluster ends there and the cell keeps what came before it.
+            if (cp > 0x10FFFF) break;
+            cps[len] = @intCast(cp);
+            len += 1;
+        }
+        if (len == 0) return;
+        try page.setGraphemes(row, dst, cps[0..len]);
+    }
+
     fn writeSnapshotCell(
         screen: *terminal.Screen,
         page: *terminal.Page,
@@ -1631,6 +1757,7 @@ pub const CAPI = struct {
         }
         if (next_cell.codepoint() != 0 or !next_style.default()) {
             dst.* = next_cell;
+            if (next_cell.codepoint() != 0) try writeSnapshotCellGraphemes(page, row, dst, cell);
         } else if (!unpackRGB(cell.background_rgb).eql(unpackRGB(snapshot.default_background_rgb))) {
             dst.* = .{
                 .content_tag = .bg_color_rgb,
@@ -1645,6 +1772,12 @@ pub const CAPI = struct {
         screen.dirty.selection = true;
     }
 
+    /// Writes a snapshot onto a mirror surface's terminal state.
+    ///
+    /// A cell's OSC 8 link fields (`link_index` and the snapshot's link table) are deliberately not
+    /// applied: they are export-only. Restoring them would mean sizing a page's `string_bytes` and
+    /// `hyperlink_bytes` capacity as well, and Spaces already resolves link hover and clicks from
+    /// the Swift snapshot rather than from the mirror surface.
     fn applySnapshotToSurface(surface: *Surface, snapshot: Snapshot) !void {
         if (snapshot.columns == 0 or snapshot.rows == 0) return error.InvalidRenderFrame;
         const expected_cell_count = @as(usize, snapshot.columns) * @as(usize, snapshot.rows);
@@ -1669,9 +1802,26 @@ pub const CAPI = struct {
         terminal_state.flags.dirty.palette = true;
 
         const screen = terminal_state.screens.active;
-        const page = screen.pages.pages.last.?.page();
-        const rows = page.rows.ptr(page.memory)[0..snapshot.rows];
         const frame_cells = snapshot.cells.?[0..expected_cell_count];
+
+        // Size the page for every cluster this frame carries before touching a single cell. Growing
+        // reactively (the recipe Screen.appendGrapheme follows) relocates the page and invalidates
+        // the page, row, and cell pointers the write loop below holds; deciding capacity up front
+        // keeps them valid for the whole loop. The page is already being resized and fully reset
+        // just above, so a capacity decision here costs nothing extra.
+        var required_grapheme_bytes: usize = 0;
+        for (frame_cells) |frame_cell| {
+            const extras = frame_cell.graphemeExtras();
+            if (extras.len == 0) continue;
+            required_grapheme_bytes += terminal.page.graphemeBytesRequired(extras.len);
+        }
+        var node = screen.pages.pages.last.?;
+        while (node.page().capacity.grapheme_bytes < required_grapheme_bytes) {
+            node = try screen.increaseCapacity(node, .grapheme_bytes);
+        }
+
+        const page = node.page();
+        const rows = page.rows.ptr(page.memory)[0..snapshot.rows];
 
         for (rows, 0..) |*row, row_index| {
             const cells = row.cells.ptr(page.memory)[0..snapshot.columns];
@@ -2536,16 +2686,26 @@ pub const CAPI = struct {
         const row_data = render_state.row_data.slice();
         const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
+        const row_pins = row_data.items(.pin);
         const palette = &render_state.colors.palette;
         const default_fg = render_state.colors.foreground;
         const default_bg = render_state.colors.background;
         var cell_index: usize = 0;
+        var links: std.ArrayListUnmanaged(SnapshotString) = .empty;
 
         for (0..rows) |row_index| {
             const cells_slice = row_cells[row_index].slice();
             const raws = cells_slice.items(.raw);
             const styles = cells_slice.items(.style);
+            const graphemes = cells_slice.items(.grapheme);
             const row_flags = snapshotFlagsForRow(row_rows[row_index]);
+
+            // A cell's OSC 8 target lives in the page its row pins, not in the render state's
+            // copied cell data. Dereferencing the pin's node is only safe while the terminal
+            // cannot change under us — the condition RenderState.linkCells documents — which holds
+            // here because the renderer state mutex is held for the whole export.
+            const link_pin = row_pins[row_index];
+            const link_page = link_pin.node.page();
 
             for (0..columns) |column_index| {
                 const raw = raws[column_index];
@@ -2555,15 +2715,59 @@ pub const CAPI = struct {
                     .palette = palette,
                 });
                 const background = style.bg(&raw, palette) orelse default_bg;
+
+                // The render state's grapheme slice is only initialized for cells tagged
+                // codepoint_grapheme; it is undefined otherwise, so the tag gates the read.
+                // Over-cap clusters export as the base codepoint alone, matching the degradation
+                // the other snapshot producers apply.
+                var extras: []u32 = &.{};
+                if (raw.hasGrapheme()) grapheme: {
+                    const cps = graphemes[column_index];
+                    if (cps.len == 0 or cps.len >= snapshot_max_grapheme_codepoints) break :grapheme;
+                    extras = global.alloc().alloc(u32, cps.len) catch |err| {
+                        log.warn("error allocating snapshot grapheme cluster err={}", .{err});
+                        abortSnapshotExport(copied_cells, cell_index, &links);
+                        return false;
+                    };
+                    for (cps, extras) |cp, *dst| dst.* = @intCast(cp);
+                }
+
+                var link_index: u32 = 0;
+                if (raw.hyperlink) link: {
+                    const rac = link_page.getRowAndCell(column_index, link_pin.y);
+                    const id = link_page.lookupHyperlink(rac.cell) orelse break :link;
+                    const entry = link_page.hyperlink_set.get(link_page.memory, id);
+                    link_index = snapshotLinkIndex(
+                        &links,
+                        entry.uri.slice(link_page.memory),
+                    ) catch |err| {
+                        log.warn("error copying snapshot hyperlink err={}", .{err});
+                        if (extras.len > 0) global.alloc().free(extras);
+                        abortSnapshotExport(copied_cells, cell_index, &links);
+                        return false;
+                    };
+                }
+
                 copied_cells[cell_index] = .{
                     .codepoint = if (raw.hasText()) @intCast(raw.codepoint()) else 0,
                     .foreground_rgb = packRGB(foreground),
                     .background_rgb = packRGB(background),
                     .flags = snapshotFlagsForCell(raw, style) | row_flags,
+                    .grapheme_extra_len = @intCast(extras.len),
+                    .grapheme_extras = if (extras.len > 0) extras.ptr else null,
+                    .link_index = link_index,
                 };
                 cell_index += 1;
             }
         }
+
+        // Hand the accumulated link table to the snapshot as an exactly sized allocation, so its
+        // deinit can free it without knowing the list's capacity.
+        const copied_links: []SnapshotString = links.toOwnedSlice(global.alloc()) catch |err| {
+            log.warn("error allocating snapshot links err={}", .{err});
+            abortSnapshotExport(copied_cells, cell_index, &links);
+            return false;
+        };
 
         const cursor = render_state.cursor.viewport;
         const pending_scroll_rects = if (terminal_state.pendingRenderScrollRectsOverflowed())
@@ -2610,6 +2814,8 @@ pub const CAPI = struct {
                 .false => 1,
                 .true => 2,
             },
+            .link_count = copied_links.len,
+            .links = if (copied_links.len > 0) copied_links.ptr else null,
         };
         terminal_state.clearPendingRenderScrollRects();
         return true;

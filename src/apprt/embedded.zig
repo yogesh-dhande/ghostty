@@ -2879,6 +2879,17 @@ pub const CAPI = struct {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
     }
 
+    /// Reports whether the running application currently has bracketed paste
+    /// (DECSET 2004) enabled — the same live mode `ghostty_surface_text`'s paste
+    /// encoding is derived from, so an embedder can know ahead of a text write
+    /// whether that write will reach the PTY framed.
+    export fn ghostty_surface_bracketed_paste(surface: *Surface) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        return core_surface.io.terminal.modes.get(.bracketed_paste);
+    }
+
     /// Returns the PTY name for the surface. The returned string must be
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {
@@ -2998,6 +3009,10 @@ pub const CAPI = struct {
 
     export fn ghostty_session_foreground_pid(session: *Session) u64 {
         return ghostty_surface_foreground_pid(session.surface);
+    }
+
+    export fn ghostty_session_bracketed_paste(session: *Session) bool {
+        return ghostty_surface_bracketed_paste(session.surface);
     }
 
     export fn ghostty_session_state_revision(session: *Session) u64 {

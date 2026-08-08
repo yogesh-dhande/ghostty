@@ -3154,6 +3154,32 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Applies a mirror render frame without presenting it.
+    ///
+    /// Identical to `ghostty_mirror_apply_render_frame` except that it does not call
+    /// `core_surface.draw()`. `applySnapshotToSurface` takes the renderer state mutex itself, so the
+    /// surface's terminal state is fully updated by the time this returns; only the present is left to
+    /// the caller.
+    ///
+    /// The draw the other entry point runs is `drawFrame(sync: true)`, which blocks the calling thread
+    /// on the swap chain. It also presents whichever cells were last *built*, and building happens on
+    /// the render thread only when woken by `ghostty_surface_refresh`, which the apply does not call --
+    /// so that draw re-presents the previous frame rather than the one it just applied. An embedder
+    /// that presents on its own cadence (refresh then draw, once per display interval) therefore pays
+    /// a GPU wait per applied frame for a present it does not use. This entry point is for that
+    /// embedder.
+    export fn ghostty_mirror_apply_render_frame_no_draw(
+        mirror: *Mirror,
+        frame: *const RenderFrame,
+    ) bool {
+        if (frame.version != 1) return false;
+        applySnapshotToSurface(mirror.session.surface, frame.snapshot) catch |err| {
+            log.err("error applying mirror render frame err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     export fn ghostty_mirror_surface(mirror: *Mirror) *Surface {
         return mirror.session.surface;
     }

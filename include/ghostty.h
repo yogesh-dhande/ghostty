@@ -1328,6 +1328,8 @@ GHOSTTY_API ghostty_mirror_t ghostty_mirror_new(ghostty_app_t,
                                                    const ghostty_session_config_s*);
 GHOSTTY_API bool ghostty_mirror_apply_render_frame(ghostty_mirror_t,
                                                       const ghostty_render_frame_s*);
+GHOSTTY_API bool ghostty_mirror_apply_render_frame_no_draw(ghostty_mirror_t,
+                                                              const ghostty_render_frame_s*);
 GHOSTTY_API ghostty_surface_t ghostty_mirror_surface(ghostty_mirror_t);
 GHOSTTY_API bool ghostty_mirror_set_host(ghostty_mirror_t,
                                             const ghostty_surface_host_s*);

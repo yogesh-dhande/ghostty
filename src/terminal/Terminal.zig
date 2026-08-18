@@ -123,6 +123,10 @@ flags: packed struct {
     /// True if the window is focused.
     focused: bool = true,
 
+    /// True if the terminal view may be visible. Unknown visibility is
+    /// represented as visible so callers behave conservatively.
+    visible: bool = true,
+
     /// True if the terminal is in a password entry mode. This is set
     /// to true based on termios state. This is set
     /// to true based on termios state.
@@ -346,7 +350,16 @@ pub const Cursor = struct {
 pub const Options = struct {
     cols: size.CellCountInt,
     rows: size.CellCountInt,
-    max_scrollback: usize = 10_000,
+
+    /// The maximum size of scrollback in bytes. Null is unlimited and zero
+    /// disables scrollback.
+    max_scrollback_bytes: ?usize = 10_000,
+
+    /// The maximum number of physical scrollback rows, excluding the active
+    /// area. Null is unlimited. The effective limit permits at least one
+    /// standard page and only complete historical pages are pruned.
+    max_scrollback_lines: ?usize = null,
+
     colors: Colors = .default,
 
     /// The default mode state. When the terminal gets a reset, it
@@ -390,7 +403,8 @@ pub fn init(
     var screen_set: ScreenSet = try .init(io_impl, alloc, .{
         .cols = cols,
         .rows = rows,
-        .max_scrollback = opts.max_scrollback,
+        .max_scrollback_bytes = opts.max_scrollback_bytes,
+        .max_scrollback_lines = opts.max_scrollback_lines,
         .kitty_image_storage_limit = opts.kitty_image_storage_limit,
         .kitty_image_loading_limits = opts.kitty_image_loading_limits,
     });
@@ -447,7 +461,10 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
 /// for handling escape sequences split across write boundaries), you
 /// must store and reuse the returned stream.
 pub fn vtStream(self: *Terminal) Stream {
-    return .initAlloc(self.gpa(), self.vtHandler());
+    return Stream.init(.{
+        .allocator = self.gpa(),
+        .handler = self.vtHandler(),
+    });
 }
 
 /// This is the handler-side only for vtStream.
@@ -522,6 +539,29 @@ pub fn gpa(self: *Terminal) Allocator {
     return self.screens.active.alloc;
 }
 
+/// Change the primary screen's maximum scrollback allocation in bytes.
+///
+/// Null removes the byte limit and zero disables scrollback. Disabling
+/// scrollback also immediately erases retained history and changes future
+/// scrolling to use the no-scrollback path. The alternate screen is
+/// intentionally unaffected because it never retains scrollback.
+pub fn setScrollbackMaxBytes(self: *Terminal, max: ?usize) void {
+    const primary = self.screens.get(.primary).?;
+    primary.pages.setMaxBytes(max);
+    primary.no_scrollback = max == 0;
+
+    if (primary.no_scrollback) primary.eraseHistory(null);
+}
+
+/// Change the primary screen's maximum number of physical scrollback lines.
+///
+/// Null removes the line limit. The alternate screen is intentionally
+/// unaffected because it never retains scrollback.
+pub fn setScrollbackMaxLines(self: *Terminal, max: ?usize) void {
+    const primary = self.screens.get(.primary).?;
+    primary.pages.setMaxLines(max);
+}
+
 /// Print UTF-8 encoded string to the terminal.
 pub fn printString(self: *Terminal, str: []const u8) !void {
     const view = try std.unicode.Utf8View.init(str);
@@ -540,9 +580,26 @@ pub fn printString(self: *Terminal, str: []const u8) !void {
 
 /// Print the previous printed character a repeated amount of times.
 pub fn printRepeat(self: *Terminal, count_req: usize) !void {
-    if (self.previous_char) |c| {
-        const count = @max(count_req, 1);
-        for (0..count) |_| try self.print(c);
+    const c = self.previous_char orelse return;
+    var remaining = @max(count_req, 1);
+
+    // Print the repeated codepoint in slices so that eligible runs
+    // take the batched printSlice fast path. printSlice is semantically
+    // identical to calling print per codepoint: ineligible characters
+    // or terminal states (insert mode, grapheme clustering, hyperlinks,
+    // etc.) fall back to the per-codepoint print() path internally.
+    //
+    // The buffer is filled with a runtime-bounded loop rather than
+    // `= @splat(c)`: a comptime-known 4096-element splat gets fully
+    // unrolled into ~33KB of consecutive stores (LLVM won't re-roll
+    // or vectorize it, see quirks_memset.zig), and it would fill the
+    // whole buffer even for the typical small repeat counts.
+    var buf: [4096]u32 = undefined;
+    for (buf[0..@min(remaining, buf.len)]) |*cp| cp.* = c;
+    while (remaining > 0) {
+        const n = @min(remaining, buf.len);
+        try self.printSlice(buf[0..n]);
+        remaining -= n;
     }
 }
 
@@ -562,11 +619,55 @@ pub fn printRepeat(self: *Terminal, count_req: usize) !void {
 /// slower per-codepoint path. They're less common and this is optimized
 /// for the aforementioned cases.
 pub fn printSlice(self: *Terminal, cps: []const u32) !void {
+    // Check if we can do the fast path up front. If we can't
+    // we need to go back to scalar `print`.
+    const fast = fast: {
+        // Only the main display is supported.
+        if (self.status_display != .main) break :fast false;
+
+        // Modes that require per-codepoint handling in print().
+        // Wraparound is required (its the default) so that our
+        // row-fill logic below can assume soft-wrap semantics. Insert
+        // mode shifts cells per print.
+        if (self.modes.get(.insert)) break :fast false;
+        if (!self.modes.get(.wraparound)) break :fast false;
+
+        // Charset must map ASCII as-is (true unless a DEC special
+        // charset is actively invoked, which is rare).
+        const screen: *Screen = self.screens.active;
+        if (screen.charset.single_shift != null) break :fast false;
+        switch (screen.charset.charsets.get(screen.charset.gl)) {
+            .utf8, .ascii => {},
+            else => break :fast false,
+        }
+
+        // Hyperlinks require per-cell map bookkeeping.
+        if (screen.cursor.hyperlink_id != 0) break :fast false;
+
+        break :fast true;
+    };
+    if (!fast) {
+        for (cps) |cp| try self.print(@intCast(cp));
+        return;
+    }
+
+    const grapheme_cluster = self.modes.get(.grapheme_cluster);
+
+    // When grapheme clustering is enabled and a left margin is set,
+    // print() consults the cell left of the margin after wrapping,
+    // which we can't reason about here. Restrict the fast path to
+    // the [0x10, 0xFF] range in that case (those never cluster).
+    const allow_unicode = !grapheme_cluster or self.scrolling_region.left == 0;
+
     var i: usize = 0;
     while (i < cps.len) {
         // Try the fast-path print first. This will return the number of
         // codepoints it consumed.
-        const consumed = try self.printSliceFast(cps[i..]);
+        const consumed = try self.printSliceFast(
+            cps[i..],
+            grapheme_cluster,
+            allow_unicode,
+        );
         if (consumed > 0) {
             i += consumed;
             continue;
@@ -588,31 +689,15 @@ pub fn printSlice(self: *Terminal, cps: []const u32) !void {
 ///
 /// The fast path handles runs of narrow (width 1) and wide (width 2)
 /// codepoints being written to simple cells. Everything else (zero
-/// width codepoints, grapheme cluster continuations, insert mode,
-/// charset mapping, hyperlinks, complex cells, etc.) is rejected so
-/// `print` can handle it with full generality.
-fn printSliceFast(self: *Terminal, cps: []const u32) !usize {
-    // Only the main display is supported.
-    if (self.status_display != .main) return 0;
-
-    // Modes that require per-codepoint handling in print(). Wraparound
-    // is required (its the default) so that our row-fill logic below can
-    // assume soft-wrap semantics. Insert mode shifts cells per print.
-    if (self.modes.get(.insert)) return 0;
-    if (!self.modes.get(.wraparound)) return 0;
-
+/// width codepoints, grapheme cluster continuations, complex cells,
+/// etc.) is rejected so `print` can handle it with full generality.
+fn printSliceFast(
+    self: *Terminal,
+    cps: []const u32,
+    grapheme_cluster: bool,
+    allow_unicode: bool,
+) !usize {
     const screen: *Screen = self.screens.active;
-
-    // Charset must map ASCII as-is (true unless a DEC special charset
-    // is actively invoked, which is rare).
-    if (screen.charset.single_shift != null) return 0;
-    switch (screen.charset.charsets.get(screen.charset.gl)) {
-        .utf8, .ascii => {},
-        else => return 0,
-    }
-
-    // Hyperlinks require per-cell map bookkeeping.
-    if (screen.cursor.hyperlink_id != 0) return 0;
 
     // Codepoints in [0x10, 0xFF] are always narrow (width 1, matching
     // the c <= 0xFF fast path in print) and can never interact with
@@ -624,13 +709,6 @@ fn printSliceFast(self: *Terminal, cps: []const u32) !usize {
     // 2027) is enabled, if they are a grapheme break from the
     // previously printed codepoint (so print would never attach them
     // to the previous cell).
-    const grapheme_cluster = self.modes.get(.grapheme_cluster);
-
-    // When grapheme clustering is enabled and a left margin is set,
-    // print() consults the cell left of the margin after wrapping,
-    // which we can't reason about here. Restrict the fast path to
-    // the [0x10, 0xFF] range in that case (those never cluster).
-    const allow_unicode = !grapheme_cluster or self.scrolling_region.left == 0;
 
     // Codepoints in [0x10, 0xFF] are always narrow: print()
     // hardcodes width 1 for c <= 0xFF (no width table lookup).
@@ -659,14 +737,46 @@ fn printSliceFast(self: *Terminal, cps: []const u32) !usize {
     }
 
     // The first codepoint requires care when grapheme clustering is
-    // enabled: print() examines the previous *cell* which can hold
-    // state (grapheme data) that we can't cheaply reason about here.
-    // Note this includes the pending-wrap state: print() may attach
-    // to the pending cell *instead of wrapping*. We only take the
-    // first codepoint if the cursor is at column zero with no pending
-    // wrap, where print() skips clustering entirely.
-    if (grapheme_cluster) {
-        if (screen.cursor.pending_wrap or screen.cursor.x != 0) return 0;
+    // enabled: print() may attach it to the previous *cell* instead
+    // of writing a new one. Take the first codepoint only when we can
+    // determine — computing exactly what print() would — that it
+    // starts a new cluster. At column zero with no pending wrap,
+    // print() skips clustering entirely. Otherwise resolve the
+    // previous cell the way print() does and check for a break.
+    //
+    // Note the pending-wrap rejection: print() may attach to the
+    // pending cell *instead of wrapping*, which we can't model here.
+    if (grapheme_cluster and screen.cursor.x != 0) gate: {
+        if (screen.cursor.pending_wrap) return 0;
+
+        // Resolve the content cell to our left exactly like print():
+        // if the immediate left cell is a wide spacer tail, the
+        // content lives one further left. (A spacer tail can never
+        // be at column zero — its wide half would have to be in the
+        // previous row — so the second cursorCellLeft is in bounds.)
+        const immediate = screen.cursorCellLeft(1);
+        const prev: *Cell = switch (immediate.wide) {
+            .spacer_tail => screen.cursorCellLeft(2),
+            else => immediate,
+        };
+
+        // An empty previous cell is necessarily a grapheme break.
+        if (prev.codepoint() == 0) break :gate;
+
+        // Grapheme data on the previous cell requires the full
+        // cluster state machine replay; only print() can do that.
+        if (prev.hasGrapheme()) return 0;
+
+        // A simple single-codepoint previous cell: print() would run
+        // exactly this break check from the default state.
+        var state: uucode.grapheme.BreakState = .default;
+        if (!unicode.graphemeBreak(
+            prev.content.codepoint.data,
+            @intCast(cp0),
+            &state,
+        )) return 0;
+    } else if (grapheme_cluster) {
+        if (screen.cursor.pending_wrap) return 0;
     }
 
     // The width lookup is a runtime value while printSliceFill is
@@ -1354,27 +1464,23 @@ pub fn print(self: *Terminal, c: u21) !void {
                     if (prev.cell.wide != .wide) break :narrow;
                     prev.cell.wide = .narrow;
 
-                    // Remove the wide spacer tail
-                    const cell = self.screens.active.cursorCellLeft(prev.left - 1);
-                    cell.wide = .narrow;
-
-                    // Back track the cursor so that we don't end up with
-                    // an extra space after the character. Since xterm is
-                    // not VS aware, it cannot be used as a reference for
-                    // this behavior; but it does follow the principle of
-                    // least surprise, and also matches the behavior that
-                    // can be observed in Kitty, which is one of the only
-                    // other VS aware terminals.
-                    if (self.screens.active.cursor.x == right_limit - 1) {
-                        // If we're already at the right edge, we stay
-                        // here and set the pending wrap to false since
-                        // when we pend a wrap, we only move our cursor once
-                        // even for wide chars (tests verify).
-                        self.screens.active.cursor.pending_wrap = false;
-                    } else {
-                        // Otherwise, move back.
-                        self.screens.active.cursorLeft(1);
+                    // Remove the wide spacer tail. The previous cell may be
+                    // under the cursor, so locate the tail from the wide base
+                    // rather than by subtracting from the cursor distance.
+                    const prev_x = self.screens.active.cursor.x - prev.left;
+                    if (prev_x < self.cols - 1) {
+                        const cells: [*]Cell = @ptrCast(prev.cell);
+                        cells[1].wide = .narrow;
                     }
+
+                    // Place the cursor one cell after the now-narrow base,
+                    // clamped to the right edge. Usually this moves the cursor
+                    // back from after the old tail, but saved cursor state or
+                    // changed margins can leave it directly on the base.
+                    self.screens.active.cursor.pending_wrap = false;
+                    self.screens.active.cursorHorizontalAbsolute(
+                        @min(prev_x + 1, right_limit - 1),
+                    );
 
                     break :narrow;
                 },
@@ -1602,7 +1708,7 @@ fn printCell(
 
                 // So integrity checks pass. We fix this up later so we don't
                 // need to do this without safety checks.
-                if (comptime std.debug.runtime_safety) {
+                if (comptime build_options.slow_runtime_safety) {
                     cell.wide = .narrow;
                 }
 
@@ -2599,7 +2705,7 @@ pub const ScrollViewport = union(Tag) {
         @This(),
         // Padding: largest variant is isize (8 bytes on 64-bit).
         // Use [2]u64 (16 bytes) for future expansion.
-        [2]u64,
+        .{ .padding = [2]u64 },
     );
     pub const C = c_union.C;
     pub const CValue = c_union.CValue;
@@ -3367,9 +3473,14 @@ pub fn eraseLine(
             break :left .{ 0, x + 1 };
         },
 
-        // Note that it seems like complete should reset the soft-wrap
-        // state of the line but in xterm it does not.
-        .complete => .{ 0, self.cols },
+        .complete => complete: {
+            // Xterm preserves this flag for EL2, but it also doesn't reflow
+            // rows when resizing. Since we do, the erased row must no longer
+            // continue onto the next row.
+            self.screens.active.cursorResetWrap();
+
+            break :complete .{ 0, self.cols };
+        },
 
         else => {
             log.err("unimplemented erase line mode: {}", .{mode});
@@ -3655,12 +3766,12 @@ pub fn setKittyGraphicsSizeLimit(
     self: *Terminal,
     alloc: Allocator,
     limit: usize,
-) !void {
+) void {
     if (comptime !build_options.kitty_graphics) return;
     var it = self.screens.all.iterator();
     while (it.next()) |entry| {
         const screen: *Screen = entry.value.*;
-        try screen.kitty_images.setLimit(self.io(), alloc, screen, limit);
+        screen.kitty_images.setLimit(self.io(), alloc, screen, limit);
     }
 }
 
@@ -3695,51 +3806,63 @@ pub fn printAttributes(self: *Terminal, buf: []u8) ![]const u8 {
     try writer.writeByte('0');
 
     const pen = self.screens.active.cursor.style;
-    var attrs: [8]u8 = @splat(0);
+    var attrs: [9]u8 = @splat(0);
     var i: usize = 0;
 
     if (pen.flags.bold) {
-        attrs[i] = '1';
+        attrs[i] = 1;
         i += 1;
     }
 
     if (pen.flags.faint) {
-        attrs[i] = '2';
+        attrs[i] = 2;
         i += 1;
     }
 
     if (pen.flags.italic) {
-        attrs[i] = '3';
+        attrs[i] = 3;
         i += 1;
     }
 
     if (pen.flags.underline != .none) {
-        attrs[i] = '4';
+        attrs[i] = 4;
+        i += 1;
+    }
+
+    if (pen.flags.overline) {
+        attrs[i] = 53;
         i += 1;
     }
 
     if (pen.flags.blink) {
-        attrs[i] = '5';
+        attrs[i] = 5;
         i += 1;
     }
 
     if (pen.flags.inverse) {
-        attrs[i] = '7';
+        attrs[i] = 7;
         i += 1;
     }
 
     if (pen.flags.invisible) {
-        attrs[i] = '8';
+        attrs[i] = 8;
         i += 1;
     }
 
     if (pen.flags.strikethrough) {
-        attrs[i] = '9';
+        attrs[i] = 9;
         i += 1;
     }
 
-    for (attrs[0..i]) |c| {
-        try writer.print(";{c}", .{c});
+    for (attrs[0..i]) |attr| {
+        // Preserve underline styles. Kind of a hack to special case 4
+        // here but its easier than changing how we do all attributes.
+        if (attr == 4 and pen.flags.underline != .single) {
+            try writer.print(";4:{}", .{@intFromEnum(pen.flags.underline)});
+            continue;
+        }
+
+        try writer.print(";{}", .{attr});
     }
 
     switch (pen.fg_color) {
@@ -3969,7 +4092,7 @@ pub fn resize(
             .{
                 .cols = opts.cols,
                 .rows = opts.rows,
-                .max_scrollback = 0,
+                .max_scrollback_bytes = 0,
                 .kitty_image_storage_limit = if (comptime build_options.kitty_graphics)
                     primary.kitty_images.total_limit
                 else
@@ -4015,6 +4138,150 @@ pub fn resize(
         .left = 0,
         .right = opts.cols - 1,
     };
+}
+
+test "Terminal forwards optional scrollback limits" {
+    const max_lines: usize = 123;
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = max_lines,
+    });
+    defer t.deinit(testing.allocator);
+
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        t.screens.active.pages.limits.bytes.explicit,
+    );
+    try testing.expectEqual(
+        max_lines,
+        t.screens.active.pages.limits.lines.explicit,
+    );
+}
+
+test "Terminal setScrollbackMaxBytes" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(testing.allocator);
+
+    const primary = t.screens.get(.primary).?;
+    const page_rows: usize = primary.pages.pages.first.?.capacity().rows;
+
+    // Build several complete pages of history so lowering the byte limit has
+    // existing allocations to prune immediately.
+    for (0..4 * page_rows) |_| try t.linefeed();
+    const old_page_size = primary.pages.page_size;
+    t.setScrollbackMaxBytes(1);
+    try testing.expectEqual(@as(usize, 1), primary.pages.limits.bytes.explicit);
+    try testing.expect(primary.pages.page_size < old_page_size);
+    try testing.expect(
+        primary.pages.page_size <= primary.pages.limits.max(.bytes),
+    );
+    try testing.expect(!primary.no_scrollback);
+
+    // Zero switches Screen behavior as well as PageList accounting, discards
+    // all retained history, and prevents future linefeeds from recreating it.
+    t.setScrollbackMaxBytes(0);
+    try testing.expectEqual(@as(usize, 0), primary.pages.limits.bytes.explicit);
+    try testing.expect(primary.no_scrollback);
+    try testing.expectEqual(
+        @as(usize, primary.pages.rows),
+        primary.pages.total_rows,
+    );
+    try testing.expect(primary.pages.viewport == .active);
+
+    for (0..page_rows) |_| try t.linefeed();
+    try testing.expectEqual(
+        @as(usize, primary.pages.rows),
+        primary.pages.total_rows,
+    );
+
+    // Re-enabling unlimited scrollback affects subsequent output.
+    t.setScrollbackMaxBytes(null);
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        primary.pages.limits.bytes.explicit,
+    );
+    try testing.expect(!primary.no_scrollback);
+    for (0..page_rows) |_| try t.linefeed();
+    try testing.expect(primary.pages.total_rows > primary.pages.rows);
+}
+
+test "Terminal setScrollbackMaxLines" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = null,
+    });
+    defer t.deinit(testing.allocator);
+
+    const primary = t.screens.get(.primary).?;
+    const page_rows: usize = primary.pages.pages.first.?.capacity().rows;
+
+    for (0..4 * page_rows) |_| try t.linefeed();
+    const old_total_rows = primary.pages.total_rows;
+    t.setScrollbackMaxLines(page_rows);
+    try testing.expectEqual(
+        page_rows,
+        primary.pages.limits.lines.explicit,
+    );
+    try testing.expect(primary.pages.total_rows < old_total_rows);
+    try testing.expect(
+        !primary.pages.limits.exceeded(&primary.pages, .lines),
+    );
+
+    const limited_total_rows = primary.pages.total_rows;
+    t.setScrollbackMaxLines(null);
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        primary.pages.limits.lines.explicit,
+    );
+    try testing.expectEqual(limited_total_rows, primary.pages.total_rows);
+    for (0..3 * page_rows) |_| try t.linefeed();
+    try testing.expect(
+        primary.pages.total_rows - primary.pages.rows > page_rows,
+    );
+}
+
+test "Terminal setScrollback only affects primary screen" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+    });
+    defer t.deinit(testing.allocator);
+
+    _ = try t.switchScreen(.alternate);
+    const primary = t.screens.get(.primary).?;
+    const alternate = t.screens.get(.alternate).?;
+
+    t.setScrollbackMaxBytes(123);
+    t.setScrollbackMaxLines(456);
+
+    try testing.expectEqual(
+        @as(usize, 123),
+        primary.pages.limits.bytes.explicit,
+    );
+    try testing.expectEqual(
+        @as(usize, 456),
+        primary.pages.limits.lines.explicit,
+    );
+    try testing.expect(!primary.no_scrollback);
+
+    try testing.expectEqual(
+        @as(usize, 0),
+        alternate.pages.limits.bytes.explicit,
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        alternate.pages.limits.lines.explicit,
+    );
+    try testing.expect(alternate.no_scrollback);
+    try testing.expectEqual(alternate, t.screens.active);
 }
 
 test "Terminal: resize resets synchronized output" {
@@ -4433,8 +4700,8 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
             .{
                 .cols = self.cols,
                 .rows = self.rows,
-                .max_scrollback = switch (key) {
-                    .primary => primary.pages.explicit_max_size,
+                .max_scrollback_bytes = switch (key) {
+                    .primary => primary.pages.limits.bytes.explicit,
                     .alternate => 0,
                 },
 
@@ -4607,8 +4874,13 @@ pub fn fullReset(self: *Terminal) void {
     self.screens.active.reset();
 
     // Rest our basic state
+    const visible = self.flags.visible;
     self.modes.reset();
-    self.flags = .{};
+    self.flags = .{
+        // Visibility belongs to the view rather than terminal state, so a
+        // terminal reset must not make a hidden view potentially visible.
+        .visible = visible,
+    };
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();
@@ -4802,6 +5074,29 @@ test "Terminal: zero-width character attaches to pending wrap cell" {
     const str = try t.plainString(testing.allocator);
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("xå̲", str);
+}
+
+test "Terminal: caps zero-width codepoints attached to one cell" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 2, .rows = 2 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, false);
+    try t.print('A');
+
+    const initial_capacity = t.screens.active.cursor.page_pin.node.capacity().grapheme_bytes;
+    for (0..pagepkg.grapheme_max_len * 4) |_| try t.print(0x0301);
+
+    const list_cell = t.screens.active.pages.getCell(.{
+        .screen = .{ .x = 0, .y = 0 },
+    }).?;
+    try testing.expectEqual(
+        @as(usize, pagepkg.grapheme_max_len),
+        list_cell.node.page().lookupGrapheme(list_cell.cell).?.len,
+    );
+    try testing.expectEqual(
+        initial_capacity,
+        list_cell.node.capacity().grapheme_bytes,
+    );
 }
 
 // https://github.com/mitchellh/ghostty/issues/1400
@@ -5684,6 +5979,68 @@ test "Terminal: VS15 to make narrow character with pending wrap" {
         try testing.expectEqual(@as(u21, 0), spacer_cell.content.codepoint.data);
         try testing.expectEqual(Cell.Wide.spacer_tail, spacer_cell.wide);
     }
+}
+
+test "Terminal: VS15 narrows wide cell under cursor with wraparound disabled" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, true);
+    t.modes.set(.wraparound, false);
+
+    // First create a wide cell spanning columns 4 and 5.
+    t.setCursorPos(1, 4);
+    try t.print(0x2614);
+
+    // Make column 4 the right margin and put the cursor on the wide base.
+    // With wraparound disabled, grapheme lookup selects the cell under the
+    // cursor when it has content.
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(1, 4);
+    t.setCursorPos(1, 4);
+    try t.print(0xFE0E);
+
+    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+    const base = t.screens.active.pages.getCell(.{ .screen = .{ .x = 3, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, base.wide);
+    try testing.expect(base.hasGrapheme());
+    const tail = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, tail.wide);
+}
+
+test "Terminal: VS15 narrows wide cell under restored pending cursor" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, true);
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(1, 4);
+
+    // Save a pending-wrap cursor at column 4.
+    t.setCursorPos(1, 4);
+    try t.print('X');
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    t.saveCursor();
+
+    // Widen the margin and replace that cell with a wide character.
+    t.setLeftAndRightMargin(1, 5);
+    t.setCursorPos(1, 4);
+    try t.print(0x2614);
+
+    // Restoring also restores pending_wrap, so grapheme lookup selects the
+    // wide base under the cursor rather than its spacer tail.
+    t.restoreCursor();
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    try t.print(0xFE0E);
+
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+    const base = t.screens.active.pages.getCell(.{ .screen = .{ .x = 3, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, base.wide);
+    try testing.expect(base.hasGrapheme());
+    const tail = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?.cell;
+    try testing.expectEqual(Cell.Wide.narrow, tail.wide);
 }
 
 test "Terminal: VS16 to make wide character on next line" {
@@ -7835,7 +8192,7 @@ test "Terminal: insertLines top/bottom scroll region" {
 test "Terminal: insertLines across page boundary marks all shifted rows dirty" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback_bytes = 1024 });
     defer t.deinit(alloc);
 
     const first_page = t.screens.active.pages.pages.first.?;
@@ -7890,7 +8247,7 @@ test "Terminal: insertLines hyperlink-dense row crosses page boundary" {
     // page's capacity and retry rather than corrupting the page list.
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback_bytes = 1024 });
     defer t.deinit(alloc);
 
     const pages = &t.screens.active.pages;
@@ -8582,7 +8939,7 @@ test "Terminal: scrollUp creates scrollback in primary screen" {
     // scrollUp (CSI S) should push lines into scrollback like xterm.
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 10 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback_bytes = 10 });
     defer t.deinit(alloc);
 
     // Fill the screen with content
@@ -8625,11 +8982,11 @@ test "Terminal: scrollUp creates scrollback in primary screen" {
     }
 }
 
-test "Terminal: scrollUp with max_scrollback zero" {
-    // When max_scrollback is 0, scrollUp should still work but not retain history
+test "Terminal: scrollUp with max_scrollback_bytes zero" {
+    // When max_scrollback_bytes is 0, scrollUp should still work but not retain history
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 0 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback_bytes = 0 });
     defer t.deinit(alloc);
 
     try t.printString("AAAAA");
@@ -8658,11 +9015,11 @@ test "Terminal: scrollUp with max_scrollback zero" {
     }
 }
 
-test "Terminal: scrollUp with max_scrollback zero and top margin" {
-    // When max_scrollback is 0 and top margin is set, should use deleteLines path
+test "Terminal: scrollUp with max_scrollback_bytes zero and top margin" {
+    // When max_scrollback_bytes is 0 and top margin is set, should use deleteLines path
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 0 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback_bytes = 0 });
     defer t.deinit(alloc);
 
     try t.printString("AAAAA");
@@ -8689,11 +9046,11 @@ test "Terminal: scrollUp with max_scrollback zero and top margin" {
     }
 }
 
-test "Terminal: scrollUp with max_scrollback zero and left/right margin" {
-    // When max_scrollback is 0 with left/right margins, uses deleteLines path
+test "Terminal: scrollUp with max_scrollback_bytes zero and left/right margin" {
+    // When max_scrollback_bytes is 0 with left/right margins, uses deleteLines path
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 0 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback_bytes = 0 });
     defer t.deinit(alloc);
 
     try t.printString("AAAAABBBBB");
@@ -9875,7 +10232,7 @@ test "Terminal: index bottom of scroll region with hyperlinks" {
 test "Terminal: index bottom of scroll region clear hyperlinks" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 0 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback_bytes = 0 });
     defer t.deinit(alloc);
 
     t.setTopAndBottomMargin(2, 3);
@@ -10068,7 +10425,7 @@ test "Terminal: index bottom of scroll region creates scrollback" {
 test "Terminal: index bottom of scroll region no scrollback" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 0 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback_bytes = 0 });
     defer t.deinit(alloc);
 
     t.setTopAndBottomMargin(1, 3);
@@ -10235,7 +10592,7 @@ test "Terminal: index bottom of alt screen top region" {
 test "Terminal: scrollUp top region no scrollback" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback = 0 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5, .max_scrollback_bytes = 0 });
     defer t.deinit(alloc);
 
     try t.printString("A\nB\nC\nD\nE");
@@ -10820,7 +11177,7 @@ test "Terminal: deleteLines colors with bg color" {
 test "Terminal: deleteLines across page boundary marks all shifted rows dirty" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback_bytes = 1024 });
     defer t.deinit(alloc);
 
     const first_page = t.screens.active.pages.pages.first.?;
@@ -10880,7 +11237,7 @@ test "Terminal: deleteLines hyperlink-dense row crosses page boundary" {
     // this exercises the cursor accounting of the capacity increase.
     const alloc = testing.allocator;
     const io_impl = testing.io;
-    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 10, .max_scrollback_bytes = 1024 });
     defer t.deinit(alloc);
 
     const pages = &t.screens.active.pages;
@@ -13488,6 +13845,35 @@ test "Terminal: eraseLine complete preserves background sgr" {
     }
 }
 
+test "Terminal: eraseLine complete resets wrap" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    for ("ABCDE123") |c| try t.print(c);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(list_cell.row.wrap);
+    }
+
+    t.setCursorPos(1, 1);
+    t.eraseLine(.complete, false);
+
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(!list_cell.row.wrap);
+    }
+    try t.print('X');
+    try t.resize(alloc, .{ .rows = 5, .cols = 10 });
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("X\n123", str);
+    }
+}
+
 test "Terminal: eraseLine complete protected attributes respected with iso" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
@@ -13915,20 +14301,31 @@ test "Terminal: printAttributes" {
         try t.setAttribute(.inverse);
         try t.setAttribute(.invisible);
         try t.setAttribute(.strikethrough);
+        try t.setAttribute(.overline);
         try t.setAttribute(.{ .direct_color_fg = .{ .r = 100, .g = 200, .b = 255 } });
         try t.setAttribute(.{ .direct_color_bg = .{ .r = 101, .g = 102, .b = 103 } });
         defer t.setAttribute(.unset) catch unreachable;
         const buf = try t.printAttributes(&storage);
-        try testing.expectEqualStrings("0;1;2;3;4;5;7;8;9;38:2::100:200:255;48:2::101:102:103", buf);
+        try testing.expectEqualStrings("0;1;2;3;4;53;5;7;8;9;38:2::100:200:255;48:2::101:102:103", buf);
     }
 
-    {
-        try t.setAttribute(.{ .underline = .single });
-        defer t.setAttribute(.unset) catch unreachable;
+    const Case = struct {
+        underline: sgr.Attribute.Underline,
+        expected: []const u8,
+    };
+    for ([_]Case{
+        .{ .underline = .single, .expected = "0;4" },
+        .{ .underline = .double, .expected = "0;4:2" },
+        .{ .underline = .curly, .expected = "0;4:3" },
+        .{ .underline = .dotted, .expected = "0;4:4" },
+        .{ .underline = .dashed, .expected = "0;4:5" },
+    }) |case| {
+        try t.setAttribute(.{ .underline = case.underline });
         const buf = try t.printAttributes(&storage);
-        try testing.expectEqualStrings("0;4", buf);
+        try testing.expectEqualStrings(case.expected, buf);
     }
 
+    try t.setAttribute(.unset);
     {
         const buf = try t.printAttributes(&storage);
         try testing.expectEqualStrings("0", buf);
@@ -15655,6 +16052,8 @@ test "Terminal: deleteLines wide char at right margin with full clear" {
 }
 
 test "Terminal: glyph APC stores session glossary entries" {
+    if (comptime !build_options.glyph_protocol) return error.SkipZigTest;
+
     const alloc = testing.allocator;
     const io_impl = testing.io;
     var t = try init(io_impl, alloc, .{ .cols = 80, .rows = 24 });

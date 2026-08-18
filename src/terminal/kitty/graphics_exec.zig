@@ -172,7 +172,7 @@ fn transmit(
 
     // If the loaded image was assigned its ID automatically, not based
     // on a number or explicitly specified ID, then we don't respond.
-    if (load.image.implicit_id) return .{};
+    if (load.image.metadata.implicit_id) return .{};
 
     // After the image is added, set the ID in case it changed.
     // The resulting image number and placement ID never change.
@@ -256,6 +256,7 @@ fn display(
     storage.addPlacement(
         io,
         alloc,
+        terminal.screens.active,
         img.id,
         result.placement_id,
         p,
@@ -273,14 +274,21 @@ fn display(
             .after => {
                 // We use terminal.index to properly handle scroll regions.
                 const size = p.gridSize(img, terminal);
-                for (0..size.rows) |_| terminal.index() catch |err| {
+                // Once the requested movement leaves the screen, its exact
+                // position is undefined by the Kitty graphics protocol. Bound
+                // the work so an untrusted row count can't make us spin.
+                const rows_to_move: usize = @min(
+                    @as(usize, size.rows),
+                    @as(usize, terminal.rows),
+                );
+                for (0..rows_to_move) |_| terminal.index() catch |err| {
                     log.warn("failed to move cursor: {}", .{err});
                     break;
                 };
 
                 terminal.setCursorPos(
                     terminal.screens.active.cursor.y,
-                    pin.x + size.cols + 1,
+                    @as(usize, pin.x) +| @as(usize, size.cols) +| 1,
                 );
             },
         },
@@ -347,8 +355,8 @@ fn loadAndAddImage(
         storage.next_image_id +%= 1;
 
         // If the image also has no number then its auto-ID is "implicit".
-        // See the doc comment on the Image.implicit_id field for more detail.
-        if (loading.image.number == 0) loading.image.implicit_id = true;
+        // See the doc comment on Image.metadata.implicit_id for more detail.
+        if (loading.image.number == 0) loading.image.metadata.implicit_id = true;
     }
 
     // If this is chunked, this is the beginning of a new chunked transmission.
@@ -369,7 +377,7 @@ fn loadAndAddImage(
     // Validate and store our image
     var img = try loading.complete(alloc);
     errdefer img.deinit(alloc);
-    try storage.addImage(io, alloc, img);
+    try storage.addImage(io, alloc, terminal.screens.active, img);
 
     // Get our display settings
     const display_ = loading.display;
@@ -628,6 +636,86 @@ test "kittygfx retransmit same id gets fresh image generation" {
     try testing.expectEqual(gen2, storage.generation);
 }
 
+test "kittygfx retransmit same id removes existing placements" {
+    const testing = std.testing;
+    const io = testing.io;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    // Transmit and display an image, then add anonymous and named placements.
+    // Multiple anonymous a=p placements for one image are explicitly valid.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=T,t=d,f=24,i=1,s=1,v=2,C=1;////////",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=p,i=1,C=1");
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=p,i=1,p=7,C=1");
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    try testing.expectEqual(@as(usize, 3), storage.placements.count());
+    try testing.expectEqual(
+        tracked + 3,
+        t.screens.active.pages.countTrackedPins(),
+    );
+
+    // Retransmitting replaces the image and must delete every old placement.
+    // Plain a=t creates no replacement placement of its own.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,t=d,f=24,i=1,s=1,v=2;AAAAAAAA",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+
+    // a=T creates one new placement after deleting the previous image and
+    // placements, so repeated redraws remain bounded at one placement.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=T,t=d,f=24,i=1,s=1,v=2,C=1;////////",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=T,t=d,f=24,i=1,s=1,v=2,C=1;AAAAAAAA",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    try testing.expectEqual(
+        tracked + 1,
+        t.screens.active.pages.countTrackedPins(),
+    );
+}
+
 test "kittygfx delete then retransmit same id gets fresh generation" {
     const testing = std.testing;
     const io = testing.io;
@@ -672,4 +760,23 @@ test "kittygfx delete then retransmit same id gets fresh generation" {
     const gen2 = storage.imageById(1).?.generation;
     try testing.expect(gen2 > gen1);
     try testing.expect(gen2 > gen_delete);
+}
+
+test "kittygfx placement bounds cursor movement for untrusted dimensions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=4294967295,r=4294967295;////",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(io, alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+    try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
 }

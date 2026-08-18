@@ -50,6 +50,7 @@ pub const Mailbox = union(enum) {
     pub fn deinit(self: *Mailbox, alloc: Allocator) void {
         switch (self.*) {
             .spsc => |*v| {
+                while (v.queue.pop(global.io())) |msg| msg.deinit();
                 v.queue.destroy(alloc);
                 v.wakeup.deinit();
             },
@@ -89,6 +90,7 @@ pub const Mailbox = union(enum) {
                 // lock so we need to unlock.
                 mb.wakeup.notify() catch |err| {
                     log.warn("failed to wake up writer, data will be dropped err={}", .{err});
+                    msg.deinit();
                     return false;
                 };
 
@@ -103,7 +105,10 @@ pub const Mailbox = union(enum) {
                 // here.
                 if (mutex) |m| m.unlock(global.io());
                 defer if (mutex) |m| m.lockUncancelable(global.io());
-                if (mb.queue.push(global.io(), msg, .{ .forever = {} }) == 0) return false;
+                if (mb.queue.push(global.io(), msg, .{ .forever = {} }) == 0) {
+                    msg.deinit();
+                    return false;
+                }
             },
         }
 

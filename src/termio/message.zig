@@ -93,9 +93,18 @@ pub const Message = union(enum) {
         }
     };
 
-    /// Request a color scheme report is sent to the pty.
+    /// Request a color scheme report is sent to the PTY.
     color_scheme_report: struct {
         /// Force write the current color scheme
+        force: bool,
+    },
+
+    /// Request a visibility report is sent to the PTY.
+    visibility_report: struct {
+        /// The visibility state to report.
+        visible: bool,
+
+        /// Send the report even when mode 2033 is disabled.
         force: bool,
     },
 
@@ -116,7 +125,7 @@ pub const Message = union(enum) {
     /// Resize the window.
     resize: renderer.Size,
 
-    /// Request a size report is sent to the pty ([in-band
+    /// Request a size report is sent to the PTY ([in-band
     /// size report, mode 2048](https://gist.github.com/rockorager/e695fb2924d36b2bcf1fff4a3704bd83) and
     /// [XTWINOPS](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h4-Functions-using-CSI-_-ordered-by-the-final-character-lparen-s-rparen:CSI-Ps;Ps;Ps-t.1EB0)).
     size_report: SizeReport,
@@ -222,12 +231,13 @@ pub const Message = union(enum) {
         };
     }
 
-    /// Release any memory owned by this message if it will not be handled.
-    pub fn deinit(self: Message) void {
-        switch (self) {
-            .change_config => |config| {
-                config.ptr.deinit();
-                config.alloc.destroy(config.ptr);
+    /// Free resources owned by a message that will not be processed.
+    /// The message is invalid after this call.
+    pub fn deinit(self: *const Message) void {
+        switch (self.*) {
+            .change_config => |v| {
+                v.ptr.deinit();
+                v.alloc.destroy(v.ptr);
             },
             .process_exit_blocking => |v| v.complete(error.TermioDraining),
             .pty_output_blocking => |v| v.complete(error.TermioDraining),
@@ -235,7 +245,6 @@ pub const Message = union(enum) {
             .write_raw_alloc,
             .pty_output_alloc,
             => |v| v.alloc.free(v.data),
-
             else => {},
         }
     }

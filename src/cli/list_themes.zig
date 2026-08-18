@@ -241,6 +241,7 @@ const Preview = struct {
     allocator: std.mem.Allocator,
     should_quit: bool,
     tty: vaxis.Tty,
+    env_map: std.process.Environ.Map,
     vx: vaxis.Vaxis,
     mouse: ?vaxis.Mouse,
     themes: []ThemeListElement,
@@ -264,16 +265,15 @@ const Preview = struct {
         theme_filter: ColorScheme,
         buf: []u8,
     ) !*Preview {
-        var env_map = try global.environMap();
-        defer env_map.deinit();
-
         const self = try allocator.create(Preview);
+        errdefer allocator.destroy(self);
 
         self.* = .{
             .allocator = allocator,
             .should_quit = false,
             .tty = try .init(global.io(), buf),
-            .vx = try vaxis.init(global.io(), allocator, &env_map, .{}),
+            .env_map = try global.environMap(),
+            .vx = undefined,
             .mouse = null,
             .themes = themes,
             .filtered = try .initCapacity(allocator, themes.len),
@@ -285,6 +285,7 @@ const Preview = struct {
             .text_input = .init(allocator),
             .theme_filter = theme_filter,
         };
+        self.vx = try vaxis.init(global.io(), allocator, &self.env_map, .{});
 
         try self.updateFiltered();
 
@@ -296,14 +297,17 @@ const Preview = struct {
         self.filtered.deinit(allocator);
         self.text_input.deinit();
         self.vx.deinit(allocator, self.tty.writer());
+        self.env_map.deinit();
         self.tty.deinit();
         allocator.destroy(self);
     }
 
     pub fn run(self: *Preview) !void {
         var loop: vaxis.Loop(Event) = .init(global.io(), &self.tty, &self.vx);
-        const writer = self.tty.writer();
+        try loop.start();
+        defer loop.stop();
 
+        const writer = self.tty.writer();
         try self.vx.enterAltScreen(writer);
         try self.vx.setTitle(writer, "👻 Ghostty Theme Preview 👻");
         try self.vx.queryTerminal(writer, .fromSeconds(1));
@@ -460,9 +464,9 @@ const Preview = struct {
                             self.text_input.buf.clearRetainingCapacity();
                             try self.updateFiltered();
                         }
-                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home, 'g' }, .{}))
                             self.current = 0;
-                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end, 'G' }, .{}))
                             self.current = self.filtered.items.len - 1;
                         if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
                             self.down(1);
@@ -775,8 +779,8 @@ const Preview = struct {
                     .{ .keys = "d", .help = "Show palette numbers in decimal." },
                     .{ .keys = "c", .help = "Copy theme name to the clipboard." },
                     .{ .keys = "C", .help = "Copy theme path to the clipboard." },
-                    .{ .keys = "Home", .help = "Go to the start of the list." },
-                    .{ .keys = "End", .help = "Go to the end of the list." },
+                    .{ .keys = "Home, g", .help = "Go to the start of the list." },
+                    .{ .keys = "End, G", .help = "Go to the end of the list." },
                     .{ .keys = "/", .help = "Start search." },
                     .{ .keys = "^X, ^/", .help = "Clear search." },
                     .{ .keys = "⏎", .help = "Save theme or close search window." },

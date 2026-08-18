@@ -977,7 +977,7 @@ test "simple search with history" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1019,7 +1019,7 @@ test "reload active with history change" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1207,7 +1207,7 @@ test "select after resize resets stale flattened results" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 3,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
 
@@ -1307,7 +1307,7 @@ test "select into history" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1485,7 +1485,7 @@ test "select prev with history" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1540,7 +1540,7 @@ test "select prev wraps when all matches are in history" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1605,7 +1605,7 @@ test "select after partial history erase drops a pruned selection" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1638,7 +1638,7 @@ test "select after history compaction ignores replaced results" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1673,7 +1673,7 @@ test "select after partial history page erase ignores shifted results" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1707,7 +1707,7 @@ test "reload defers pruning unselected history results" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1742,7 +1742,7 @@ test "reload after partial history page erase drops shifted selection first" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1781,7 +1781,7 @@ test "select after history page split ignores moved results" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1815,7 +1815,7 @@ test "screen search no scrollback has no history" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = 0,
+        .max_scrollback_bytes = 0,
     });
     defer t.deinit(alloc);
 
@@ -1852,7 +1852,7 @@ test "reloadActive partial history cleanup on appendSlice error" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1900,7 +1900,7 @@ test "reloadActive partial history cleanup on loop append error" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;
@@ -1947,7 +1947,7 @@ test "select after clearing scrollback" {
     var t: Terminal = try .init(io, alloc, .{
         .cols = 10,
         .rows = 2,
-        .max_scrollback = std.math.maxInt(usize),
+        .max_scrollback_bytes = std.math.maxInt(usize),
     });
     defer t.deinit(alloc);
     const list: *PageList = &t.screens.active.pages;

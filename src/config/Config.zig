@@ -41,6 +41,7 @@ const ClipboardCodepointMap = @import("ClipboardCodepointMap.zig");
 const KeyRemapSet = @import("../input/key_mods.zig").RemapSet;
 pub const WindowPaddingBalance = @import("../renderer/size.zig").PaddingBalance;
 const string = @import("string.zig");
+const Limit = @import("limit.zig").Limit;
 
 // We do this instead of importing all of terminal/main.zig to
 // limit the dependency graph. This is important because some things
@@ -95,6 +96,10 @@ pub const compatibility = std.StaticStringMap(
     // Ghostty 1.3 rename the "window" option to "new-window".
     // See: https://github.com/ghostty-org/ghostty/pull/9764
     .{ "macos-dock-drop-behavior", compatMacOSDockDropBehavior },
+
+    // Ghostty 1.4 renamed `scrollback-limit` to `scrollback-limit-bytes`
+    // when `scrollback-limit-lines` was added so the units are explicit.
+    .{ "scrollback-limit", cli.compatibilityRenamed(Config, "scrollback-limit-bytes") },
 });
 
 /// Set Ghostty's graphical user interface language to a language other than the
@@ -903,10 +908,10 @@ palette: Palette = .{},
 /// Enables the ability to move the cursor at prompts by clicking on a
 /// location in the prompt text.
 ///
-/// This feature requires shell integration, specifically prompt marking
-/// via `OSC 133`. Some shells like Fish (v4) and Nu (0.111+) natively
-/// support this while others may require additional configuration or
-/// Ghostty's shell integration features to be enabled.
+/// This feature requires prompt marking via `OSC 133`. Some shells like Fish
+/// (v4.1+) and Nu (0.111+) natively support this while others may require
+/// additional configuration or Ghostty's shell integration features to be
+/// enabled.
 ///
 /// Depending on the shell, this works either by translating your click
 /// position into a series of synthetic arrow key movements or by sending
@@ -1378,11 +1383,32 @@ input: RepeatableReadableIO = .{},
 ///
 /// This size is per terminal surface, not for the entire application.
 ///
-/// It is not currently possible to set an unlimited scrollback buffer.
-/// This is a future planned feature.
+/// A separate maximum can be set with `scrollback-limit-lines`; if both limits
+/// are set, then the first one reached will determine when scrollback is
+/// removed.
+///
+/// The default is 50 MB. Set this to `unlimited` to remove the byte limit.
 ///
 /// This can be changed at runtime but will only affect new terminal surfaces.
-@"scrollback-limit": usize = 50_000_000, // 50MB
+@"scrollback-limit-bytes": Limit(usize, 50_000_000) = .default,
+
+/// The maximum number of lines of scrollback to retain. This excludes
+/// the active screen. Soft-wrapped lines count as multiple lines.
+///
+/// This limit is an estimate. Internally, Ghostty will only trim lines
+/// up to the minimum allocation unit that is used internally (called a
+/// "page"). The size of a page depends on how many styles, graphemes, etc.
+/// take up the screen. In practice, this can be anywhere from a handful to
+/// a couple hundred lines. Importantly, memory is capped either way.
+/// This means that the actual limited lines will likely be slightly
+/// higher in practice.
+///
+/// The default is `unlimited`. A separate maximum can be set with
+/// `scrollback-limit-bytes`; if both limits are set, then the first one reached
+/// will determine when scrollback is removed.
+///
+/// This can be changed at runtime but will only affect new terminal surfaces.
+@"scrollback-limit-lines": Limit(usize, std.math.maxInt(usize)) = .default,
 
 /// Whether to compress scrollback pages while the terminal is idle.
 ///
@@ -1415,9 +1441,9 @@ input: RepeatableReadableIO = .{},
 /// Valid values:
 ///
 ///   * `system` - Respect the system settings for when to show scrollbars.
-///     For example, on macOS, this will respect the "Scrollbar behavior"
-///     system setting which by default usually only shows scrollbars while
-///     actively scrolling or hovering the gutter.
+///     On macOS, we only show scrollbars while actively scrolling or hovering
+///     the gutter. If the system setting is set to "Always", the scrollbar
+///     will be shown when the mouse is over the gutter area.
 ///
 ///   * `never` - Never show a scrollbar. You can still scroll using the mouse,
 ///     keybind actions, etc. but you will not have a visual UI widget showing
@@ -1445,6 +1471,14 @@ link: RepeatableLink = .{},
 /// The URL matcher is always lowest priority of any configured links (see
 /// `link`). If you want to customize URL matching, use `link` and disable this.
 @"link-url": bool = true,
+
+/// Enable hyperlinks created with the OSC 8 escape sequence. When disabled,
+/// OSC 8 hyperlinks are not highlighted, previewed, copied, or opened.
+///
+/// This does not affect URL matching controlled by `link-url`.
+///
+/// Available since: 1.4.0
+@"link-osc8": bool = true,
 
 /// Show link previews for a matched URL.
 ///
@@ -1772,8 +1806,6 @@ class: ?[:0]const u8 = null,
 /// `global:unconsumed:ctrl+a=reload_config` will make the keybind global
 /// and not consume the input to reload the config.
 ///
-/// Note: `global:` is only supported on macOS and certain Linux platforms.
-///
 /// On macOS, this feature requires accessibility permissions to be granted
 /// to Ghostty. When a `global:` keybind is specified and Ghostty is launched
 /// or reloaded, Ghostty will attempt to request these permissions.
@@ -1781,24 +1813,40 @@ class: ?[:0]const u8 = null,
 /// you can find these permissions in System Preferences -> Privacy & Security
 /// -> Accessibility.
 ///
-/// On Linux, you need a desktop environment that implements the
-/// [Global Shortcuts](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html)
-/// protocol as a part of its XDG desktop protocol implementation.
-/// Desktop environments that are known to support (or not support)
-/// global shortcuts include:
+/// Since Ghostty 1.4.0, global shortcuts on Linux are primarily supported
+/// through the [`vicinae-hotkey-v1`](https://github.com/vicinaehq/vicinae-wayland-protocols/tree/main/staging/vicinae-hotkey)
+/// protocol, available out-of-the-box with the following Wayland compositors
+/// and desktop environments:
 ///
-///  - Users using KDE Plasma (since [5.27](https://kde.org/announcements/plasma/5/5.27.0/#wayland))
-///    and GNOME (since [48](https://release.gnome.org/48/#and-thats-not-all)) should be able
-///    to use global shortcuts with little to no configuration.
+///   - Hyprland since version 0.56.0
 ///
-///  - Some manual configuration is required on Hyprland. Consult the steps
-///    outlined on the [Hyprland Wiki](https://wiki.hyprland.org/Configuring/Binds/#dbus-global-shortcuts)
-///    to set up global shortcuts correctly.
-///    (Important: [`xdg-desktop-portal-hyprland`](https://wiki.hyprland.org/Hypr-Ecosystem/xdg-desktop-portal-hyprland/)
-///    must also be installed!)
+/// On X11 or when your Wayland compositor/desktop environment does not
+/// support `vicinae-hotkey-v1`, the much more widely-used
+/// [XDG Global Shortcuts](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html)
+/// protocol is used instead.
 ///
-///  - Notably, global shortcuts have not been implemented on wlroots-based
-///    compositors like Sway (see [upstream issue](https://github.com/emersion/xdg-desktop-portal-wlr/issues/240)).
+/// Note: XDG Global Shortcuts rely on a functional XDG Desktop Portal
+/// implementation **that is designed to be used with your desktop environment
+/// or compositor**. Please make sure that you have the correct one installed.
+///
+/// Desktop environments that are known to support the XDG Global Shortcuts
+/// protocol include:
+///
+///  - KDE Plasma since [5.27](https://kde.org/announcements/plasma/5/5.27.0/#wayland)
+///    with `xdg-desktop-portal-kde` installed
+///
+///  - GNOME since [48](https://release.gnome.org/48/#and-thats-not-all) with
+///    `xdg-desktop-portal-gnome` installed
+///
+///  - Hyprland before version 0.56.0, with `xdg-desktop-portal-hyprland`
+///    installed. **Some manual configuration is required.** Consult the steps
+///    outlined on the [Hyprland Wiki](https://wiki.hypr.land/Configuring/Basics/Binds/#dbus-global-shortcuts)
+///    to set up D-Bus-based global shortcuts correctly.
+///
+/// Desktop environments and compositors that don't implement either protocol
+/// do not support global shortcuts, like wlroots-based compositors e.g. Sway
+/// (see [upstream issue](https://github.com/emersion/xdg-desktop-portal-wlr/issues/240))
+/// and COSMIC.
 ///
 /// ## Chained Actions
 ///
@@ -2299,6 +2347,33 @@ keybind: Keybinds = .{},
 ///
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"window-titlebar-foreground": ?Color = null,
+
+/// Controls when drag handles are shown over splits,
+/// allowing splits to be rearranged with mouse controls.
+///
+/// Valid values:
+///
+///  - `always`
+///
+///    Always display the drag handle, even when there's only one split.
+///
+///  - `auto` *(default)*
+///
+///    Automatically show and hide the drag handle.
+///
+///    On Linux, the handle is only shown when there are two or
+///    more splits present.
+///
+///    On macOS, the handle is only hidden when there's one split
+///    in **fullscreen** mode, otherwise it's shown when hovered.
+///
+///  - `never`
+///
+///    Never show the drag handle. Splits then cannot be rearranged with
+///    mouse controls.
+///
+/// Available since: 1.4.0.
+@"drag-handle": DragHandle = .auto,
 
 /// This controls when resize overlays are shown. Resize overlays are a
 /// transient popup that shows the size of the terminal while the surfaces are
@@ -2859,10 +2934,9 @@ keybind: Keybinds = .{},
 ///     (Available since: 1.2.0)
 ///
 ///   * `ssh-terminfo` - Enable automatic terminfo installation on remote hosts.
-///     Attempts to install Ghostty's terminfo entry using `infocmp` and `tic` when
-///     connecting to hosts that lack it. Requires `infocmp` to be available locally
-///     and `tic` to be available on remote hosts. Once terminfo is installed on a
-///     remote host, it will be automatically "cached" to avoid repeat installations.
+///     Attempts to install Ghostty's embedded terminfo entry using `tic` on local
+///     cache misses. Requires `tic` to be available on remote hosts. Successful
+///     installations are cached locally to avoid repeat installations.
 ///     If desired, the `+ssh-cache` CLI action can be used to manage the installation
 ///     cache manually using various arguments.
 ///     (Available since: 1.2.0)
@@ -4049,6 +4123,7 @@ fn writeConfigTemplate(path: []const u8) !void {
         @embedFile("./config-template"),
         .{ .path = path },
     );
+    try writer.flush();
 }
 
 /// Load configurations from the default configuration files. The default
@@ -4445,6 +4520,29 @@ fn expandPaths(self: *Config, base: []const u8) !void {
     }
 }
 
+/// Expand tilde paths to absolute paths to the user's home directory.
+/// If expansion fails, an error is logged and the original path is returned.
+fn expandHome(path: []const u8, buf: []u8) []const u8 {
+    if (!std.mem.startsWith(u8, path, "~/"))
+        return path;
+
+    var environ_map = global.environMap() catch |err| {
+        log.warn("failed to get environment map for path \"{s}\": {}", .{ path, err });
+        return path;
+    };
+    defer environ_map.deinit();
+
+    return internal_os.expandHome(
+        global.io(),
+        &environ_map,
+        path,
+        buf,
+    ) catch |err| {
+        log.warn("failed to expand home directory in path \"{s}\": {}", .{ path, err });
+        return path;
+    };
+}
+
 fn loadTheme(self: *Config, theme: Theme) !void {
     // Load the correct theme depending on the conditional state.
     // Dark/light themes were programmed prior to conditional configuration
@@ -4544,14 +4642,17 @@ fn loadTheme(self: *Config, theme: Theme) !void {
 /// Call this once after you are done setting configuration. This
 /// is idempotent but will waste memory if called multiple times.
 pub fn finalize(self: *Config) !void {
+    const alloc = self._arena.?.allocator();
+
     // We always load the theme first because it may set other fields
     // in our config.
-    if (self.theme) |theme| {
+    if (self.theme) |*theme| {
+        try theme.finalize(alloc);
         const different = !std.mem.eql(u8, theme.light, theme.dark);
 
         // Warning: loadTheme will deinit our existing config and replace
         // it so all memory from self prior to this point will be freed.
-        try self.loadTheme(theme);
+        try self.loadTheme(theme.*);
 
         // If we have different light vs dark mode themes, disable
         // window-theme = auto since that breaks it.
@@ -4564,8 +4665,6 @@ pub fn finalize(self: *Config) !void {
             self._conditional_set.insert(.theme);
         }
     }
-
-    const alloc = self._arena.?.allocator();
 
     // Used for a variety of defaults. See the function docs as well the
     // specific variable use sites for more details.
@@ -4647,7 +4746,7 @@ pub fn finalize(self: *Config) !void {
                         var environ_map = try global.environMap();
                         defer environ_map.deinit();
                         var buf: [std.fs.max_path_bytes]u8 = undefined;
-                        if (try internal_os.home(&environ_map, &buf)) |home| {
+                        if (try internal_os.home(global.io(), &environ_map, &buf)) |home| {
                             wd = .{ .path = try alloc.dupe(u8, home) };
                         } else {
                             wd = .inherit;
@@ -5371,20 +5470,8 @@ pub const WorkingDirectory = union(enum) {
             else => return,
         };
 
-        if (!std.mem.startsWith(u8, path, "~/")) return;
-
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const expanded = expanded: {
-            var environ_map = global.environMap() catch |err| break :expanded err;
-            defer environ_map.deinit();
-            break :expanded internal_os.expandHome(&environ_map, path, &buf);
-        } catch |err| {
-            log.warn(
-                "error expanding home directory for working-directory path={s}: {}",
-                .{ path, err },
-            );
-            return;
-        };
+        const expanded = expandHome(path, &buf);
 
         if (std.mem.eql(u8, expanded, path)) return;
         self.* = .{ .path = try alloc.dupe(u8, expanded) };
@@ -5446,6 +5533,7 @@ pub const WorkingDirectory = union(enum) {
 
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             const expected = internal_os.expandHome(
+                testing.io,
                 &environ_map,
                 "~/projects/ghostty",
                 &buf,
@@ -6446,7 +6534,7 @@ pub const Keybinds = struct {
         try self.set.put(
             alloc,
             .{ .key = .{ .unicode = ',' }, .mods = inputpkg.ctrlOrSuper(.{}) },
-            .{ .open_config = {} },
+            .{ .open_config = .default },
         );
 
         {
@@ -8708,8 +8796,20 @@ pub const RepeatableCommand = struct {
             self.value.deinit(alloc);
             self.value_c.deinit(alloc);
         }
-        try self.value.appendSlice(alloc, inputpkg.command.defaults);
-        try self.value_c.appendSlice(alloc, inputpkg.command.defaultsC);
+        try self.value.ensureUnusedCapacity(alloc, inputpkg.command.defaults.len);
+        try self.value_c.ensureUnusedCapacity(alloc, inputpkg.command.defaults.len);
+        for (inputpkg.command.defaults) |cmd| {
+            // Translation is currently a GTK-only feature. In particular,
+            // translating these shared strings for the embedded runtime gives
+            // the macOS app a localized command palette in an otherwise
+            // unlocalized UI.
+            const localized = if (comptime build_config.app_runtime == .gtk)
+                cmd.translated()
+            else
+                cmd;
+            self.value.appendAssumeCapacity(localized);
+            self.value_c.appendAssumeCapacity(try localized.cval(alloc));
+        }
     }
 
     pub fn parseCLI(
@@ -9234,6 +9334,13 @@ pub const MacOSDockDropBehavior = enum {
 
 /// See window-show-tab-bar
 pub const WindowShowTabBar = enum {
+    always,
+    auto,
+    never,
+};
+
+/// See drag-handle
+pub const DragHandle = enum {
     always,
     auto,
     never,
@@ -9887,6 +9994,19 @@ pub const Theme = struct {
         };
     }
 
+    /// Expand tilde paths in light/dark theme values.
+    pub fn finalize(self: *Theme, alloc: Allocator) Allocator.Error!void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+
+        const light = expandHome(self.light, &buf);
+        if (!std.mem.eql(u8, light, self.light))
+            self.light = try alloc.dupeZ(u8, light);
+
+        const dark = expandHome(self.dark, &buf);
+        if (!std.mem.eql(u8, dark, self.dark))
+            self.dark = try alloc.dupeZ(u8, dark);
+    }
+
     /// Deep copy of the struct. Required by Config.
     pub fn clone(self: *const Theme, alloc: Allocator) Allocator.Error!Theme {
         return .{
@@ -9941,6 +10061,34 @@ pub const Theme = struct {
             try v.parseCLI(alloc, " light:foo,  dark : bar  ");
             try testing.expectEqualStrings("foo", v.light);
             try testing.expectEqualStrings("bar", v.dark);
+        }
+
+        // Expand tilde to home
+        {
+            var environ_map = try testing.environ.createMap(alloc);
+            defer environ_map.deinit();
+
+            var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const home = try internal_os.expandHome(
+                testing.io,
+                &environ_map,
+                "~/",
+                &home_buf,
+            );
+
+            var v: Theme = undefined;
+            try v.parseCLI(alloc, "light:~/foo, dark:~/bar");
+            try v.finalize(alloc);
+
+            var expected_buf: [std.fs.max_path_bytes]u8 = undefined;
+            try testing.expectEqualStrings(
+                try std.fmt.bufPrint(&expected_buf, "{s}foo", .{home}),
+                v.light,
+            );
+            try testing.expectEqualStrings(
+                try std.fmt.bufPrint(&expected_buf, "{s}bar", .{home}),
+                v.dark,
+            );
         }
 
         var v: Theme = undefined;
@@ -10512,6 +10660,7 @@ test "clone preserves conditional set" {
 
 test "working-directory expands tilde" {
     const testing = std.testing;
+    const io = testing.io;
     const alloc = testing.allocator;
     var environ_map = try testing.environ.createMap(testing.allocator);
     defer environ_map.deinit();
@@ -10526,6 +10675,7 @@ test "working-directory expands tilde" {
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const expected = internal_os.expandHome(
+        io,
         &environ_map,
         "~/projects/ghostty",
         &buf,
@@ -10826,6 +10976,94 @@ test "theme specifying light/dark sets theme usage in conditional state" {
         try testing.expect(cfg.@"window-theme" == .system);
         try testing.expect(cfg._conditional_set.contains(.theme));
     }
+}
+
+test "scrollback limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try testing.expectEqual(
+        @as(usize, 50_000_000),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-lines".value,
+    );
+
+    var it: TestIterator = .{ .data = &.{
+        "--scrollback-limit-bytes=1234",
+        "--scrollback-limit-lines=567",
+    } };
+    try cfg.loadIter(alloc, &it);
+
+    try testing.expectEqual(
+        @as(usize, 1234),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        @as(usize, 567),
+        cfg.@"scrollback-limit-lines".value,
+    );
+
+    var unlimited_it: TestIterator = .{ .data = &.{
+        "--scrollback-limit-bytes=unlimited",
+        "--scrollback-limit-lines=unlimited",
+    } };
+    try cfg.loadIter(alloc, &unlimited_it);
+
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-lines".value,
+    );
+
+    var reset_it: TestIterator = .{ .data = &.{
+        "--scrollback-limit-bytes=",
+        "--scrollback-limit-lines=",
+    } };
+    try cfg.loadIter(alloc, &reset_it);
+
+    try testing.expectEqual(
+        @as(usize, 50_000_000),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-lines".value,
+    );
+}
+
+test "compatibility: scrollback-limit renamed to bytes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        "--scrollback-limit=1234",
+    } };
+    try cfg.loadIter(alloc, &it);
+
+    try testing.expectEqual(
+        @as(usize, 1234),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+
+    var unlimited_it: TestIterator = .{ .data = &.{
+        "--scrollback-limit=unlimited",
+    } };
+    try cfg.loadIter(alloc, &unlimited_it);
+
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-bytes".value,
+    );
 }
 
 test "compatibility: gtk-single-instance desktop" {

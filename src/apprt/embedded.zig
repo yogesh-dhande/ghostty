@@ -1772,6 +1772,107 @@ pub const CAPI = struct {
         screen.dirty.selection = true;
     }
 
+    /// A mirror's local text selection expressed in grid coordinates, plus the anchor of an
+    /// in-progress selection drag.
+    ///
+    /// A mirror is viewport-only: it holds no scrollback and every frame rewrites the whole grid,
+    /// so a selection's identity is the active-area coordinates it covers rather than the rows it
+    /// was originally taken from. That makes coordinates the right thing to carry across the
+    /// `fullReset` each frame performs, and it matches what a real terminal shows for a full-screen
+    /// TUI repainting in place. The terminal's own dimensions are no part of that identity: the
+    /// host view pushes its pixel size through `ghostty_surface_set_size`, whose io-thread resize
+    /// can land between two frame applies and leave the terminal at the view's grid rather than
+    /// the last frame's, so a coordinate is validated against the grid the new frame actually
+    /// paints (the pin lookups in `restoreMirrorSelection`), never against the terminal size at
+    /// capture time. A frame that shrinks the grid out from under a selection fails that lookup
+    /// and drops it, which keeps the reset's own behavior for a genuine size change.
+    ///
+    /// Accepted risk: an interim host-view resize reflows or clamps the tracked pins before the
+    /// next capture, so a selection held across a window resize or scale change can restore at
+    /// the reflowed coordinates rather than its originals. Preventing that means caching
+    /// coordinates across applies on mirror session state, which is not worth it for a cosmetic
+    /// shift that needs a geometry change mid-selection and clears on the next click.
+    const MirrorSelectionState = struct {
+        selection: ?Bounds = null,
+        /// Where the left press that started the current drag landed. Null when no drag is in
+        /// progress or its anchor already belongs to a screen the gesture no longer owns.
+        drag_anchor: ?terminal.point.Coordinate = null,
+
+        const Bounds = struct {
+            start: terminal.point.Coordinate,
+            end: terminal.point.Coordinate,
+            rectangle: bool,
+        };
+    };
+
+    /// Reads the mirror's selection and drag anchor as active-area coordinates.
+    ///
+    /// The anchor is read through `validatedLeftClickPin` so a pin belonging to a screen the
+    /// gesture no longer owns is never resurrected at a coordinate on this screen.
+    fn captureMirrorSelection(
+        surface: *Surface,
+        terminal_state: *terminal.Terminal,
+    ) MirrorSelectionState {
+        var state: MirrorSelectionState = .{};
+        const screen = terminal_state.screens.active;
+
+        if (screen.selection) |sel| capture: {
+            const start = screen.pages.pointFromPin(.active, sel.start()) orelse break :capture;
+            const end = screen.pages.pointFromPin(.active, sel.end()) orelse break :capture;
+            state.selection = .{
+                .start = start.coord(),
+                .end = end.coord(),
+                .rectangle = sel.rectangle,
+            };
+        }
+
+        const gesture = &surface.core_surface.mouse.selection_gesture;
+        if (gesture.left_click_count > 0) capture: {
+            const pin = gesture.validatedLeftClickPin(&terminal_state.screens) orelse break :capture;
+            const pt = screen.pages.pointFromPin(.active, pin.*) orelse break :capture;
+            state.drag_anchor = pt.coord();
+        }
+
+        return state;
+    }
+
+    /// Re-applies a captured selection and drag anchor to the rewritten grid.
+    ///
+    /// The pin lookups are the validity check: a coordinate outside the grid this frame painted
+    /// resolves to null and quietly drops what it was restoring, which is how a frame that
+    /// shrinks the grid sheds a selection it can no longer address. Capture and restore describe
+    /// the same screen: a mirror only ever sits on the primary screen, since applying a frame
+    /// ends by switching there and nothing else moves this terminal off it.
+    fn restoreMirrorSelection(
+        surface: *Surface,
+        terminal_state: *terminal.Terminal,
+        state: MirrorSelectionState,
+    ) !void {
+        const screen = terminal_state.screens.active;
+
+        if (state.selection) |bounds| restore: {
+            const start = screen.pages.pin(.{ .active = bounds.start }) orelse break :restore;
+            const end = screen.pages.pin(.{ .active = bounds.end }) orelse break :restore;
+            try screen.select(terminal.Selection.init(start, end, bounds.rectangle));
+        }
+
+        // A drag that cannot be re-anchored must be cancelled, not left running: the reset that
+        // preceded this restore moved its tracked pin to the top-left, and `validatedLeftClickPin`
+        // has no way to tell that re-anchored pin from a real press there, so the next drag event
+        // would grow a selection from (0,0). That covers both an anchor that no longer fits the
+        // grid this frame painted and a live gesture whose anchor could not be captured at all.
+        const gesture = &surface.core_surface.mouse.selection_gesture;
+        if (state.drag_anchor) |coord| {
+            if (screen.pages.pin(.{ .active = coord })) |pin| {
+                try gesture.rebindLeftClickPin(terminal_state, pin);
+            } else {
+                gesture.reset(terminal_state);
+            }
+        } else if (gesture.left_click_count > 0) {
+            gesture.reset(terminal_state);
+        }
+    }
+
     /// Writes a snapshot onto a mirror surface's terminal state.
     ///
     /// A cell's OSC 8 link fields (`link_index` and the snapshot's link table) are deliberately not
@@ -1788,6 +1889,15 @@ pub const CAPI = struct {
         defer core_surface.renderer_state.mutex.unlock(global.io());
 
         const terminal_state = core_surface.renderer_state.terminal;
+
+        // The selection and the drag anchor are read before the grid is touched, because the
+        // `fullReset` below clears the selection and re-anchors every tracked pin (the drag
+        // anchor among them) at the top-left.
+        //
+        // Mouse input and frame applies both run on the host app's main thread and this holds the
+        // renderer state mutex, so the surface's gesture state can be read and rewritten here.
+        const preserved = captureMirrorSelection(surface, terminal_state);
+
         try terminal_state.resize(
             global.alloc(),
             .{
@@ -1855,6 +1965,10 @@ pub const CAPI = struct {
             else => .null,
         };
         screen.cursor.page_row.dirty = true;
+
+        // Restoring last means the selection's tracked pins and the drag anchor resolve against
+        // the pages this frame actually wrote, after the grapheme capacity growth above.
+        try restoreMirrorSelection(surface, terminal_state, preserved);
     }
 
     const Session = struct {

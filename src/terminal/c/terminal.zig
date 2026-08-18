@@ -1374,6 +1374,7 @@ pub const TerminalData = enum(c_int) {
     mode = 37,
     vt_ground = 38,
     cursor_at_prompt = 39,
+    selection_valid = 40,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1387,6 +1388,7 @@ pub const TerminalData = enum(c_int) {
             .vt_processing_error,
             .vt_ground,
             .cursor_at_prompt,
+            .selection_valid,
             => bool,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
@@ -1535,6 +1537,10 @@ fn getTyped(
         .selection => out.* = selection_c.CSelection.fromZig(
             t.screens.active.selection orelse return .no_value,
         ),
+        .selection_valid => {
+            const sel = t.screens.active.selection orelse return .no_value;
+            out.* = !sel.start().garbage and !sel.end().garbage;
+        },
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
         .vt_processing_error => out.* = wrapper.stream.handler.semantic_failure,
         .vt_ground => out.* = wrapper.stream.ground(),
@@ -1627,6 +1633,72 @@ pub fn point_from_grid_ref(
         return .no_value;
     if (out) |o| o.* = pt.coord();
     return .success;
+}
+
+/// The fixed capacity of Terminal.pending_render_scroll_rects. Mirrored
+/// here so callers of take_render_scroll_rects know the buffer size that
+/// is guaranteed to never overflow.
+pub const max_render_scroll_rects = 64;
+
+/// C: GhosttyTerminalScrollRect
+pub const TerminalScrollRect = extern struct {
+    size: usize = @sizeOf(TerminalScrollRect),
+    row_start: size.CellCountInt = 0,
+    row_count: size.CellCountInt = 0,
+    column_start: size.CellCountInt = 0,
+    column_count: size.CellCountInt = 0,
+    delta_rows: i32 = 0,
+    delta_columns: i32 = 0,
+};
+
+/// Copies the terminal's pending render scroll rects (viewport scroll
+/// deltas accumulated since the last call) into the caller-provided buffer,
+/// then unconditionally clears the pending buffer. This is the vt-facing
+/// consumer of Terminal.pendingRenderScrollRects(); nothing else in the vt
+/// render_state path reads or clears it.
+///
+/// Returns the number of rects written, which is min(pending count, capacity).
+/// If the terminal accumulated more scroll operations than its internal
+/// fixed buffer (max_render_scroll_rects) could hold, the pending rects are
+/// discarded entirely (this mirrors Terminal.pendingRenderScrollRectsOverflowed()),
+/// `overflowed` is set to true if non-NULL, and this returns 0. The pending
+/// buffer is cleared in both the overflow and non-overflow cases, and also
+/// when `out` is NULL or `capacity` is 0 (draining without reading).
+pub fn take_render_scroll_rects(
+    terminal_: Terminal,
+    out: ?[*]TerminalScrollRect,
+    capacity: usize,
+    overflowed: ?*bool,
+) callconv(lib.calling_conv) usize {
+    if (overflowed) |o| o.* = false;
+
+    const wrapper = terminal_ orelse return 0;
+    const t: *ZigTerminal = wrapper.terminal;
+
+    // This call always takes ownership of whatever is pending, regardless
+    // of whether the caller supplied a destination buffer with enough
+    // capacity to read all of it.
+    defer t.clearPendingRenderScrollRects();
+
+    if (t.pendingRenderScrollRectsOverflowed()) {
+        if (overflowed) |o| o.* = true;
+        return 0;
+    }
+
+    const rects = t.pendingRenderScrollRects();
+    const dest = out orelse return 0;
+    const n = @min(rects.len, capacity);
+    for (rects[0..n], 0..) |r, i| {
+        dest[i] = .{
+            .row_start = r.row_start,
+            .row_count = r.row_count,
+            .column_start = r.column_start,
+            .column_count = r.column_count,
+            .delta_rows = r.delta_rows,
+            .delta_columns = r.delta_columns,
+        };
+    }
+    return n;
 }
 
 pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
@@ -5498,4 +5570,212 @@ test "get_multi null keys returns invalid_value" {
     var cols: u16 = 0;
     var values = [_]?*anyopaque{@ptrCast(&cols)};
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
+}
+
+test "get selection_valid returns no_value without a selection" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var valid: bool = undefined;
+    try testing.expectEqual(Result.no_value, get(t, .selection_valid, @ptrCast(&valid)));
+}
+
+test "get selection_valid returns true for a live selection" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    vt_write(t, "Hello", 5);
+
+    var start_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, .{
+        .tag = .active,
+        .value = .{ .active = .{ .x = 0, .y = 0 } },
+    }, &start_ref));
+
+    var end_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, .{
+        .tag = .active,
+        .value = .{ .active = .{ .x = 4, .y = 0 } },
+    }, &end_ref));
+
+    const sel: selection_c.CSelection = .{
+        .start = start_ref,
+        .end = end_ref,
+        .rectangle = false,
+    };
+    try testing.expectEqual(Result.success, set(t, .selection, @ptrCast(&sel)));
+
+    var valid: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .selection_valid, @ptrCast(&valid)));
+    try testing.expect(valid);
+}
+
+test "get selection_valid is false after scrollback trim garbages the tracked pin" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        3,
+    ));
+    defer free(t);
+
+    // Track a selection over the very first content we write. Once we've
+    // scrolled far enough into history and clamped scrollback down, this
+    // is the content that gets pruned first.
+    vt_write(t, "Hi", 2);
+
+    var start_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, .{
+        .tag = .active,
+        .value = .{ .active = .{ .x = 0, .y = 0 } },
+    }, &start_ref));
+
+    var end_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, .{
+        .tag = .active,
+        .value = .{ .active = .{ .x = 1, .y = 0 } },
+    }, &end_ref));
+
+    const sel: selection_c.CSelection = .{
+        .start = start_ref,
+        .end = end_ref,
+        .rectangle = false,
+    };
+    try testing.expectEqual(Result.success, set(t, .selection, @ptrCast(&sel)));
+    try testing.expect(t.?.terminal.screens.active.selection.?.tracked());
+
+    var valid: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .selection_valid, @ptrCast(&valid)));
+    try testing.expect(valid);
+
+    // Grow scrollback well past a single page of history. `lines.min` is
+    // exactly one page's row capacity for this column count (see
+    // PageList.Limits), so growing several multiples of it guarantees
+    // multiple complete historical pages exist before we clamp down.
+    const min_lines = t.?.terminal.screens.active.pages.limits.lines.min;
+    const newlines = try testing.allocator.alloc(u8, min_lines * 4);
+    defer testing.allocator.free(newlines);
+    @memset(newlines, '\n');
+    vt_write(t, newlines.ptr, newlines.len);
+
+    // Clamping max_scrollback_lines enforces immediately (PageList.setMaxLines
+    // -> Limits.enforce), pruning complete historical pages until only about
+    // one page's worth of history (the enforced minimum) remains. That prunes
+    // the page our selection's start pin still points into, marking it
+    // garbage per PageList's tracked-pin garbage-marking (PageList.zig
+    // Limits.enforce, and the equivalent path in PageList.grow's prune
+    // branch).
+    var tiny_max_lines: usize = 1;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_lines, @ptrCast(&tiny_max_lines)));
+    try testing.expect(t.?.terminal.screens.active.selection.?.start().garbage);
+
+    try testing.expectEqual(Result.success, get(t, .selection_valid, @ptrCast(&valid)));
+    try testing.expect(!valid);
+
+    // This is exactly the gap selection_valid exists to close: the raw
+    // GHOSTTY_TERMINAL_DATA_SELECTION read is untouched by this change and
+    // still reports success, with endpoints silently collapsed to wherever
+    // the garbage pin was relocated. A caller that only reads
+    // GHOSTTY_TERMINAL_DATA_SELECTION has no way to tell those endpoints no
+    // longer describe the original selection.
+    var out: selection_c.CSelection = undefined;
+    try testing.expectEqual(Result.success, get(t, .selection, @ptrCast(&out)));
+}
+
+test "take_render_scroll_rects returns pending rects and clears them" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer free(t);
+
+    // Fill the 3-row active area with three CRLF-terminated lines, then
+    // print a fourth without a trailing newline. The fourth line's CRLF
+    // is the only linefeed issued while the cursor sits on the bottom
+    // margin row, so it triggers exactly one row of scroll (a plain "\n"
+    // without carriage return would instead walk the cursor across
+    // columns as it drops rows, scrolling twice and merging into a single
+    // delta_rows == -2 entry, which is not what this test wants to
+    // exercise).
+    vt_write(t, "a\r\nb\r\nc\r\nd", 10);
+
+    var out: [max_render_scroll_rects]TerminalScrollRect = undefined;
+    var overflowed = true;
+    const n = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expect(n > 0);
+    try testing.expect(!overflowed);
+    try testing.expectEqual(@as(i32, -1), out[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), out[0].delta_columns);
+    try testing.expectEqual(@as(size.CellCountInt, 3), out[0].row_count);
+    try testing.expectEqual(@as(size.CellCountInt, 10), out[0].column_count);
+
+    // A second call reports nothing: the first call cleared the buffer.
+    overflowed = true;
+    const n2 = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n2);
+    try testing.expect(!overflowed);
+}
+
+test "take_render_scroll_rects on a null terminal is a no-op" {
+    var out: [max_render_scroll_rects]TerminalScrollRect = undefined;
+    var overflowed = false;
+    const n = take_render_scroll_rects(null, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expect(!overflowed);
+}
+
+test "take_render_scroll_rects reports overflow after more than max_render_scroll_rects non-mergeable rects" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer free(t);
+
+    // Push some scrollback so the viewport has at least one row to toggle
+    // into. The exact scrollback depth doesn't matter here (unlike the
+    // "returns pending rects" test above, this test never inspects
+    // delta_rows), only that offset 0 and offset 1 are both reachable.
+    vt_write(t, "a\r\nb\r\nc\r\nd", 10);
+
+    var out: [max_render_scroll_rects]TerminalScrollRect = undefined;
+    var overflowed = false;
+    // Drain the single rect the write above already recorded so the count
+    // below starts from zero.
+    _ = take_render_scroll_rects(t, &out, out.len, &overflowed);
+
+    // recordRenderScrollRect only merges a new rect into the last one when
+    // both share the same scroll direction. Alternating delta = -1 (toward
+    // scrollback) and delta = +1 (back toward the active area) therefore
+    // never merges: each call flips the offset between 0 and 1 and appends
+    // a distinct entry. The (max_render_scroll_rects + 1)th such call
+    // overflows the fixed-size buffer.
+    var i: usize = 0;
+    while (i < max_render_scroll_rects + 1) : (i += 1) {
+        const delta: isize = if (i % 2 == 0) -1 else 1;
+        scroll_viewport(t, .{ .tag = .delta, .value = .{ .delta = delta } });
+    }
+
+    overflowed = false;
+    const n = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expect(overflowed);
 }

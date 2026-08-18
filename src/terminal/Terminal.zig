@@ -6723,7 +6723,7 @@ test "Terminal: scrollViewport records render scroll rect for scrollback" {
     var t = try init(testing.io, testing.allocator, .{
         .cols = 1,
         .rows = 4,
-        .max_scrollback = 20,
+        .max_scrollback_bytes = 20,
     });
     defer t.deinit(testing.allocator);
 

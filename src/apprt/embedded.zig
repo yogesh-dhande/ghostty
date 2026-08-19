@@ -3062,13 +3062,23 @@ pub const CAPI = struct {
         end_y: u16 = 0,
     };
 
+    /// True if `screen`'s selection exists and has been pruned out from under it: PageList's
+    /// prune step (PageList.zig, the tracked-pins loop in the prune block around line 4045)
+    /// remaps a garbaged pin to a valid but meaningless (0, 0) coordinate rather than leaving it
+    /// dangling, so a garbage pin cannot be detected by a failed pin lookup and must be checked
+    /// directly. Shared by `projectSelectionForExport` (to export no selection) and
+    /// `exportSnapshotFromSurface` (to actually clear the stale selection off the surface); see
+    /// the latter for why both are needed.
+    fn selectionGarbageAfterPrune(screen: *terminal.Screen) bool {
+        const sel = screen.selection orelse return false;
+        return sel.start().garbage or sel.end().garbage;
+    }
+
     /// Projects `screen`'s selection into the viewport a snapshot is about to export, in
     /// screen-space rows starting at `viewport_top` and spanning `rows` rows of `columns` columns.
     ///
     /// A selection with no intersection with the viewport, or whose tracked pins were pruned out
-    /// from under it (garbage, see PageList.Limits.enforce), exports as absent. A garbage pin is
-    /// remapped to a valid but semantically meaningless (0, 0) coordinate rather than left
-    /// dangling, so it must be checked directly rather than trusted to fail the pin lookups below.
+    /// from under it (garbage, see `selectionGarbageAfterPrune`), exports as absent.
     fn projectSelectionForExport(
         screen: *terminal.Screen,
         viewport_top: u32,
@@ -3077,7 +3087,7 @@ pub const CAPI = struct {
     ) ExportedSelection {
         if (rows == 0 or columns == 0) return .{};
         const sel = screen.selection orelse return .{};
-        if (sel.start().garbage or sel.end().garbage) return .{};
+        if (selectionGarbageAfterPrune(screen)) return .{};
 
         const tl_pin = sel.topLeft(screen);
         const br_pin = sel.bottomRight(screen);
@@ -3117,6 +3127,12 @@ pub const CAPI = struct {
         result: *Snapshot,
     ) bool {
         result.* = .{};
+
+        var cleared_garbage_selection = false;
+        // Registered before the mutex lock/unlock defers so it runs after the unlock (defers run
+        // last-in-first-out): `Surface.refresh` must not be called with the renderer mutex held,
+        // matching how `ghostty_surface_clear_selection` refreshes only after releasing the lock.
+        defer if (cleared_garbage_selection) surface.refresh();
 
         const core_surface = &surface.core_surface;
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
@@ -3274,6 +3290,29 @@ pub const CAPI = struct {
                     };
                 }
             }
+        }
+
+        // A garbaged selection (its tracked pins pruned out of scrollback, see
+        // `selectionGarbageAfterPrune`) is only half handled by `projectSelectionForExport`
+        // below returning absent: that stops this and every future frame from exporting a
+        // highlight, but `screen.selection` itself stays installed, so `ghostty_surface_has_
+        // selection` keeps reporting true and `ghostty_surface_read_selection` /
+        // `Screen.selectionString` (which has no garbage guard) keep formatting whatever text now
+        // sits at the pin's remapped (0, 0) location, unrelated to what the user actually
+        // selected. Clear it here through `setRemoteSelection`, the same notification-firing,
+        // clipboard-silent funnel `ghostty_surface_clear_selection` uses, so subscribers observe
+        // the clear via `selection_changed`. The renderer mutex is already held for this whole
+        // function (see the lock above), which is `setRemoteSelection`'s contract, so this does
+        // not re-acquire it. The Linux headless host clears the equivalent way in its render pass
+        // (GhosttyLinuxHeadlessSessionCore.swift) for the identical reason. The deferred
+        // `surface.refresh()` registered before the mutex defers (above) schedules the owner
+        // view's redraw once the lock is released, so the stale highlight does not linger on the
+        // owner's rendered surface until an unrelated event happens to trigger a render.
+        if (selectionGarbageAfterPrune(screen)) {
+            core_surface.setRemoteSelection(null) catch |err| {
+                log.warn("error clearing garbaged selection during snapshot export err={}", .{err});
+            };
+            cleared_garbage_selection = true;
         }
 
         const scrollbar = screen.pages.scrollbar();
@@ -4680,6 +4719,50 @@ test "projectSelectionForExport returns absent for a selection pruned out of scr
     const bar = s.pages.scrollbar();
     const result = CAPI.projectSelectionForExport(&s, @intCast(bar.offset), 24, 80);
     try std.testing.expectEqual(@as(u8, 0), result.flags);
+}
+
+test "selectionGarbageAfterPrune detects a selection pruned out of scrollback" {
+    // Same eviction recipe as "projectSelectionForExport returns absent for a selection pruned
+    // out of scrollback" above: force PageList.Limits.enforce to evict the page the selection is
+    // pinned to, which marks its tracked pins garbage and remaps them to (0, 0) rather than
+    // leaving them dangling.
+    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = 65536,
+    });
+    defer s.deinit();
+
+    const page1_node = s.pages.pages.last.?;
+    const page1 = page1_node.page();
+    for (0..page1.capacity.rows - page1.size.rows) |_| {
+        try std.testing.expect(try s.pages.grow() == null);
+    }
+
+    try s.select(terminal.Selection.init(
+        s.pages.pin(.{ .screen = .{} }).?,
+        s.pages.pin(.{ .screen = .{} }).?,
+        false,
+    ));
+    try std.testing.expect(!CAPI.selectionGarbageAfterPrune(&s));
+
+    var grew: usize = 0;
+    while (!s.selection.?.start().garbage and grew < 10_000) : (grew += 1) {
+        _ = try s.pages.grow();
+    }
+    try std.testing.expect(CAPI.selectionGarbageAfterPrune(&s));
+
+    // This is the detection half of `exportSnapshotFromSurface`'s fix: once
+    // `selectionGarbageAfterPrune` is true, it clears the selection through
+    // `Surface.setRemoteSelection(null)`, which (via `Surface.setSelection`) reduces to
+    // `screen.select(null)` plus the `selection_changed` notification. `setRemoteSelection`
+    // needs a full apprt `Surface` to call (see the file-level test doc comment above for why
+    // that is not built here), so only its effect on the screen is asserted directly: once the
+    // garbaged selection is cleared, detection reports it gone, matching what
+    // `ghostty_surface_has_selection` should report afterward.
+    try s.select(null);
+    try std.testing.expect(!CAPI.selectionGarbageAfterPrune(&s));
+    try std.testing.expect(s.selection == null);
 }
 
 test "absolute screen-space selection tracks its text across new output (ghostty_surface_set_selection_absolute's recipe)" {

@@ -283,14 +283,33 @@ fn recordRenderScrollRect(
     delta_columns: i32,
 ) void {
     if (self.pending_render_scroll_rect_overflow) return;
+    // No-op: nothing in the rect to move.
     if (row_count == 0 or column_count == 0) return;
+    // No-op: the rect was recorded but nothing actually moved.
     if (delta_rows == 0 and delta_columns == 0) return;
 
     const row_end = @as(usize, row_start) + @as(usize, row_count);
     const column_end = @as(usize, column_start) + @as(usize, column_count);
+    // Out of bounds for this rect: leave the pending carry as-is (untouched, not poisoned).
     if (row_end > self.rows or column_end > self.cols) return;
-    if (delta_rows != 0 and @as(u32, @abs(delta_rows)) >= @as(u32, row_count)) return;
-    if (delta_columns != 0 and @as(u32, @abs(delta_columns)) >= @as(u32, column_count)) return;
+
+    // A delta whose magnitude reaches or exceeds the rect's own extent moves every row (or
+    // column) out of the rect in a single step. That is real movement, not a no-op, but the
+    // rect-plus-delta model cannot describe "the whole region emptied out and something
+    // unrelated took its place": there is no meaningful shift amount to hand a consumer. Poison
+    // the carry exactly like the accumulated-delta overflow below does, so a consumer (e.g. a
+    // mirror's in-progress drag) sees `scroll_carry_valid = false` and cancels rather than
+    // trusting an empty or partial rect list to reconstruct the movement.
+    if (delta_rows != 0 and @as(u32, @abs(delta_rows)) >= @as(u32, row_count)) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+    if (delta_columns != 0 and @as(u32, @abs(delta_columns)) >= @as(u32, column_count)) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
 
     if (self.pending_render_scroll_rect_count > 0) {
         const last_index: usize = @intCast(self.pending_render_scroll_rect_count - 1);
@@ -6749,6 +6768,29 @@ test "Terminal: scrollViewport records render scroll rect for scrollback" {
 
     t.clearPendingRenderScrollRects();
     t.scrollViewport(.{ .delta = 1 });
+    try testing.expectEqual(@as(usize, 0), t.pendingRenderScrollRects().len);
+}
+
+test "Terminal: whole-region scroll poisons the render scroll rect carry" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    try t.printString("ABCDE");
+    t.clearPendingRenderScrollRects();
+
+    // scrollUp clamps its count to the (unmargined, full-screen) scroll region height, so
+    // scrollUp(5) here records a delta whose magnitude equals row_count: the same shape CSI S
+    // hits with a parameter >= the scroll region's height, or deleteLines covering the full
+    // region. recordRenderScrollRect's whole-region guards used to silently drop this rect
+    // instead of poisoning the carry the way the accumulated-delta overflow branch does, which
+    // left scroll_carry_valid true with an empty rect list for the frame: a consumer (e.g. a
+    // mirror's in-progress drag) then kept its anchor unshifted instead of cancelling, and could
+    // commit the wrong rows.
+    try t.scrollUp(5);
+
+    try testing.expect(t.pendingRenderScrollRectsOverflowed());
     try testing.expectEqual(@as(usize, 0), t.pendingRenderScrollRects().len);
 }
 

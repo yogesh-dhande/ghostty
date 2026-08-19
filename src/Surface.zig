@@ -2595,6 +2595,24 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     }
 }
 
+/// Set or clear the selection on behalf of a remote party (a Spaces mirror
+/// committing or releasing the shared selection over the device API). Routes
+/// through `setSelection` so the apprt notification fires exactly like a
+/// local mutation, and never copies to the clipboard: the Spaces daemon's
+/// control response is the sole clipboard writer for a remote commit.
+///
+/// This must be called with the renderer mutex held. That means the
+/// `selection_changed` apprt action fires while the mutex is held, so an
+/// embedder that synchronously read the selection back from inside the
+/// action callback would deadlock; that is upstream's established contract,
+/// not something this route adds (a local drag fires the same action from
+/// `cursorPosCallback` with the mutex held), and every real consumer is
+/// asynchronous: the macOS apprt posts a debounced notification, GTK
+/// ignores the action, and the Spaces embedded host does not consume it.
+pub fn setRemoteSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    try self.setSelection(sel_);
+}
+
 /// Set a selection and, per `copy_on_select`, copy it to the clipboard.
 /// For committing selection gestures (mouse release, select-all binding).
 ///

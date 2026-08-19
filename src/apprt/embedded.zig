@@ -2021,6 +2021,7 @@ pub const CAPI = struct {
         if (snapshot.columns == 0 or snapshot.rows == 0) return error.InvalidRenderFrame;
         const expected_cell_count = @as(usize, snapshot.columns) * @as(usize, snapshot.rows);
         if (snapshot.cell_count < expected_cell_count or snapshot.cells == null) return error.InvalidRenderFrame;
+        if (snapshot.scroll_rect_count > 0 and snapshot.scroll_rects == null) return error.InvalidRenderFrame;
 
         const core_surface = &surface.core_surface;
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
@@ -2904,8 +2905,10 @@ pub const CAPI = struct {
     /// rejected, since the caller's view of that extent (a mirror's last-applied frame) can be a
     /// few rows stale by the time this call lands; clamping keeps a slightly-stale request
     /// selecting the nearest still-valid cell instead of failing outright. Installed through
-    /// `Screen.select`, which tracks the pins the same way a live mouse-driven selection does, so
-    /// the selection follows scrollback trimming and content edits like any other.
+    /// `Surface.setRemoteSelection`, the notification-aware funnel every selection mutation uses
+    /// (so the apprt hears `selection_changed`, without any clipboard write), which tracks the
+    /// pins the same way a live mouse-driven selection does: the selection follows scrollback
+    /// trimming and content edits like any other.
     ///
     /// Returns false only when the terminal has no rows at all, or a clamped coordinate still
     /// fails to resolve to a pin (both indicate an empty or otherwise unusable terminal, not a
@@ -2939,7 +2942,7 @@ pub const CAPI = struct {
 
             const start_pin = screen.pages.pin(.{ .screen = clamped_start }) orelse break :ok false;
             const end_pin = screen.pages.pin(.{ .screen = clamped_end }) orelse break :ok false;
-            screen.select(terminal.Selection.init(start_pin, end_pin, rectangle)) catch break :ok false;
+            core_surface.setRemoteSelection(terminal.Selection.init(start_pin, end_pin, rectangle)) catch break :ok false;
             break :ok true;
         };
         // Released before refresh() to match every other mutation-then-refresh call site in this
@@ -2952,12 +2955,14 @@ pub const CAPI = struct {
 
     /// Clears a surface's selection, for a host terminal to drop a selection another party asked
     /// it to release (for example, a mirror-side click that ends the shared selection). Goes
-    /// through `Screen.clearSelection`, the same funnel a local click uses, so it triggers no
-    /// clipboard write (only the release path after an actual local drag does that).
+    /// through `Surface.setRemoteSelection`, the notification-aware funnel every selection
+    /// mutation uses, so the apprt hears `selection_changed` and no clipboard write happens
+    /// (only the release path after an actual local drag copies).
     export fn ghostty_surface_clear_selection(surface: *Surface) void {
         const core_surface = &surface.core_surface;
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        core_surface.renderer_state.terminal.screens.active.clearSelection();
+        // Clearing cannot fail: `setSelection(null)` only frees the tracked pins.
+        core_surface.setRemoteSelection(null) catch {};
         core_surface.renderer_state.mutex.unlock(global.io());
         surface.refresh();
     }
@@ -3240,7 +3245,7 @@ pub const CAPI = struct {
         // Captured once and reused both for the flag on the result below and to decide whether
         // pending_scroll_rects is trustworthy: an overflowed ring buffer means rects were dropped,
         // so a mirror cannot reconstruct movement from them and must not try.
-        const scroll_carry_valid = !terminal_state.pendingRenderScrollRectsOverflowed();
+        var scroll_carry_valid = !terminal_state.pendingRenderScrollRectsOverflowed();
         const pending_scroll_rects = if (scroll_carry_valid)
             terminal_state.pendingRenderScrollRects()
         else
@@ -3250,6 +3255,10 @@ pub const CAPI = struct {
         if (pending_scroll_rects.len > 0) {
             copied_scroll_rects = global.alloc().alloc(SnapshotScrollRect, pending_scroll_rects.len) catch |err| blk: {
                 log.warn("error allocating snapshot scroll rects err={}", .{err});
+                // Rects existed but could not be exported (and the pending buffer is cleared
+                // below regardless), so this frame does not describe how content moved; a
+                // mirror must cancel a drag carry rather than trust an empty rect list.
+                scroll_carry_valid = false;
                 scroll_rect_count = 0;
                 break :blk &.{};
             };

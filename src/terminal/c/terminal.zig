@@ -1657,7 +1657,10 @@ pub const TerminalScrollRect = extern struct {
 /// consumer of Terminal.pendingRenderScrollRects(); nothing else in the vt
 /// render_state path reads or clears it.
 ///
-/// Returns the number of rects written, which is min(pending count, capacity).
+/// Returns the number of rects written, which is min(pending count, capacity),
+/// or 0 with `overflowed` set when the caller's `GhosttyTerminalScrollRect.size`
+/// does not match this build's (see the sized-struct check below): the pending
+/// rects were discarded unread, exactly what `overflowed` tells a caller.
 /// If the terminal accumulated more scroll operations than its internal
 /// fixed buffer (max_render_scroll_rects) could hold, the pending rects are
 /// discarded entirely (this mirrors Terminal.pendingRenderScrollRectsOverflowed()),
@@ -1688,6 +1691,19 @@ pub fn take_render_scroll_rects(
     const rects = t.pendingRenderScrollRects();
     const dest = out orelse return 0;
     const n = @min(rects.len, capacity);
+    // TerminalScrollRect is a sized struct, but `dest[i]` below strides by this
+    // build's native @sizeOf: a caller compiled against a different struct size
+    // would be written at the wrong offsets from the second element on. Refuse a
+    // mismatched size outright (the pending buffer is still drained, per the
+    // contract above), the same way other sized-struct outputs reject on size.
+    // Report the refusal through `overflowed`: both cases mean "pending scroll
+    // state was discarded unread", and it is the one signal a size-mismatched
+    // caller can still read, telling it to drop its incremental scroll carry
+    // instead of mistaking the 0 for "nothing scrolled".
+    if (n > 0 and dest[0].size != @sizeOf(TerminalScrollRect)) {
+        if (overflowed) |o| o.* = true;
+        return 0;
+    }
     for (rects[0..n], 0..) |r, i| {
         dest[i] = .{
             .row_start = r.row_start,
@@ -5715,7 +5731,10 @@ test "take_render_scroll_rects returns pending rects and clears them" {
     // exercise).
     vt_write(t, "a\r\nb\r\nc\r\nd", 10);
 
-    var out: [max_render_scroll_rects]TerminalScrollRect = undefined;
+    // Sized-struct contract: the caller initializes each slot's `size`
+    // (C callers via GHOSTTY_INIT_SIZED); take_render_scroll_rects refuses
+    // a mismatched size, so an `undefined` buffer would be rejected.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
     var overflowed = true;
     const n = take_render_scroll_rects(t, &out, out.len, &overflowed);
     try testing.expect(n > 0);
@@ -5732,8 +5751,42 @@ test "take_render_scroll_rects returns pending rects and clears them" {
     try testing.expect(!overflowed);
 }
 
+test "take_render_scroll_rects rejects a mismatched caller struct size via overflowed" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer free(t);
+
+    // Same single-scroll setup as the "returns pending rects" test above.
+    vt_write(t, "a\r\nb\r\nc\r\nd", 10);
+
+    // A caller compiled against a different (here: smaller) struct size must be
+    // refused: n == 0 with `overflowed` set, telling it the pending scroll state
+    // was discarded unread rather than that nothing scrolled.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{ .size = @sizeOf(TerminalScrollRect) - 1 });
+    var overflowed = false;
+    const n = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expect(overflowed);
+
+    // The refusal still drained the pending buffer, per the take-ownership
+    // contract: a correctly sized follow-up call sees nothing.
+    var sized_out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
+    overflowed = true;
+    const n2 = take_render_scroll_rects(t, &sized_out, sized_out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n2);
+    try testing.expect(!overflowed);
+}
+
 test "take_render_scroll_rects on a null terminal is a no-op" {
-    var out: [max_render_scroll_rects]TerminalScrollRect = undefined;
+    // Sized-struct contract: the caller initializes each slot's `size`
+    // (C callers via GHOSTTY_INIT_SIZED); take_render_scroll_rects refuses
+    // a mismatched size, so an `undefined` buffer would be rejected.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
     var overflowed = false;
     const n = take_render_scroll_rects(null, &out, out.len, &overflowed);
     try testing.expectEqual(@as(usize, 0), n);
@@ -5756,7 +5809,10 @@ test "take_render_scroll_rects reports overflow after more than max_render_scrol
     // delta_rows), only that offset 0 and offset 1 are both reachable.
     vt_write(t, "a\r\nb\r\nc\r\nd", 10);
 
-    var out: [max_render_scroll_rects]TerminalScrollRect = undefined;
+    // Sized-struct contract: the caller initializes each slot's `size`
+    // (C callers via GHOSTTY_INIT_SIZED); take_render_scroll_rects refuses
+    // a mismatched size, so an `undefined` buffer would be rejected.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
     var overflowed = false;
     // Drain the single rect the write above already recorded so the count
     // below starts from zero.

@@ -461,6 +461,26 @@ pub fn processOutputBlocking(
     try output.wait();
 }
 
+/// Wait until this terminal's IO thread has processed every message queued before this call.
+///
+/// The message carries nothing and its handler does nothing: it neither parses bytes nor touches the
+/// terminal, so it is safe to issue at any moment, including while the stream parser sits mid-sequence.
+/// That is the point of it — a host-managed embedder that has queued input needs to know when that
+/// input has been handed to its receive-buffer callback, and injecting synthetic bytes to find out
+/// would feed the parser (a DCS passthrough state forwards them, a partial UTF-8 codepoint is
+/// invalidated by them).
+///
+/// Refuses to run on the IO thread itself, where waiting for that thread cannot complete.
+pub fn syncBlocking(self: *Termio) !void {
+    if (termio.Thread.isCurrentThread(self)) return error.TermioSyncOnIoThread;
+
+    var sync: termio.Message.BlockingSync = .{};
+    if (!self.mailbox.sendAndNotifyBlocking(.{
+        .sync_blocking = &sync,
+    })) return error.TermioMailboxUnavailable;
+    try sync.wait();
+}
+
 /// Queue a host-managed process exit. This must go through the IO mailbox so
 /// prior host output is parsed before the app observes process termination.
 pub fn queueProcessExit(self: *Termio, exit_code: u32, runtime_ms: u64) void {

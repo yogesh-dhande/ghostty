@@ -1370,6 +1370,7 @@ GHOSTTY_API void ghostty_session_set_data_callback(ghostty_session_t,
 GHOSTTY_API void ghostty_session_process_output(ghostty_session_t,
                                                    const uint8_t*,
                                                    uintptr_t);
+GHOSTTY_API void ghostty_session_sync_io(ghostty_session_t);
 GHOSTTY_API void ghostty_session_send_input_raw(ghostty_session_t,
                                                    const uint8_t*,
                                                    uintptr_t);

@@ -3622,6 +3622,20 @@ pub const CAPI = struct {
         session.notifyScreenMutation();
     }
 
+    /// Wait until this session's IO thread has processed everything queued before this call.
+    ///
+    /// Host-managed sessions receive their input through that thread's mailbox and emit it to the host
+    /// through the receive-buffer callback while handling it, with no completion signal of its own.
+    /// This posts a no-op message through the same FIFO mailbox and returns once the thread has reached
+    /// it, which proves the earlier input was handled — and therefore handed to the host — first.
+    /// Nothing is parsed and no terminal state is touched, so it is safe to call at any point in the
+    /// output stream.
+    export fn ghostty_session_sync_io(session: *Session) void {
+        session.surface.core_surface.io.syncBlocking() catch |err| {
+            log.warn("error syncing session io err={}", .{err});
+        };
+    }
+
     export fn ghostty_session_send_input_raw(
         session: *Session,
         ptr: ?[*]const u8,

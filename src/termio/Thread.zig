@@ -351,6 +351,13 @@ pub fn processOutputOnCurrentThread(
     return true;
 }
 
+/// Whether the caller is running on the IO thread that serves `io`. Used to refuse a synchronous
+/// wait that would otherwise deadlock on the very thread it waits for.
+pub fn isCurrentThread(io: *termio.Termio) bool {
+    const cb = current_callback orelse return false;
+    return cb.io == io;
+}
+
 /// Queue a host-managed process exit from this terminal's IO thread by placing
 /// it behind pending mailbox messages and draining until it is delivered.
 /// Returns false when the caller is not on the IO thread for the provided
@@ -553,6 +560,9 @@ fn handleMessage(
             };
             v.complete(null);
         },
+        // Nothing to do but report having got here: this message exists so a host can order
+        // against messages queued before it (see Message.BlockingSync).
+        .sync_blocking => |v| v.complete(null),
         .pty_output_small => |v| try self.processHostOutput(cb, v.data[0..v.len], true),
         .pty_output_stable => |v| try self.processHostOutput(cb, v, true),
         .pty_output_alloc => |v| {

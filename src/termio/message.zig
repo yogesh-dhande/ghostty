@@ -58,6 +58,38 @@ pub const Message = union(enum) {
         }
     };
 
+    /// A message that carries nothing and does nothing, used purely to learn when this terminal's IO
+    /// thread has reached it. Because the mailbox is FIFO, its completion proves every message queued
+    /// before it was already handled — including a host-managed write, whose handling is what invokes
+    /// the embedder's receive-buffer callback. Nothing here touches the stream parser or the terminal,
+    /// so a host can order against its own input without injecting bytes that a parser mid-sequence
+    /// (a DCS passthrough, a partial UTF-8 codepoint) would fold into the stream.
+    pub const BlockingSync = struct {
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
+        done: bool = false,
+        err: ?anyerror = null,
+
+        pub fn complete(self: *BlockingSync, err: ?anyerror) void {
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+
+            self.err = err;
+            self.done = true;
+            self.cond.signal(io);
+        }
+
+        pub fn wait(self: *BlockingSync) !void {
+            const io = global.io();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+
+            while (!self.done) self.cond.waitUncancelable(io, &self.mutex);
+            if (self.err) |err| return err;
+        }
+    };
+
     pub const BlockingProcessExit = struct {
         data: ProcessExit,
         mutex: std.Io.Mutex = .init,
@@ -168,6 +200,10 @@ pub const Message = union(enum) {
     /// before the caller returns.
     pty_output_blocking: *BlockingOutput,
 
+    /// A no-op message whose only purpose is to be completed in mailbox order,
+    /// so a host-managed embedder can wait for everything queued before it.
+    sync_blocking: *BlockingSync,
+
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 
@@ -241,6 +277,7 @@ pub const Message = union(enum) {
             },
             .process_exit_blocking => |v| v.complete(error.TermioDraining),
             .pty_output_blocking => |v| v.complete(error.TermioDraining),
+            .sync_blocking => |v| v.complete(error.TermioDraining),
             .write_alloc,
             .write_raw_alloc,
             .pty_output_alloc,

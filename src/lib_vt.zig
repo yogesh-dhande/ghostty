@@ -50,6 +50,7 @@ pub const sys = terminal.sys;
 pub const TinyIo = @import("lib/TinyIo.zig");
 
 pub const apc = terminal.apc;
+pub const clipboard = terminal.clipboard;
 pub const dcs = terminal.dcs;
 pub const osc = terminal.osc;
 pub const point = terminal.point;
@@ -64,6 +65,7 @@ pub const parse_table = terminal.parse_table;
 pub const search = terminal.search;
 pub const sgr = terminal.sgr;
 pub const size = terminal.size;
+pub const snapshot = terminal.snapshot;
 pub const x11_color = terminal.x11_color;
 
 pub const Charset = terminal.Charset;
@@ -93,6 +95,10 @@ pub const TerminalStream = terminal.TerminalStream;
 pub const Stream = terminal.Stream;
 pub const StreamAction = terminal.StreamAction;
 pub const UnknownSequence = terminal.UnknownSequence;
+
+pub const Paste = terminal.Paste;
+pub const PasteSource = terminal.PasteSource;
+pub const PasteError = terminal.PasteError;
 pub const Cursor = Screen.Cursor;
 pub const CursorStyle = Screen.CursorStyle;
 pub const CursorStyleReq = terminal.CursorStyle;
@@ -127,8 +133,11 @@ pub const input = struct {
     // Paste-related APIs
     pub const PasteError = paste.Error;
     pub const PasteOptions = paste.Options;
+    pub const max_paste_frame_size = paste.max_frame_size;
     pub const isSafePaste = paste.isSafe;
+    pub const isSafePasteWith = paste.isSafeWith;
     pub const encodePaste = paste.encode;
+    pub const encodePasteWriter = paste.encodeWriter;
 
     // Key encoding
     pub const Key = key.Key;
@@ -206,6 +215,7 @@ comptime {
             @export(&c.focus_encode, .{ .name = "ghostty_focus_encode" });
             @export(&c.paste_is_safe, .{ .name = "ghostty_paste_is_safe" });
             @export(&c.paste_encode, .{ .name = "ghostty_paste_encode" });
+            @export(&c.terminal_paste, .{ .name = "ghostty_terminal_paste" });
             @export(&c.mouse_event_new, .{ .name = "ghostty_mouse_event_new" });
             @export(&c.mouse_event_free, .{ .name = "ghostty_mouse_event_free" });
             @export(&c.mouse_event_set_action, .{ .name = "ghostty_mouse_event_set_action" });

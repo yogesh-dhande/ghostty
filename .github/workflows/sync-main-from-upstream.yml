@@ -1,0 +1,49 @@
+name: sync-main-from-upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-main-from-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync-main:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout spaces branch
+        uses: actions/checkout@v4
+        with:
+          ref: spaces
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_MAIN_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Mirror upstream main into fork main
+        run: |
+          git remote add upstream https://github.com/ghostty-org/ghostty.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/ghostty-org/ghostty.git
+          git fetch --no-tags upstream main
+
+          upstream_sha="$(git rev-parse refs/remotes/upstream/main)"
+          origin_sha="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+
+          echo "upstream/main: $upstream_sha"
+          echo "origin/main:   ${origin_sha:-<missing>}"
+
+          if [[ "$origin_sha" == "$upstream_sha" ]]; then
+            echo "Fork main already matches upstream main."
+            exit 0
+          fi
+
+          git push --force origin "refs/remotes/upstream/main:refs/heads/main"

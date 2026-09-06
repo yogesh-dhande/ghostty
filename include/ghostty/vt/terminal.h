@@ -1951,6 +1951,27 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: size_t *
    */
   GHOSTTY_TERMINAL_DATA_CLIPBOARD_WRITE_MAX_BYTES = 40,
+
+  /**
+   * Whether the active screen's current selection is valid.
+   *
+   * A tracked selection endpoint can be marked garbage when scrollback
+   * trimming discards the page it pointed into and cannot relocate it to a
+   * sensical position. When that happens, GHOSTTY_TERMINAL_DATA_SELECTION
+   * still returns a snapshot, but its endpoints have collapsed to whatever
+   * position the garbage pin was left at (typically the top-left of the
+   * active screen) and no longer describe the original selection. Query
+   * this value first to detect that case before trusting the selection
+   * snapshot's endpoints.
+   *
+   * Returns GHOSTTY_NO_VALUE when there is no active selection. Returns true
+   * when a selection exists and neither endpoint pin is garbage (this
+   * includes untracked selections, which are never garbage). Returns false
+   * when a selection exists and at least one endpoint pin is garbage.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_SELECTION_VALID = 41,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
@@ -2199,6 +2220,82 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
     const GhosttyAllocator* allocator,
     uint8_t** out_ptr,
     size_t* out_len);
+
+/**
+ * A single pending render scroll rect, describing a viewport region that
+ * scrolled by a row/column delta since the last call to
+ * ghostty_terminal_take_render_scroll_rects().
+ *
+ * This is a sized struct. Use GHOSTTY_INIT_SIZED() to initialize it.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. Must be set to
+   *  sizeof(GhosttyTerminalScrollRect). */
+  size_t size;
+
+  /** First row of the scrolled region (0-indexed, viewport-relative). */
+  uint16_t row_start;
+
+  /** Number of rows in the scrolled region. */
+  uint16_t row_count;
+
+  /** First column of the scrolled region (0-indexed). */
+  uint16_t column_start;
+
+  /** Number of columns in the scrolled region. */
+  uint16_t column_count;
+
+  /** Row delta applied to the region (negative scrolls up, positive scrolls
+   *  down). */
+  int32_t delta_rows;
+
+  /** Column delta applied to the region (negative scrolls left, positive
+   *  scrolls right). */
+  int32_t delta_columns;
+} GhosttyTerminalScrollRect;
+
+/**
+ * Copy out and clear the terminal's pending render scroll rects.
+ *
+ * A terminal accumulates render scroll rects as viewport scroll deltas
+ * happen (e.g. scrolling text up as new lines are written). These are a
+ * render hint for consumers that want to shift already-rendered content
+ * instead of redrawing it from scratch; they are not authoritative and a
+ * consumer must still be able to render from the terminal's current state
+ * directly.
+ *
+ * This function copies up to `capacity` pending rects into `out`, in the
+ * order they were recorded, then unconditionally clears the pending buffer
+ * so the next call only reports rects recorded after this one. If `out` is
+ * NULL or `capacity` is 0, nothing is copied but the pending buffer is still
+ * cleared. If there are more pending rects than `capacity`, only the first
+ * `capacity` are copied and the rest are discarded by the clear.
+ *
+ * The terminal internally holds at most 64 pending rects; if more scroll
+ * operations accumulated than that internal buffer could track, the
+ * pending rects are discarded entirely, `overflowed` (if non-NULL) is set
+ * to true, and this returns 0. A consumer that observes overflow should
+ * treat its render state as needing a full redraw rather than an
+ * incremental scroll.
+ *
+ * @param terminal The terminal handle (may be NULL, in which case this
+ *                 is a no-op that returns 0)
+ * @param out Destination buffer for the copied rects (may be NULL)
+ * @param capacity Number of GhosttyTerminalScrollRect entries `out` can hold
+ * @param[out] overflowed Set to true if the pending rects overflowed the
+ *                        terminal's internal tracking and were discarded,
+ *                        false otherwise (may be NULL)
+ * @return The number of rects written to `out`
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API size_t ghostty_terminal_take_render_scroll_rects(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScrollRect* out,
+    size_t capacity,
+    bool* overflowed);
 
 /**
  * Scroll the terminal viewport.

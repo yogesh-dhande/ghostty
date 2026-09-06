@@ -20,9 +20,13 @@ const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const termio = @import("../termio.zig");
 const renderer = @import("../renderer.zig");
+const terminalpkg = @import("../terminal/main.zig");
+const ScrollbackCompression = @import("../renderer/ScrollbackCompression.zig").ScrollbackCompression;
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.io_thread);
+
+threadlocal var current_callback: ?*CallbackData = null;
 
 /// This stores the information that is coalesced.
 const Coalesce = struct {
@@ -72,6 +76,14 @@ coalesce_data: Coalesce = .{},
 sync_reset: xev.Timer,
 sync_reset_c: xev.Completion = .{},
 sync_reset_cancel_c: xev.Completion = .{},
+
+/// Incremental scrollback compression scheduling for headless sessions.
+///
+/// A rendered surface schedules this on its renderer thread, which wakes on
+/// every terminal mutation. A headless session has no renderer thread, so the
+/// IO thread — the only thread that mutates the terminal for such a session —
+/// owns the same scheduler instead. Null for rendered surfaces.
+compression: ?Compression = null,
 
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
@@ -128,6 +140,7 @@ pub fn deinit(self: *Thread) void {
     self.scroll.deinit();
     self.coalesce.deinit();
     self.sync_reset.deinit();
+    if (self.compression) |*v| v.deinit();
     self.stop.deinit();
     self.loop.deinit();
 }
@@ -136,6 +149,7 @@ pub fn deinit(self: *Thread) void {
 pub fn threadMain(self: *Thread, io: *termio.Termio) void {
     // Call child function so we can use errors...
     self.threadMain_(io) catch |err| {
+        io.mailbox.deactivateAndDrain();
         log.warn("error in io thread err={}", .{err});
 
         // Use an arena to simplify memory management below
@@ -261,6 +275,19 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     // ourselves and the thread data so we can thread that through (pun intended).
     var cb: CallbackData = .{ .self = self, .io = io };
 
+    // A headless session has no renderer thread to schedule scrollback
+    // compression, so this thread does it. The flag is immutable, so this
+    // read cannot race a rendered session's endpoint rebinding.
+    if (comptime terminalpkg.compression_enabled) {
+        if (io.headless) self.compression = try .init();
+    }
+
+    // Host-managed callbacks may synchronously feed output back into Ghostty
+    // during threadEnter initial input, before the mailbox is activated.
+    std.debug.assert(current_callback == null);
+    current_callback = &cb;
+    defer current_callback = null;
+
     // Run our thread start/end callbacks. This allows the implementation
     // to hook into the event loop as needed. The thread data is created
     // on the stack here so that it has a stable pointer throughout the
@@ -272,6 +299,8 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     // Start the async handlers.
     mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
     self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+    io.mailbox.activate();
+    defer io.mailbox.deactivateAndDrain();
 
     // Run
     log.debug("starting IO thread", .{});
@@ -284,7 +313,152 @@ const CallbackData = struct {
     self: *Thread,
     io: *termio.Termio,
     data: termio.Termio.ThreadData = undefined,
+
+    /// Accessors required by `ScrollbackCompression`.
+    pub fn compressionScheduler(self: *CallbackData) *Compression {
+        return &self.self.compression.?;
+    }
+
+    pub fn compressionLoop(self: *CallbackData) *xev.Loop {
+        return &self.self.loop;
+    }
+
+    pub fn compressionState(self: *CallbackData) *renderer.State {
+        return self.io.renderer_state;
+    }
+
+    pub fn compressionEnabled(self: *CallbackData) bool {
+        return self.io.config.scrollback_compression;
+    }
 };
+
+/// Process host-managed output from this terminal's IO thread by queueing it
+/// behind pending mailbox messages and draining until it completes. Returns
+/// false when the caller is not on the IO thread for the provided termio.
+pub fn processOutputOnCurrentThread(
+    io: *termio.Termio,
+    data: []const u8,
+    notify_screen_change: bool,
+) anyerror!bool {
+    const cb = current_callback orelse return false;
+    if (cb.io != io) return false;
+
+    var output: termio.Message.BlockingOutput = .{
+        .data = data,
+        .notify_screen_change = notify_screen_change,
+    };
+    try cb.self.queueBlockingOutputOnCurrentThread(cb, &output);
+    return true;
+}
+
+/// Whether the caller is running on the IO thread that serves `io`. Used to refuse a synchronous
+/// wait that would otherwise deadlock on the very thread it waits for.
+pub fn isCurrentThread(io: *termio.Termio) bool {
+    const cb = current_callback orelse return false;
+    return cb.io == io;
+}
+
+/// Queue a host-managed process exit from this terminal's IO thread by placing
+/// it behind pending mailbox messages and draining until it is delivered.
+/// Returns false when the caller is not on the IO thread for the provided
+/// termio.
+pub fn queueProcessExitOnCurrentThread(
+    io: *termio.Termio,
+    exit_code: u32,
+    runtime_ms: u64,
+) anyerror!bool {
+    const cb = current_callback orelse return false;
+    if (cb.io != io) return false;
+
+    var process_exit: termio.Message.BlockingProcessExit = .{
+        .data = .{
+            .exit_code = exit_code,
+            .runtime_ms = runtime_ms,
+        },
+    };
+    try cb.self.queueBlockingProcessExitOnCurrentThread(cb, &process_exit);
+    return true;
+}
+
+fn queueBlockingOutputOnCurrentThread(
+    self: *Thread,
+    cb: *CallbackData,
+    output: *termio.Message.BlockingOutput,
+) anyerror!void {
+    if (self.flags.drain) return error.TermioDraining;
+
+    const queue = cb.io.mailbox.spsc.queue;
+    var redraw = false;
+    var first_err: ?anyerror = null;
+
+    while (queue.push(global.io(), .{
+        .pty_output_blocking = output,
+    }, .{ .instant = {} }) == 0) {
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    while (!output.isDone()) {
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    output.wait() catch |err| {
+        if (first_err == null) first_err = err;
+    };
+    if (redraw) {
+        self.wakeCompression(cb);
+        try cb.io.notifyRenderer();
+    }
+    if (first_err) |err| return err;
+}
+
+fn queueBlockingProcessExitOnCurrentThread(
+    self: *Thread,
+    cb: *CallbackData,
+    process_exit: *termio.Message.BlockingProcessExit,
+) anyerror!void {
+    if (self.flags.drain) return error.TermioDraining;
+
+    const queue = cb.io.mailbox.spsc.queue;
+    var redraw = false;
+    var first_err: ?anyerror = null;
+
+    while (queue.push(global.io(), .{
+        .process_exit_blocking = process_exit,
+    }, .{ .instant = {} }) == 0) {
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    while (!process_exit.isDone()) {
+        const message = queue.pop(global.io()) orelse return error.TermioMailboxUnavailable;
+        redraw = true;
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    process_exit.wait() catch |err| {
+        if (first_err == null) first_err = err;
+    };
+    if (redraw) {
+        self.wakeCompression(cb);
+        cb.io.notifyRenderer() catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+    if (first_err) |err| return err;
+}
 
 /// Drain the mailbox, handling all the messages in our terminal implementation.
 fn drainMailbox(
@@ -293,8 +467,6 @@ fn drainMailbox(
 ) !void {
     // We assert when starting the thread that this is the state
     const mailbox = cb.io.mailbox.spsc.queue;
-    const io = cb.io;
-    const data = &cb.data;
 
     // If we're draining, we just drain the mailbox and return.
     if (self.flags.drain) {
@@ -306,72 +478,182 @@ fn drainMailbox(
     // expectation is that all our message handlers will be non-blocking
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
+    var first_err: ?anyerror = null;
     while (mailbox.pop(global.io())) |message| {
         // If we have a message we always redraw
         redraw = true;
 
         log.debug("mailbox message={s}", .{@tagName(message)});
-        switch (message) {
-            .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
-            .visibility_report => |v| try io.visibilityReport(
-                data,
-                v.visible,
-                v.force,
-            ),
-            .crash => @panic("crash request, crashing intentionally"),
-            .change_config => |config| {
-                defer config.alloc.destroy(config.ptr);
-                try io.changeConfig(data, config.ptr);
-            },
-            .inspector => |v| self.flags.has_inspector = v,
-            .resize => |v| self.handleResize(cb, v),
-            .size_report => |v| try io.sizeReport(data, v),
-            .clear_screen => |v| try io.clearScreen(data, v.history),
-            .scroll_viewport => |v| io.scrollViewport(v),
-            .selection_scroll => |v| {
-                if (v) {
-                    self.startScrollTimer(cb);
-                } else {
-                    self.stopScrollTimer();
-                }
-            },
-            .jump_to_prompt => |v| try io.jumpToPrompt(v),
-            .kitty_clipboard_grant_read => |v| {
-                defer v.alloc.free(v.pw);
-                try io.kittyClipboardGrant(v.pw, .read);
-            },
-            .kitty_clipboard_grant_write => |v| {
-                defer v.alloc.free(v.pw);
-                try io.kittyClipboardGrant(v.pw, .write);
-            },
-            .start_synchronized_output => self.startSynchronizedOutput(cb),
-            .linefeed_mode => |v| self.flags.linefeed_mode = v,
-            .focused => |v| try io.focusGained(data, v),
-            .write_small => |v| try io.queueWrite(
-                data,
-                v.data[0..v.len],
-                self.flags.linefeed_mode,
-            ),
-            .write_stable => |v| try io.queueWrite(
-                data,
-                v,
-                self.flags.linefeed_mode,
-            ),
-            .write_alloc => |v| {
-                defer v.alloc.free(v.data);
-                try io.queueWrite(
-                    data,
-                    v.data,
-                    self.flags.linefeed_mode,
-                );
-            },
-        }
+        self.handleMessage(cb, message) catch |err| {
+            if (first_err == null) first_err = err;
+        };
     }
 
     // Trigger a redraw after we've drained so we don't waste cyces
     // messaging a redraw.
     if (redraw) {
-        try io.renderer_wakeup.notify();
+        cb.io.notifyRenderer() catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+
+    if (first_err) |err| return err;
+}
+
+fn handleMessage(
+    self: *Thread,
+    cb: *CallbackData,
+    message: termio.Message,
+) anyerror!void {
+    const io = cb.io;
+    const data = &cb.data;
+
+    switch (message) {
+        .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
+        .visibility_report => |v| try io.visibilityReport(
+            data,
+            v.visible,
+            v.force,
+        ),
+        .crash => @panic("crash request, crashing intentionally"),
+        .change_config => |config| {
+            defer config.alloc.destroy(config.ptr);
+            const compression_was_enabled = io.config.scrollback_compression;
+            try io.changeConfig(data, config.ptr);
+
+            // A newly enabled scheduler holds a stale activity token, so its
+            // next wake would decide nothing changed and never compress the
+            // history that accumulated while compression was off.
+            if (!compression_was_enabled and io.config.scrollback_compression) {
+                if (self.compression) |*compression| compression.resetActivity();
+            }
+        },
+        .inspector => |v| self.flags.has_inspector = v,
+        .resize => |v| self.handleResize(cb, v),
+        .size_report => |v| try io.sizeReport(data, v),
+        .clear_screen => |v| try io.clearScreen(data, v.history),
+        .scroll_viewport => |v| io.scrollViewport(v),
+        .selection_scroll => |v| {
+            if (v) {
+                self.startScrollTimer(cb);
+            } else {
+                self.stopScrollTimer();
+            }
+        },
+        .jump_to_prompt => |v| try io.jumpToPrompt(v),
+        .kitty_clipboard_grant_read => |v| {
+            defer v.alloc.free(v.pw);
+            try io.kittyClipboardGrant(v.pw, .read);
+        },
+        .kitty_clipboard_grant_write => |v| {
+            defer v.alloc.free(v.pw);
+            try io.kittyClipboardGrant(v.pw, .write);
+        },
+        .start_synchronized_output => self.startSynchronizedOutput(cb),
+        .linefeed_mode => |v| self.flags.linefeed_mode = v,
+        .focused => |v| try io.focusGained(data, v),
+        .process_exit => |v| self.handleProcessExit(cb, v),
+        .process_exit_blocking => |v| {
+            self.handleProcessExit(cb, v.data);
+            v.complete(null);
+        },
+        .pty_output_blocking => |v| {
+            self.processHostOutput(
+                cb,
+                v.data,
+                v.notify_screen_change,
+            ) catch |err| {
+                v.complete(err);
+                return err;
+            };
+            v.complete(null);
+        },
+        // Nothing to do but report having got here: this message exists so a host can order
+        // against messages queued before it (see Message.BlockingSync).
+        .sync_blocking => |v| v.complete(null),
+        .pty_output_small => |v| try self.processHostOutput(cb, v.data[0..v.len], true),
+        .pty_output_stable => |v| try self.processHostOutput(cb, v, true),
+        .pty_output_alloc => |v| {
+            defer v.alloc.free(v.data);
+            try self.processHostOutput(cb, v.data, true);
+        },
+        .write_small => |v| try io.queueWrite(
+            data,
+            v.data[0..v.len],
+            self.flags.linefeed_mode,
+        ),
+        .write_stable => |v| try io.queueWrite(
+            data,
+            v,
+            self.flags.linefeed_mode,
+        ),
+        .write_alloc => |v| {
+            defer v.alloc.free(v.data);
+            try io.queueWrite(
+                data,
+                v.data,
+                self.flags.linefeed_mode,
+            );
+        },
+        .write_raw_small => |v| try io.queueWrite(
+            data,
+            v.data[0..v.len],
+            false,
+        ),
+        .write_raw_stable => |v| try io.queueWrite(
+            data,
+            v,
+            false,
+        ),
+        .write_raw_alloc => |v| {
+            defer v.alloc.free(v.data);
+            try io.queueWrite(
+                data,
+                v.data,
+                false,
+            );
+        },
+    }
+}
+
+fn handleProcessExit(
+    self: *Thread,
+    cb: *CallbackData,
+    process_exit: termio.Message.ProcessExit,
+) void {
+    self.flushCoalescedResize(cb);
+    _ = cb.io.surface_mailbox.push(.{
+        .child_exited = .{
+            .exit_code = process_exit.exit_code,
+            .runtime_ms = process_exit.runtime_ms,
+        },
+    }, .{ .forever = {} });
+}
+
+fn processHostOutput(
+    self: *Thread,
+    cb: *CallbackData,
+    data: []const u8,
+    notify_screen_change: bool,
+) anyerror!void {
+    self.flushCoalescedResize(cb);
+
+    const messages_alloc = cb.io.terminal_stream.handler.alloc;
+    var messages: std.ArrayListUnmanaged(termio.Message) = .empty;
+    defer messages.deinit(messages_alloc);
+
+    cb.io.processOutputCaptureMessages(data, notify_screen_change, &messages);
+
+    var next: usize = 0;
+    errdefer {
+        while (next < messages.items.len) : (next += 1) {
+            messages.items[next].deinit();
+        }
+    }
+    while (next < messages.items.len) {
+        const message = messages.items[next];
+        next += 1;
+        try self.handleMessage(cb, message);
     }
 }
 
@@ -425,6 +707,19 @@ fn syncResetCallback(
     return .disarm;
 }
 
+fn flushCoalescedResize(self: *Thread, cb: *CallbackData) void {
+    if (self.coalesce_data.resize) |v| {
+        self.coalesce_data.resize = null;
+        cb.io.resize(&cb.data, v) catch |err| {
+            log.warn("error during resize err={}", .{err});
+        };
+
+        // A resize reflows the PageList, which is compression-relevant work
+        // that may not be followed by any further output.
+        self.wakeCompression(cb);
+    }
+}
+
 fn coalesceCallback(
     cb_: ?*CallbackData,
     _: *xev.Loop,
@@ -440,13 +735,7 @@ fn coalesceCallback(
     };
 
     const cb = cb_ orelse return .disarm;
-
-    if (cb.self.coalesce_data.resize) |v| {
-        cb.self.coalesce_data.resize = null;
-        cb.io.resize(&cb.data, v) catch |err| {
-            log.warn("error during resize err={}", .{err});
-        };
-    }
+    cb.self.flushCoalescedResize(cb);
 
     return .disarm;
 }
@@ -467,6 +756,10 @@ fn wakeupCallback(
     const cb = cb_ orelse return .rearm;
     cb.self.drainMailbox(cb) catch |err|
         log.err("error draining mailbox err={}", .{err});
+
+    // Unconditional because a backend reader thread signals compression by
+    // notifying this async without publishing a message.
+    cb.self.wakeCompression(cb);
 
     return .rearm;
 }
@@ -543,3 +836,32 @@ fn selectionScrollCallback(
 
     return .disarm;
 }
+
+/// Wake the scrollback compression scheduler, if this thread owns one.
+fn wakeCompression(self: *Thread, cb: *CallbackData) void {
+    if (self.compression) |*compression| compression.wake(cb);
+}
+
+/// Wake a termio's scrollback compression scheduler from the shared terminal
+/// parse path, which runs on a different thread depending on the backend: a
+/// host-managed backend parses on this IO thread, while `Exec` parses on its
+/// own reader thread.
+///
+/// The scheduler's timer belongs to the IO thread's event loop, so a foreign
+/// thread must not touch it. It hands off through the mailbox wakeup async,
+/// which is threadsafe, and `wakeupCallback` performs the wake.
+pub fn wakeCompressionForTermio(io: *termio.Termio) void {
+    if (current_callback) |cb| {
+        if (cb.io == io) {
+            cb.self.wakeCompression(cb);
+            return;
+        }
+    }
+
+    io.mailbox.notify();
+}
+
+/// The compression scheduler is hosted on `CallbackData` because it needs both
+/// this thread's event loop and the termio's renderer state, and `CallbackData`
+/// is the only stable pointer that has both.
+const Compression = ScrollbackCompression(CallbackData);

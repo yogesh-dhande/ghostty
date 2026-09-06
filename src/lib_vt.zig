@@ -328,6 +328,7 @@ comptime {
         @export(&c.terminal_continuation_write, .{ .name = "ghostty_terminal_continuation_write" });
         @export(&c.terminal_continuation_buf, .{ .name = "ghostty_terminal_continuation_buf" });
         @export(&c.terminal_continuation_alloc, .{ .name = "ghostty_terminal_continuation_alloc" });
+        @export(&c.terminal_take_render_scroll_rects, .{ .name = "ghostty_terminal_take_render_scroll_rects" });
         if (features.selection) {
             @export(&c.terminal_select_word, .{ .name = "ghostty_terminal_select_word" });
             @export(&c.terminal_select_word_between, .{ .name = "ghostty_terminal_select_word_between" });

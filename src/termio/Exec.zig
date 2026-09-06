@@ -575,6 +575,7 @@ pub const Config = struct {
     working_directory: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
+    use_login_shell: bool = true,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -830,6 +831,7 @@ const Subprocess = struct {
             alloc,
             shell_command,
             internal_os.passwd,
+            cfg.use_login_shell,
         ) catch |err| switch (err) {
             // If we fail to allocate space for the command we want to
             // execute, we'd still like to try to run something so
@@ -1844,11 +1846,14 @@ fn execCommand(
     alloc: Allocator,
     command: configpkg.Command,
     comptime passwdpkg: type,
+    use_login_shell: bool,
 ) (Allocator.Error || error{SystemError})![]const [:0]const u8 {
     // If we're on macOS, we have to use `login(1)` to get all of
     // the proper environment variables set, a login shell, and proper
     // hushlogin behavior.
     if (comptime builtin.target.os.tag.isDarwin()) darwin: {
+        if (!use_login_shell) break :darwin;
+
         const passwd = passwdpkg.get(alloc) catch |err| {
             log.warn("failed to read passwd, not using a login shell err={}", .{err});
             break :darwin;
@@ -2077,7 +2082,7 @@ test "execCommand darwin: shell command" {
                 .name = "testuser",
             };
         }
-    });
+    }, true);
 
     try testing.expectEqual(8, result.len);
     try testing.expectEqualStrings(result[0], "/usr/bin/login");
@@ -2107,7 +2112,7 @@ test "execCommand darwin: direct command" {
                 .name = "testuser",
             };
         }
-    });
+    }, true);
 
     try testing.expectEqual(5, result.len);
     try testing.expectEqualStrings(result[0], "/usr/bin/login");
@@ -2135,6 +2140,7 @@ test "execCommand: shell command, empty passwd" {
                 return .{};
             }
         },
+        true,
     );
 
     try testing.expectEqual(3, result.len);
@@ -2161,6 +2167,7 @@ test "execCommand: shell command, error passwd" {
                 return error.Fail;
             }
         },
+        true,
     );
 
     try testing.expectEqual(3, result.len);
@@ -2188,7 +2195,7 @@ test "execCommand: direct command, error passwd" {
             // login command and falls back to POSIX behavior.
             return error.Fail;
         }
-    });
+    }, true);
 
     try testing.expectEqual(2, result.len);
     try testing.expectEqualStrings(result[0], "foo");
@@ -2218,7 +2225,7 @@ test "execCommand: direct command, config freed" {
             // login command and falls back to POSIX behavior.
             return error.Fail;
         }
-    });
+    }, true);
 
     command_arena.deinit();
 
@@ -2239,7 +2246,7 @@ test "execCommand windows: bare cmd.exe resolves via COMSPEC" {
         fn get(_: Allocator) !PasswdEntry {
             return .{};
         }
-    });
+    }, true);
 
     try testing.expectEqual(1, result.len);
 
@@ -2261,7 +2268,7 @@ test "execCommand windows: bare non-cmd shell is passed through" {
         fn get(_: Allocator) !PasswdEntry {
             return .{};
         }
-    });
+    }, true);
 
     try testing.expectEqual(1, result.len);
     try testing.expectEqualStrings("pwsh.exe", result[0]);
@@ -2279,7 +2286,7 @@ test "execCommand windows: shell with args is split on whitespace" {
         fn get(_: Allocator) !PasswdEntry {
             return .{};
         }
-    });
+    }, true);
 
     try testing.expectEqual(2, result.len);
     try testing.expectEqualStrings("wsl", result[0]);
@@ -2301,9 +2308,31 @@ test "execCommand windows: direct command is passed through unchanged" {
         fn get(_: Allocator) !PasswdEntry {
             return .{};
         }
-    });
+    }, true);
 
     try testing.expectEqual(2, result.len);
     try testing.expectEqualStrings("C:\\tools\\foo.exe", result[0]);
     try testing.expectEqualStrings("arg with spaces", result[1]);
+}
+
+test "execCommand darwin: direct command without login shell" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommand(alloc, .{ .direct = &.{
+        "/bin/cat",
+    } }, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return .{
+                .name = "testuser",
+            };
+        }
+    }, false);
+
+    try testing.expectEqual(1, result.len);
+    try testing.expectEqualStrings(result[0], "/bin/cat");
 }

@@ -27,6 +27,7 @@ flatpak/repo/
 glad.zip
 /Box_test.ppm
 /Box_test_diff.ppm
+/errdefer_test
 /ghostty.qcow2
 
 vgcore.*

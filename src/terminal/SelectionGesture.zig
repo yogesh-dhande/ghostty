@@ -220,6 +220,37 @@ pub fn validatedLeftClickPin(
     return pin;
 }
 
+/// Move the active gesture's press anchor to `p` on the terminal's active screen.
+///
+/// This exists for callers that rewrite the screen contents underneath a live drag and know
+/// where the original press belongs in the rewritten screen, such as a mirror surface applying
+/// a full-grid frame. `PageList.reset` keeps tracked pins alive but re-anchors them at the
+/// top-left and marks them garbage, so without this the drag would either be rejected or
+/// continue from the wrong cell.
+///
+/// The pin must belong to the active screen. Reusing the existing tracked pin when it is still
+/// valid keeps the recorded screen key and generation matching the pin, which is what lets
+/// `deinit`/`reset` untrack it from the right screen later; when the anchor came from a screen
+/// this gesture no longer owns, the stale reference is dropped and a fresh pin is tracked on the
+/// active screen with the key and generation updated together.
+pub fn rebindLeftClickPin(
+    self: *SelectionGesture,
+    t: *Terminal,
+    p: Pin,
+) Allocator.Error!void {
+    if (self.validatedLeftClickPin(&t.screens)) |pin| {
+        pin.* = p;
+        return;
+    }
+
+    self.untrackPin(t);
+    const screens: *const ScreenSet = &t.screens;
+    self.left_click_pin = try screens.active.pages.trackPin(p);
+    errdefer comptime unreachable;
+    self.left_click_screen = screens.active_key;
+    self.left_click_screen_generation = screens.generation(screens.active_key);
+}
+
 pub const Press = struct {
     /// The time when the press event occurred. Prefer a monotonic timer;
     /// backwards timestamps reset the repeat sequence.

@@ -99,6 +99,15 @@ const GraphemeMap = AutoOffsetHashMap(
     hash_map.default_max_load_percentage,
 );
 
+/// The `Capacity.grapheme_bytes` a single `setGraphemes` call of the given codepoint count
+/// consumes. Callers that must size a page's grapheme capacity before writing (rather than
+/// growing reactively, which relocates the page and invalidates every cell pointer they hold)
+/// sum this over the cells they are about to write. This is the same accounting
+/// `Page.exactRowCapacity` uses to size a page for graphemes it already holds.
+pub fn graphemeBytesRequired(cps_len: usize) usize {
+    return GraphemeAlloc.bytesRequired(u21, cps_len);
+}
+
 /// The allocator used for shared utf8-encoded strings within a page.
 /// Note the chunk size below is the minimum size of a single allocation
 /// and requires a single bit of metadata in our bitmap allocator. Therefore

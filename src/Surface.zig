@@ -83,6 +83,13 @@ font_metrics: font.Metrics,
 /// a specific size.
 font_size_adjusted: bool,
 
+/// True when this surface has no renderer at all: no renderer thread, no
+/// graphics objects and no windowing-system view. Headless surfaces exist to
+/// host terminal state for a process that only reads that state, so `renderer`,
+/// `renderer_thread` and `renderer_thr` below are left undefined and every
+/// read of them is guarded by this flag.
+headless: bool,
+
 /// The renderer for this surface.
 renderer: Renderer,
 
@@ -94,6 +101,11 @@ renderer_thread: rendererpkg.Thread,
 
 /// The actual thread
 renderer_thr: std.Thread,
+
+/// Serializes cross-thread renderer endpoint producers with renderer
+/// thread replacement.
+renderer_endpoint_mutex: std.Io.Mutex = .init,
+renderer_endpoint_rebinding: bool = false,
 
 /// Mouse state.
 mouse: Mouse,
@@ -180,6 +192,12 @@ search: ?Search = null,
 
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.Io.Timestamp = null,
+
+/// True when a runtime owner needs terminal screen mutation notifications.
+screen_change_notifications_enabled: std.atomic.Value(bool) = .{ .raw = false },
+
+/// Coalesces screen mutation notifications while the app thread catches up.
+screen_change_notification_pending: std.atomic.Value(bool) = .{ .raw = false },
 
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
@@ -496,8 +514,15 @@ pub fn init(
     var derived_config = try DerivedConfig.init(alloc, config);
     errdefer derived_config.deinit();
 
+    // Headless surfaces have no view to render into and nothing that consumes
+    // rendered output, so no renderer is built for them at all.
+    const headless: bool = if (comptime @hasDecl(apprt.runtime.Surface, "isHeadless"))
+        rt_surface.isHeadless()
+    else
+        false;
+
     // Initialize our renderer with our initialized surface.
-    try Renderer.surfaceInit(rt_surface);
+    if (!headless) try Renderer.surfaceInit(rt_surface);
 
     // Determine our DPI configurations so we can properly configure
     // font points to pixels and handle other high-DPI scaling factors.
@@ -555,7 +580,7 @@ pub fn init(
 
     // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
-    var renderer_impl = try Renderer.init(alloc, .{
+    var renderer_impl = if (headless) undefined else try Renderer.init(alloc, .{
         .config = try .init(alloc, config),
         .font_grid = font_grid,
         .size = size,
@@ -563,7 +588,7 @@ pub fn init(
         .rt_surface = rt_surface,
         .thread = &self.renderer_thread,
     });
-    errdefer renderer_impl.deinit();
+    errdefer if (!headless) renderer_impl.deinit();
 
     // The mutex used to protect our renderer state.
     const mutex = try alloc.create(std.Io.Mutex);
@@ -571,7 +596,7 @@ pub fn init(
     errdefer alloc.destroy(mutex);
 
     // Create the renderer thread
-    var render_thread = try rendererpkg.Thread.init(
+    var render_thread = if (headless) undefined else try rendererpkg.Thread.init(
         alloc,
         config,
         rt_surface,
@@ -579,7 +604,7 @@ pub fn init(
         &self.renderer_state,
         app_mailbox,
     );
-    errdefer render_thread.deinit();
+    errdefer if (!headless) render_thread.deinit();
 
     // Create the IO thread
     var io_thread = try termio.Thread.init(alloc);
@@ -605,6 +630,7 @@ pub fn init(
         .font_size = font_size,
         .font_size_adjusted = false,
         .font_metrics = font_grid.metrics,
+        .headless = headless,
         .renderer = renderer_impl,
         .renderer_thread = render_thread,
         .renderer_state = .{
@@ -623,6 +649,8 @@ pub fn init(
         // Our conditional state is initialized to the app state. This
         // lets us get the most likely correct color theme and so on.
         .config_conditional_state = app.config_conditional_state,
+        .screen_change_notifications_enabled = .{ .raw = false },
+        .screen_change_notification_pending = .{ .raw = false },
     };
 
     // The command we're going to execute
@@ -639,37 +667,52 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+        var backend: termio.Backend = backend: {
+            const host_managed_config = if (comptime @hasDecl(apprt.runtime.Surface, "hostManagedTermioConfig"))
+                rt_surface.hostManagedTermioConfig()
+            else
+                null;
+
+            if (host_managed_config) |backend_config| {
+                break :backend .{ .host_managed = termio.HostManaged.init(backend_config) };
+            }
+
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+            };
+            errdefer env.deinit();
+
+            // don't leak GHOSTTY_LOG to any subprocesses
+            _ = env.orderedRemove("GHOSTTY_LOG");
+
+            var buf: [18]u8 = undefined;
+            try env.put(
+                "GHOSTTY_SURFACE_ID",
+                std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+            );
+
+            // Initialize our IO backend
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global.resourcesDir().host(),
+                .term = config.term,
+                .use_login_shell = config.@"macos-use-login-shell",
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+
+            break :backend .{ .exec = io_exec };
         };
-        errdefer env.deinit();
-
-        // don't leak GHOSTTY_LOG to any subprocesses
-        _ = env.orderedRemove("GHOSTTY_LOG");
-
-        var buf: [18]u8 = undefined;
-        try env.put(
-            "GHOSTTY_SURFACE_ID",
-            std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-        );
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global.resourcesDir().host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer backend.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -679,11 +722,11 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
+            .renderer_wakeup = if (headless) null else render_thread.wakeup,
+            .renderer_mailbox = if (headless) null else render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
     }
@@ -719,15 +762,15 @@ pub fn init(
 
     // Give the renderer one more opportunity to finalize any surface
     // setup on the main thread prior to spinning up the rendering thread.
-    try renderer_impl.finalizeSurfaceInit(rt_surface);
+    if (!headless) try renderer_impl.finalizeSurfaceInit(rt_surface);
 
     // Start our renderer thread
-    self.renderer_thr = try std.Thread.spawn(
+    if (!headless) self.renderer_thr = try std.Thread.spawn(
         .{},
         rendererpkg.Thread.threadMain,
         .{&self.renderer_thread},
     );
-    self.renderer_thr.setName(global.io(), "renderer") catch {};
+    if (!headless) self.renderer_thr.setName(global.io(), "renderer") catch {};
 
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
@@ -802,7 +845,7 @@ pub fn deinit(self: *Surface) void {
     if (self.search) |*s| s.deinit();
 
     // Stop rendering thread
-    {
+    if (!self.headless) {
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
         self.renderer_thr.join();
@@ -820,8 +863,8 @@ pub fn deinit(self: *Surface) void {
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
-    self.renderer_thread.deinit();
-    self.renderer.deinit();
+    if (!self.headless) self.renderer_thread.deinit();
+    if (!self.headless) self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     self.io.deinit();
@@ -845,6 +888,132 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
+}
+
+const RendererThreadStart = struct {
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    thread: ?*rendererpkg.Thread = null,
+    canceled: bool = false,
+    consumed: bool = false,
+
+    fn threadMain(self: *RendererThreadStart) void {
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        while (self.thread == null and !self.canceled) {
+            self.cond.waitUncancelable(io, &self.mutex);
+        }
+
+        const thread = self.thread;
+        self.consumed = true;
+        self.cond.signal(io);
+        self.mutex.unlock(io);
+
+        if (thread) |t| rendererpkg.Thread.threadMain(t);
+    }
+
+    fn start(self: *RendererThreadStart, thread: *rendererpkg.Thread) void {
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        std.debug.assert(!self.canceled);
+        self.thread = thread;
+        self.cond.signal(io);
+        while (!self.consumed) self.cond.waitUncancelable(io, &self.mutex);
+    }
+
+    fn cancel(self: *RendererThreadStart) void {
+        const io = global.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        self.canceled = true;
+        self.cond.signal(io);
+        while (!self.consumed) self.cond.waitUncancelable(io, &self.mutex);
+    }
+};
+
+/// Rebind the renderer to a replacement runtime surface without restarting
+/// the underlying PTY or terminal state.
+pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
+    // A headless surface has no renderer to rebind and no host to rebind to.
+    if (self.headless) return error.SurfaceIsHeadless;
+
+    // The config is refreshed from the stopped renderer thread below before
+    // the replacement thread starts. Avoid reading the live thread config here
+    // because a config reload may be mutating it concurrently.
+    const placeholder_config: rendererpkg.Thread.DerivedConfig = .{
+        .scrollback_compression = false,
+    };
+    var render_thread = try rendererpkg.Thread.initWithDerivedConfig(
+        self.alloc,
+        placeholder_config,
+        rt_surface,
+        &self.renderer,
+        &self.renderer_state,
+        .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
+    );
+    var render_thread_installed = false;
+    defer if (!render_thread_installed) render_thread.deinit();
+
+    var renderer_rebind = try self.renderer.prepareSurfaceRebind(rt_surface);
+    var renderer_rebind_installed = false;
+    defer if (!renderer_rebind_installed) self.renderer.deinitSurfaceRebind(&renderer_rebind);
+
+    var renderer_thread_start: RendererThreadStart = .{};
+    var renderer_thr = try std.Thread.spawn(
+        .{},
+        RendererThreadStart.threadMain,
+        .{&renderer_thread_start},
+    );
+    renderer_thr.setName(global.io(), "renderer") catch {};
+    var renderer_thr_started = false;
+    defer if (!renderer_thr_started) {
+        renderer_thread_start.cancel();
+        renderer_thr.join();
+    };
+
+    self.beginRendererRebind();
+    var renderer_rebinding = true;
+    defer if (renderer_rebinding) self.endRendererRebind();
+
+    self.renderer_thread.stop.notify() catch |err|
+        log.err("error notifying renderer thread to stop during rebind err={}", .{err});
+    self.renderer_thr.join();
+
+    // Re-enter the renderer on the calling thread so graphics API state is
+    // safe to mutate while we swap the host surface.
+    self.renderer.threadEnter(self.rt_surface) catch unreachable;
+
+    // Preserve renderer thread state after the old thread can no longer process
+    // messages. Config reloads processed during rebind must carry forward, and
+    // pending focus messages may still be drained into the replacement thread.
+    render_thread.config = self.renderer_thread.config;
+    render_thread.flags = self.renderer_thread.flags;
+
+    self.renderer.rebindSurface(rt_surface, &renderer_rebind);
+    renderer_rebind_installed = true;
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    var old_render_thread = self.renderer_thread;
+    self.rt_surface = rt_surface;
+    self.renderer_thread = render_thread;
+    self.io.setRendererEndpointAndDrain(
+        self.renderer_thread.wakeup,
+        self.renderer_thread.mailbox,
+        &old_render_thread,
+    );
+    render_thread_installed = true;
+    self.renderer_state.mutex.unlock(global.io());
+
+    renderer_thread_start.start(&self.renderer_thread);
+    renderer_thr_started = true;
+    self.renderer_thr = renderer_thr;
+    old_render_thread.deinit();
+
+    self.endRendererRebind();
+    renderer_rebinding = false;
 }
 
 /// Close this surface. This will trigger the runtime to start the
@@ -875,7 +1044,10 @@ fn queueIo(
         switch (msg) {
             .write_small,
             .write_stable,
+            .write_raw_small,
+            .write_raw_stable,
             .write_alloc,
+            .write_raw_alloc,
             => {
                 msg.deinit();
                 return;
@@ -888,10 +1060,22 @@ fn queueIo(
     self.io.queueMessage(msg, mutex);
 }
 
+/// Send raw PTY bytes directly to the child process. This bypasses higher-level
+/// text and paste semantics and is intended for external session control.
+pub fn sendInputRaw(self: *Surface, data: []const u8) !void {
+    if (data.len == 0) return;
+    self.queueIo(try termio.Message.writeReqRaw(
+        self.alloc,
+        data,
+    ), .unlocked);
+}
+
 /// Forces the surface to render. This is useful for when the surface
 /// is in the middle of animation (such as a resize, etc.) or when
 /// the render timer is managed manually by the apprt.
 pub fn draw(self: *Surface) !void {
+    if (self.headless) return;
+
     // Renderers are required to support `drawFrame` being called from
     // the main thread, so that they can update contents during resize.
     try self.renderer.drawFrame(true);
@@ -901,6 +1085,9 @@ pub fn draw(self: *Surface) !void {
 /// This will not affect the GUI. The GUI must use performAction to
 /// show/hide the inspector UI.
 pub fn activateInspector(self: *Surface) !void {
+    // The inspector renders through the surface's renderer; a headless
+    // surface has none, and Inspector.render reads the renderer thread.
+    if (self.headless) return;
     if (self.inspector != null) return;
 
     // Setup the inspector
@@ -920,7 +1107,7 @@ pub fn activateInspector(self: *Surface) !void {
     }
 
     // Notify our components we have an inspector active
-    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
+    if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = true }, .{ .forever = {} });
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
@@ -937,7 +1124,7 @@ pub fn deactivateInspector(self: *Surface) void {
     }
 
     // Notify our components we have deactivated inspector
-    _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
+    if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{ .inspector = false }, .{ .forever = {} });
     self.queueIo(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
@@ -1128,6 +1315,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .screen_change => self.flushScreenChangeNotification(),
+
         .progress_report => |v| {
             _ = self.rt_app.performAction(
                 .{ .surface = self },
@@ -1253,6 +1442,16 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.
     if (info.runtime_ms <= self.config.abnormal_command_exit_runtime_ms) runtime: {
+        const is_host_managed = switch (self.io.backend) {
+            .exec => false,
+            .host_managed => true,
+        };
+
+        // Host-managed processes are launched and timed by the embedder. The
+        // process-exit API may not have launch timing, so don't classify these
+        // exits as Ghostty launch failures based on runtime_ms.
+        if (is_host_managed) break :runtime;
+
         // On macOS, our exit code detection doesn't work, possibly
         // because of our `login` wrapper. More investigation required.
         if (comptime !builtin.target.os.tag.isDarwin()) {
@@ -1326,6 +1525,32 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     self.close();
 }
 
+/// Enable or disable terminal screen mutation notifications for runtime
+/// owners that maintain session state outside core Surface.
+pub fn setScreenChangeNotificationsEnabled(self: *Surface, enabled: bool) void {
+    self.screen_change_notifications_enabled.store(enabled, .monotonic);
+    if (!enabled) {
+        self.screen_change_notification_pending.store(false, .monotonic);
+    }
+}
+
+/// Mark that a screen-change notification should be delivered. Returns true
+/// only for the transition from no pending notification to pending.
+pub fn queueScreenChangeNotification(self: *Surface) bool {
+    if (!self.screen_change_notifications_enabled.load(.monotonic)) return false;
+    return !self.screen_change_notification_pending.swap(true, .monotonic);
+}
+
+/// Deliver a pending screen-change notification on the app thread.
+pub fn flushScreenChangeNotification(self: *Surface) void {
+    if (!self.screen_change_notification_pending.swap(false, .monotonic)) return;
+    if (!self.screen_change_notifications_enabled.load(.monotonic)) return;
+
+    if (comptime @hasDecl(apprt.runtime.Surface, "notifyOwnerSessionScreenChange")) {
+        self.rt_surface.notifyOwnerSessionScreenChange();
+    }
+}
+
 /// Called when the child process exited abnormally.
 fn childExitedAbnormally(
     self: *Surface,
@@ -1338,6 +1563,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        .host_managed => &.{"host-managed"},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -1436,9 +1662,9 @@ fn passwordInput(self: *Surface, v: bool) !void {
 
 fn searchCallback(event: terminal.search.Thread.Event, ud: ?*anyopaque) void {
     // IMPORTANT: This function is run on the SEARCH THREAD! It is NOT SAFE
-    // to access anything other than values that never change on the surface.
-    // The surface is guaranteed to be valid for the lifetime of the search
-    // thread.
+    // to access anything other than values that never change on the surface,
+    // or helpers that synchronize mutable cross-thread state. The surface is
+    // guaranteed to be valid for the lifetime of the search thread.
     const self: *Surface = @ptrCast(@alignCast(ud.?));
     self.searchCallback_(event) catch |err| {
         log.warn("error in search callback err={}", .{err});
@@ -1460,15 +1686,12 @@ fn searchCallback_(
             const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
             for (matches) |*m| m.* = try m.clone(alloc);
 
-            _ = self.renderer_thread.mailbox.push(
-                global.io(),
+            self.queueRendererMessageFromAnyThread(
                 .{ .search_viewport_matches = .{
                     .arena = arena,
                     .matches = matches,
                 } },
-                .forever,
             );
-            try self.renderer_thread.wakeup.notify();
         },
 
         .selected_match => |selected_| {
@@ -1479,13 +1702,11 @@ fn searchCallback_(
                 const alloc = arena.allocator();
                 const match = try sel.highlight.clone(alloc);
 
-                _ = self.renderer_thread.mailbox.push(
-                    global.io(),
+                self.queueRendererMessageFromAnyThread(
                     .{ .search_selected_match = .{
                         .arena = arena,
                         .match = match,
                     } },
-                    .forever,
                 );
 
                 // Send the selected index to the surface mailbox
@@ -1495,10 +1716,8 @@ fn searchCallback_(
                 );
             } else {
                 // Reset our selected match
-                _ = self.renderer_thread.mailbox.push(
-                    global.io(),
+                self.queueRendererMessageFromAnyThread(
                     .{ .search_selected_match = null },
-                    .forever,
                 );
 
                 // Reset the selected index
@@ -1507,8 +1726,6 @@ fn searchCallback_(
                     .forever,
                 );
             }
-
-            try self.renderer_thread.wakeup.notify();
         },
 
         .total_matches => |total| {
@@ -1520,20 +1737,15 @@ fn searchCallback_(
 
         // When we quit, tell our renderer to reset any search state.
         .quit => {
-            _ = self.renderer_thread.mailbox.push(
-                global.io(),
+            self.queueRendererMessageFromAnyThread(
                 .{ .search_selected_match = null },
-                .forever,
             );
-            _ = self.renderer_thread.mailbox.push(
-                global.io(),
+            self.queueRendererMessageFromAnyThread(
                 .{ .search_viewport_matches = .{
                     .arena = .init(self.alloc),
                     .matches = &.{},
                 } },
-                .forever,
             );
-            try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
             _ = self.surfaceMailbox().push(
@@ -1554,11 +1766,12 @@ fn searchCallback_(
 /// Call this when modifiers change. This is safe to call even if modifiers
 /// match the previous state.
 ///
-/// This is not publicly exported because modifier changes happen implicitly
-/// on mouse callbacks, key callbacks, etc.
+/// This is public to apprts that deduplicate mouse movement before forwarding
+/// cursor position callbacks. It is not exported through the C API because
+/// modifier changes otherwise happen implicitly on mouse and key callbacks.
 ///
 /// The renderer state mutex MUST NOT be held.
-fn modsChanged(self: *Surface, mods: input.Mods) void {
+pub fn modsChanged(self: *Surface, mods: input.Mods) void {
     // The only place we keep track of mods currently is on the mouse.
     if (!self.mouse.mods.equal(mods)) {
         // The mouse mods only contain binding modifiers since we don't
@@ -1809,14 +2022,14 @@ pub fn updateConfig(
 
     // We need to store our configs in a heap-allocated pointer so that
     // our messages aren't huge.
-    var renderer_message = try rendererpkg.Message.initChangeConfig(self.alloc, config);
-    errdefer renderer_message.deinit();
+    var renderer_message = if (self.headless) null else try rendererpkg.Message.initChangeConfig(self.alloc, config);
+    errdefer if (renderer_message) |*v| v.deinit();
     var termio_config_ptr = try self.alloc.create(termio.Termio.DerivedConfig);
     errdefer self.alloc.destroy(termio_config_ptr);
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
-    _ = self.renderer_thread.mailbox.push(global.io(), renderer_message, .{ .forever = {} });
+    if (renderer_message) |msg| _ = self.renderer_thread.mailbox.push(global.io(), msg, .{ .forever = {} });
     self.queueIo(.{
         .change_config = .{
             .alloc = self.alloc,
@@ -2371,6 +2584,24 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     }
 }
 
+/// Set or clear the selection on behalf of a remote party (a Spaces mirror
+/// committing or releasing the shared selection over the device API). Routes
+/// through `setSelection` so the apprt notification fires exactly like a
+/// local mutation, and never copies to the clipboard: the Spaces daemon's
+/// control response is the sole clipboard writer for a remote commit.
+///
+/// This must be called with the renderer mutex held. That means the
+/// `selection_changed` apprt action fires while the mutex is held, so an
+/// embedder that synchronously read the selection back from inside the
+/// action callback would deadlock; that is upstream's established contract,
+/// not something this route adds (a local drag fires the same action from
+/// `cursorPosCallback` with the mutex held), and every real consumer is
+/// asynchronous: the macOS apprt posts a debounced notification, GTK
+/// ignores the action, and the Spaces embedded host does not consume it.
+pub fn setRemoteSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    try self.setSelection(sel_);
+}
+
 /// Set a selection and, per `copy_on_select`, copy it to the clipboard.
 /// For committing selection gestures (mouse release, select-all binding).
 ///
@@ -2453,7 +2684,11 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Notify our render thread of the new font stack. The renderer
     // MUST accept the new font grid and deref the old.
-    _ = self.renderer_thread.mailbox.push(global.io(), .{
+    // A headless surface has no renderer to accept the new grid, so it
+    // releases the old grid reference itself.
+    if (self.headless) {
+        self.app.font_grid_set.deref(self.font_grid_key);
+    } else _ = self.renderer_thread.mailbox.push(global.io(), .{
         .font_grid = .{
             .grid = font_grid,
             .set = &self.app.font_grid_set,
@@ -2474,7 +2709,62 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 /// isn't guaranteed to happen immediately but it will happen as soon as
 /// practical.
 fn queueRender(self: *Surface) !void {
+    if (self.headless) return;
     try self.renderer_thread.wakeup.notify();
+}
+
+fn beginRendererRebind(self: *Surface) void {
+    self.renderer_endpoint_mutex.lockUncancelable(global.io());
+    defer self.renderer_endpoint_mutex.unlock(global.io());
+
+    self.renderer_endpoint_rebinding = true;
+}
+
+fn endRendererRebind(self: *Surface) void {
+    self.renderer_endpoint_mutex.lockUncancelable(global.io());
+    defer self.renderer_endpoint_mutex.unlock(global.io());
+
+    self.renderer_endpoint_rebinding = false;
+}
+
+/// Queue a renderer message from a producer that can run concurrently with
+/// renderer host rebinding.
+pub fn queueRendererMessageFromAnyThread(
+    self: *Surface,
+    msg: rendererpkg.Message,
+) void {
+    // A headless surface has no renderer to drain this mailbox, so the retry
+    // loop below would never terminate. Nothing will take ownership of what the
+    // message carries either, so release it here instead of leaking it. Search
+    // results are the reachable case: they arrive from the search thread with an
+    // arena per update.
+    if (self.headless) {
+        msg.deinit();
+        return;
+    }
+
+    const io = global.io();
+    while (true) {
+        self.renderer_endpoint_mutex.lockUncancelable(io);
+
+        if (self.renderer_endpoint_rebinding) {
+            self.renderer_endpoint_mutex.unlock(io);
+            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+            continue;
+        }
+
+        if (self.renderer_thread.mailbox.push(io, msg, .{ .instant = {} }) > 0) {
+            self.renderer_thread.wakeup.notify() catch |err|
+                log.warn("failed to notify renderer err={}", .{err});
+            self.renderer_endpoint_mutex.unlock(io);
+            return;
+        }
+
+        self.renderer_thread.wakeup.notify() catch |err|
+            log.warn("failed to notify renderer err={}", .{err});
+        self.renderer_endpoint_mutex.unlock(io);
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
 }
 
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
@@ -3305,6 +3595,9 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
 /// of focus state. This is used to pause rendering when the surface
 /// is not visible, and also re-render when it becomes visible again.
 pub fn occlusionCallback(self: *Surface, visible: bool) !void {
+    // Occlusion only exists to pause and resume rendering.
+    if (self.headless) return;
+
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
@@ -3347,7 +3640,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     self.focused = focused;
 
     // Notify our render thread of the new state
-    _ = self.renderer_thread.mailbox.push(global.io(), .{
+    if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{
         .focus = focused,
     }, .{ .forever = {} });
 
@@ -5606,7 +5899,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .main => @panic("crash binding action, crashing intentionally"),
 
             .render => {
-                _ = self.renderer_thread.mailbox.push(global.io(), .{ .crash = {} }, .{ .forever = {} });
+                if (!self.headless) _ = self.renderer_thread.mailbox.push(global.io(), .{ .crash = {} }, .{ .forever = {} });
                 self.queueRender() catch |err| {
                     // Not a big deal if this fails.
                     log.warn("failed to notify renderer of crash message err={}", .{err});

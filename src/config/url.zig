@@ -25,7 +25,7 @@ const oni = @import("oniguruma");
 /// There are many complicated cases where these heuristics break down, but
 /// handling them well requires a non-regex approach.
 const url_schemes =
-    \\https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:
+    \\https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:|spaces://
 ;
 
 const ipv6_url_pattern =
@@ -60,12 +60,13 @@ const non_dotted_path_lookahead =
     \\(?![\w\-.~:\/?#@!$&*+;=%]*\.)
 ;
 
+// U+00A0 and U+202F appear in macOS-generated filenames around AM/PM.
 const dotted_path_space_segments =
-    \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]*[\/.])*
+    \\(?:(?<!:)[ \x{00A0}\x{202F}](?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]*[\/.])*
 ;
 
 const any_path_space_segments =
-    \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]+)*
+    \\(?:(?<!:)[ \x{00A0}\x{202F}](?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]+)*
 ;
 
 // Branch 1: URLs with explicit schemes (http, mailto, ftp, etc.).
@@ -180,6 +181,10 @@ test "url regex" {
         .{
             .input = "match tel://+12123456789 phone numbers",
             .expect = "tel://+12123456789",
+        },
+        .{
+            .input = "open spaces://terminal/6D2A81F3?device=mac-mini in Spaces",
+            .expect = "spaces://terminal/6D2A81F3?device=mac-mini",
         },
         .{
             .input = "match with query url https://example.com?query=1&other=2 and more text.",
@@ -351,6 +356,14 @@ test "url regex" {
         .{
             .input = "/tmp/test folder/file.txt",
             .expect = "/tmp/test folder/file.txt",
+        },
+        .{
+            .input = "/Users/yogesh/Desktop/Screen Recording 2026-05-07 at 10.11.01\u{202F}AM.mov",
+            .expect = "/Users/yogesh/Desktop/Screen Recording 2026-05-07 at 10.11.01\u{202F}AM.mov",
+        },
+        .{
+            .input = "/tmp/test\u{00A0}folder/file.txt",
+            .expect = "/tmp/test\u{00A0}folder/file.txt",
         },
         .{
             .input = "/tmp/test  folder/file.txt",

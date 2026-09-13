@@ -227,6 +227,7 @@ pub const search_get_multi = search.get_multi;
 pub const terminal_grid_ref = terminal.grid_ref;
 pub const terminal_grid_ref_track = terminal.grid_ref_track;
 pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
+pub const terminal_take_render_scroll_rects = terminal.take_render_scroll_rects;
 
 pub const snapshot_encode = snapshot.encode;
 pub const snapshot_encode_buf = snapshot.encode_buf;

@@ -125,6 +125,24 @@ pub fn init(
     state: *rendererpkg.State,
     app_mailbox: App.Mailbox,
 ) !Thread {
+    return initWithDerivedConfig(
+        alloc,
+        .init(config),
+        surface,
+        renderer_impl,
+        state,
+        app_mailbox,
+    );
+}
+
+pub fn initWithDerivedConfig(
+    alloc: Allocator,
+    derived_config: DerivedConfig,
+    surface: *apprt.Surface,
+    renderer_impl: *rendererpkg.Renderer,
+    state: *rendererpkg.State,
+    app_mailbox: App.Mailbox,
+) !Thread {
     // Create our event loop.
     var loop = try xev.Loop.init(.{});
     errdefer loop.deinit();
@@ -155,7 +173,7 @@ pub fn init(
 
     var result: Thread = .{
         .alloc = alloc,
-        .config = .init(config),
+        .config = derived_config,
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,
@@ -192,6 +210,18 @@ pub fn deinit(self: *Thread) void {
 
     // Nothing can possibly access the mailbox anymore, destroy it.
     self.mailbox.destroy(self.alloc);
+}
+
+/// Move all pending mailbox messages to another renderer mailbox.
+/// This is only safe after this thread has stopped consuming messages.
+pub fn drainMailboxTo(self: *Thread, dst: *Mailbox) void {
+    const io = global.io();
+    var drain = self.mailbox.drain(io);
+    defer drain.deinit(io);
+
+    while (drain.next()) |message| {
+        std.debug.assert(dst.push(io, message, .{ .forever = {} }) > 0);
+    }
 }
 
 /// The main entrypoint for the thread.
@@ -746,6 +776,30 @@ fn cursorBlinkInterval() u64 {
     return CURSOR_BLINK_INTERVAL;
 }
 
+test "drainMailboxTo preserves pending messages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    const src_mailbox = try Mailbox.create(alloc);
+    defer src_mailbox.destroy(alloc);
+    const dst_mailbox = try Mailbox.create(alloc);
+    defer dst_mailbox.destroy(alloc);
+
+    try testing.expect(src_mailbox.push(io, .{ .focus = false }, .{ .instant = {} }) > 0);
+    try testing.expect(src_mailbox.push(io, .{ .visible = false }, .{ .instant = {} }) > 0);
+    try testing.expect(src_mailbox.push(io, .reset_cursor_blink, .{ .instant = {} }) > 0);
+
+    var thread: Thread = undefined;
+    thread.mailbox = src_mailbox;
+    thread.drainMailboxTo(dst_mailbox);
+
+    try testing.expect(src_mailbox.pop(io) == null);
+    try testing.expectEqual(false, dst_mailbox.pop(io).?.focus);
+    try testing.expectEqual(false, dst_mailbox.pop(io).?.visible);
+    try testing.expectEqual(.reset_cursor_blink, dst_mailbox.pop(io).?);
+    try testing.expect(dst_mailbox.pop(io) == null);
+}
 /// Schedules incremental terminal compression after renderer activity stops.
 ///
 /// This owns all renderer-specific compression state. The terminal decides

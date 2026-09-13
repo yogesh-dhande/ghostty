@@ -66,6 +66,12 @@ height_px: u32 = 0,
 /// The current scrolling region.
 scrolling_region: ScrollingRegion,
 
+/// Scroll operations that happened since the last embedded snapshot export.
+/// These are only a render hint; the exported snapshot remains authoritative.
+pending_render_scroll_rects: [64]RenderScrollRect = undefined,
+pending_render_scroll_rect_count: u8 = 0,
+pending_render_scroll_rect_overflow: bool = false,
+
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
 
@@ -249,6 +255,109 @@ pub const ScrollingRegion = struct {
     left: size.CellCountInt,
     right: size.CellCountInt,
 };
+
+pub const RenderScrollRect = struct {
+    row_start: size.CellCountInt,
+    row_count: size.CellCountInt,
+    column_start: size.CellCountInt,
+    column_count: size.CellCountInt,
+    delta_rows: i32,
+    delta_columns: i32,
+};
+
+pub fn pendingRenderScrollRects(self: *const Terminal) []const RenderScrollRect {
+    const count: usize = @intCast(self.pending_render_scroll_rect_count);
+    return self.pending_render_scroll_rects[0..count];
+}
+
+pub fn pendingRenderScrollRectsOverflowed(self: *const Terminal) bool {
+    return self.pending_render_scroll_rect_overflow;
+}
+
+pub fn clearPendingRenderScrollRects(self: *Terminal) void {
+    self.pending_render_scroll_rect_count = 0;
+    self.pending_render_scroll_rect_overflow = false;
+}
+
+fn recordRenderScrollRect(
+    self: *Terminal,
+    row_start: size.CellCountInt,
+    row_count: size.CellCountInt,
+    column_start: size.CellCountInt,
+    column_count: size.CellCountInt,
+    delta_rows: i32,
+    delta_columns: i32,
+) void {
+    if (self.pending_render_scroll_rect_overflow) return;
+    // No-op: nothing in the rect to move.
+    if (row_count == 0 or column_count == 0) return;
+    // No-op: the rect was recorded but nothing actually moved.
+    if (delta_rows == 0 and delta_columns == 0) return;
+
+    const row_end = @as(usize, row_start) + @as(usize, row_count);
+    const column_end = @as(usize, column_start) + @as(usize, column_count);
+    // Out of bounds for this rect: leave the pending carry as-is (untouched, not poisoned).
+    if (row_end > self.rows or column_end > self.cols) return;
+
+    // A delta whose magnitude reaches or exceeds the rect's own extent moves every row (or
+    // column) out of the rect in a single step. That is real movement, not a no-op, but the
+    // rect-plus-delta model cannot describe "the whole region emptied out and something
+    // unrelated took its place": there is no meaningful shift amount to hand a consumer. Poison
+    // the carry exactly like the accumulated-delta overflow below does, so a consumer (e.g. a
+    // mirror's in-progress drag) sees `scroll_carry_valid = false` and cancels rather than
+    // trusting an empty or partial rect list to reconstruct the movement.
+    if (delta_rows != 0 and @as(u32, @abs(delta_rows)) >= @as(u32, row_count)) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+    if (delta_columns != 0 and @as(u32, @abs(delta_columns)) >= @as(u32, column_count)) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+
+    if (self.pending_render_scroll_rect_count > 0) {
+        const last_index: usize = @intCast(self.pending_render_scroll_rect_count - 1);
+        const last = &self.pending_render_scroll_rects[last_index];
+        if (last.row_start == row_start and
+            last.row_count == row_count and
+            last.column_start == column_start and
+            last.column_count == column_count and
+            last.delta_columns == 0 and
+            delta_columns == 0 and
+            last.delta_rows != 0 and
+            delta_rows != 0 and
+            (last.delta_rows > 0) == (delta_rows > 0))
+        {
+            const combined_delta_rows = last.delta_rows + delta_rows;
+            if (@as(u32, @abs(combined_delta_rows)) >= @as(u32, row_count)) {
+                self.pending_render_scroll_rect_count = 0;
+                self.pending_render_scroll_rect_overflow = true;
+                return;
+            }
+            last.delta_rows = combined_delta_rows;
+            return;
+        }
+    }
+
+    const operation_index: usize = @intCast(self.pending_render_scroll_rect_count);
+    if (operation_index >= self.pending_render_scroll_rects.len) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+
+    self.pending_render_scroll_rects[operation_index] = .{
+        .row_start = row_start,
+        .row_count = row_count,
+        .column_start = column_start,
+        .column_count = column_count,
+        .delta_rows = delta_rows,
+        .delta_columns = delta_columns,
+    };
+    self.pending_render_scroll_rect_count += 1;
+}
 
 /// Terminal-level cursor state shared by all screens.
 pub const Cursor = struct {
@@ -2388,6 +2497,14 @@ pub fn index(self: *Terminal) !void {
             (!screen.no_scrollback or
                 self.scrolling_region.bottom == 0))
         {
+            self.recordRenderScrollRect(
+                0,
+                self.scrolling_region.bottom + 1,
+                0,
+                self.cols,
+                -1,
+                0,
+            );
             // If a bottom margin is set, kitty image placements may
             // need adjusting around the scroll. The rare placements-
             // present case is handled out of line so this hot path
@@ -2414,6 +2531,17 @@ pub fn index(self: *Terminal) !void {
             return;
         }
 
+        // Otherwise use a fast path function to efficiently scroll
+        // the contents of the scrolling region.
+        self.recordRenderScrollRect(
+            self.scrolling_region.top,
+            self.scrolling_region.bottom - self.scrolling_region.top + 1,
+            0,
+            self.cols,
+            -1,
+            0,
+        );
+
         // Kitty image placements may need adjusting around the scroll;
         // handled out of line like the scrollback path above.
         if (comptime build_options.kitty_graphics) {
@@ -2424,8 +2552,6 @@ pub fn index(self: *Terminal) !void {
             }
         }
 
-        // Otherwise use a fast path function to efficiently scroll
-        // the contents of the scrolling region.
         try screen.cursorScrollRegionUp(
             self.scrolling_region.bottom - self.scrolling_region.top,
         );
@@ -2718,6 +2844,14 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
         // Clamp count to the scroll region height.
         const region_height = self.scrolling_region.bottom + 1;
         const adjusted_count = @min(count, region_height);
+        self.recordRenderScrollRect(
+            0,
+            self.scrolling_region.bottom + 1,
+            0,
+            self.cols,
+            -@as(i32, @intCast(adjusted_count)),
+            0,
+        );
 
         // TODO: Create an optimized version that can scroll N times
         // This isn't critical because in most cases, scrollUp is used
@@ -2774,12 +2908,27 @@ pub const ScrollViewport = union(Tag) {
 
 /// Scroll the viewport of the terminal grid.
 pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
+    const before_offset = self.screens.active.pages.scrollbar().offset;
     self.screens.active.scroll(switch (behavior) {
         .top => .{ .top = {} },
         .bottom => .{ .active = {} },
         .delta => |delta| .{ .delta_row = delta },
         .row => |row| .{ .row = row },
     });
+    const after_offset = self.screens.active.pages.scrollbar().offset;
+
+    if (after_offset == before_offset) return;
+    const scroll_rows = if (after_offset > before_offset)
+        after_offset - before_offset
+    else
+        before_offset - after_offset;
+    if (scroll_rows >= @as(usize, self.rows)) return;
+
+    const delta_rows: i32 = if (after_offset > before_offset)
+        -@as(i32, @intCast(scroll_rows))
+    else
+        @as(i32, @intCast(scroll_rows));
+    self.recordRenderScrollRect(0, self.rows, 0, self.cols, delta_rows, 0);
 }
 
 /// Return the current compression activity value.
@@ -2983,6 +3132,14 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+    self.recordRenderScrollRect(
+        self.screens.active.cursor.y,
+        @intCast(rem),
+        self.scrolling_region.left,
+        self.scrolling_region.right - self.scrolling_region.left + 1,
+        @as(i32, @intCast(adjusted_count)),
+        0,
+    );
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
@@ -3156,6 +3313,14 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+    self.recordRenderScrollRect(
+        self.screens.active.cursor.y,
+        @intCast(rem),
+        self.scrolling_region.left,
+        self.scrolling_region.right - self.scrolling_region.left + 1,
+        -@as(i32, @intCast(adjusted_count)),
+        0,
+    );
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
@@ -6865,6 +7030,62 @@ test "Terminal: print writes to bottom if scrolled" {
         .x = t.screens.active.cursor.x,
         .y = t.screens.active.cursor.y,
     } }));
+}
+
+test "Terminal: scrollViewport records render scroll rect for scrollback" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 1,
+        .rows = 4,
+        .max_scrollback_bytes = 20,
+    });
+    defer t.deinit(testing.allocator);
+
+    for ("abcdef") |c| try t.print(c);
+    t.clearPendingRenderScrollRects();
+
+    t.scrollViewport(.{ .delta = -1 });
+    var rects = t.pendingRenderScrollRects();
+    try testing.expectEqual(@as(usize, 1), rects.len);
+    try testing.expectEqual(@as(size.CellCountInt, 0), rects[0].row_start);
+    try testing.expectEqual(@as(size.CellCountInt, 4), rects[0].row_count);
+    try testing.expectEqual(@as(size.CellCountInt, 0), rects[0].column_start);
+    try testing.expectEqual(@as(size.CellCountInt, 1), rects[0].column_count);
+    try testing.expectEqual(@as(i32, 1), rects[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), rects[0].delta_columns);
+
+    t.clearPendingRenderScrollRects();
+    t.scrollViewport(.{ .delta = 1 });
+    rects = t.pendingRenderScrollRects();
+    try testing.expectEqual(@as(usize, 1), rects.len);
+    try testing.expectEqual(@as(i32, -1), rects[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), rects[0].delta_columns);
+
+    t.clearPendingRenderScrollRects();
+    t.scrollViewport(.{ .delta = 1 });
+    try testing.expectEqual(@as(usize, 0), t.pendingRenderScrollRects().len);
+}
+
+test "Terminal: whole-region scroll poisons the render scroll rect carry" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    try t.printString("ABCDE");
+    t.clearPendingRenderScrollRects();
+
+    // scrollUp clamps its count to the (unmargined, full-screen) scroll region height, so
+    // scrollUp(5) here records a delta whose magnitude equals row_count: the same shape CSI S
+    // hits with a parameter >= the scroll region's height, or deleteLines covering the full
+    // region. recordRenderScrollRect's whole-region guards used to silently drop this rect
+    // instead of poisoning the carry the way the accumulated-delta overflow branch does, which
+    // left scroll_carry_valid true with an empty rect list for the frame: a consumer (e.g. a
+    // mirror's in-progress drag) then kept its anchor unshifted instead of cancelling, and could
+    // commit the wrong rows.
+    try t.scrollUp(5);
+
+    try testing.expect(t.pendingRenderScrollRectsOverflowed());
+    try testing.expectEqual(@as(usize, 0), t.pendingRenderScrollRects().len);
 }
 
 test "Terminal: print charset" {

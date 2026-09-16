@@ -635,6 +635,11 @@ typedef struct {
   uint32_t scrollbar_offset;
   bool mouse_reporting_active;
   uint8_t mouse_shift_capture;
+  // True when the alternate screen is the terminal's active screen (DEC modes 1047/1049, which
+  // full-screen programs such as less, vim, and coding agents enter). The alternate screen has no
+  // scrollback of its own, so a client routes a scroll gesture to the application rather than to a
+  // local viewport while this is set. Populated on export only; applying a snapshot ignores it.
+  bool alternate_screen_active;
   // The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes. A
   // cell's `link_index` is 1-based into this table. Populated on export only.
   size_t link_count;

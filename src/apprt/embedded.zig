@@ -1877,6 +1877,14 @@ pub const CAPI = struct {
         mouse_reporting_active: bool = false,
         /// terminal.flags.mouse_shift_capture as 0 = unset, 1 = false, 2 = true.
         mouse_shift_capture: u8 = 0,
+        /// True when the alternate screen is the terminal's active screen (DEC modes 1047/1049,
+        /// which full-screen programs such as less, vim, and coding agents enter). The alternate
+        /// screen has no scrollback of its own, so a client routes a scroll gesture to the
+        /// application rather than to a local viewport while this is set. Exported alongside the
+        /// rest of the frame under one renderer-state lock, so it always describes the screen the
+        /// exported cells came from. Populated on export only; applying a snapshot ignores it,
+        /// since a mirror paints cells rather than switching screens of its own.
+        alternate_screen_active: bool = false,
         /// The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes.
         /// A cell's `link_index` is 1-based into this table. Populated on export only.
         link_count: usize = 0,
@@ -3597,6 +3605,7 @@ pub const CAPI = struct {
                 .false => 1,
                 .true => 2,
             },
+            .alternate_screen_active = terminal_state.screens.active_key == .alternate,
             .link_count = copied_links.len,
             .links = if (copied_links.len > 0) copied_links.ptr else null,
         };

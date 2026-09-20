@@ -521,9 +521,6 @@ pub fn init(
     else
         false;
 
-    // Initialize our renderer with our initialized surface.
-    if (!headless) try Renderer.surfaceInit(rt_surface);
-
     // Determine our DPI configurations so we can properly configure
     // font points to pixels and handle other high-DPI scaling factors.
     const content_scale = try rt_surface.getContentScale();
@@ -602,7 +599,6 @@ pub fn init(
         rt_surface,
         &self.renderer,
         &self.renderer_state,
-        app_mailbox,
     );
     errdefer if (!headless) render_thread.deinit();
 
@@ -760,10 +756,6 @@ pub fn init(
     // to duplicate.
     try self.resize(self.size.screen);
 
-    // Give the renderer one more opportunity to finalize any surface
-    // setup on the main thread prior to spinning up the rendering thread.
-    if (!headless) try renderer_impl.finalizeSurfaceInit(rt_surface);
-
     // Start our renderer thread
     if (!headless) self.renderer_thr = try std.Thread.spawn(
         .{},
@@ -849,9 +841,6 @@ pub fn deinit(self: *Surface) void {
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
         self.renderer_thr.join();
-
-        // We need to become the active rendering thread again
-        self.renderer.threadEnter(self.rt_surface) catch unreachable;
     }
 
     // Stop our IO thread
@@ -952,7 +941,6 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
         rt_surface,
         &self.renderer,
         &self.renderer_state,
-        .{ .rt_app = self.rt_app, .mailbox = &self.app.mailbox },
     );
     var render_thread_installed = false;
     defer if (!render_thread_installed) render_thread.deinit();
@@ -978,6 +966,9 @@ pub fn rebindRendererHost(self: *Surface, rt_surface: *apprt.Surface) !void {
     var renderer_rebinding = true;
     defer if (renderer_rebinding) self.endRendererRebind();
 
+    // The old thread's exit must leave uploaded images in place for the
+    // replacement thread; `rebindSurface` ends this below.
+    self.renderer.beginSurfaceRebind();
     self.renderer_thread.stop.notify() catch |err|
         log.err("error notifying renderer thread to stop during rebind err={}", .{err});
     self.renderer_thr.join();
@@ -1291,6 +1282,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const body = std.mem.sliceTo(&notification.body, 0);
             try self.showDesktopNotification(title, body);
         },
+
+        .redraw => self.redraw(),
 
         .renderer_health => |health| self.updateRendererHealth(health),
 
@@ -1936,6 +1929,18 @@ fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
         scrollbar,
     ) catch |err| {
         log.warn("failed to notify app of scrollbar change err={}", .{err});
+    };
+}
+
+/// Called when the render thread has pushed a new frame.
+/// Notifies the apprt to redraw this surface.
+fn redraw(self: *Surface) void {
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .render,
+        {},
+    ) catch |err| {
+        log.warn("failed to notify app of frame present err={}", .{err});
     };
 }
 
@@ -2767,6 +2772,25 @@ pub fn queueRendererMessageFromAnyThread(
     }
 }
 
+/// Called by the apprt when the surface's display is realized.
+/// Notifies the renderer so it can begin rendering.
+/// Safe to call from the main thread.
+pub fn displayRealized(self: *Surface) !void {
+    try self.renderer.displayRealized();
+}
+
+/// Called by the apprt when the surface's display is unrealized (the surface
+/// is being destroyed or reparented). Safe to call from the main thread.
+pub fn displayUnrealized(self: *Surface) void {
+    self.renderer.displayUnrealized();
+
+    // Wake the render thread so it notices `display_realized` is now false
+    // and releases GPU resources (swap chain and shaders).
+    self.renderer_thread.wakeup.notify() catch |err| {
+        log.warn("failed to notify renderer thread of unrealize err={}", .{err});
+    };
+}
+
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
@@ -2806,6 +2830,17 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
     // Mail the IO thread
     self.queueIo(.{ .resize = self.size }, .unlocked);
+
+    // Mail the render thread so it updates its padding and screen size.
+    // A headless surface has no render thread to mail.
+    if (!self.headless) _ = self.renderer_thread.mailbox.push(
+        global.io(),
+        .{ .resize = self.size },
+        .forever,
+    );
+    self.queueRender() catch |err| {
+        log.warn("failed to notify renderer of resize err={}", .{err});
+    };
 }
 
 /// Recalculate the balanced padding if needed.

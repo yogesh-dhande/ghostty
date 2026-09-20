@@ -331,11 +331,6 @@ fn detachLayer(view: objc.Object, layer: IOSurfaceLayer) void {
     }
 }
 
-/// Present the last presented target again. (noop for Metal)
-pub inline fn presentLastTarget(self: *Metal) !void {
-    _ = self;
-}
-
 /// Returns the options to use when constructing buffers.
 pub inline fn bufferOptions(self: Metal) bufferpkg.Options {
     return .{

@@ -133,6 +133,9 @@ pub const Message = union(enum) {
     /// The terminal encountered a bell character.
     ring_bell,
 
+    /// The terminal screen content changed.
+    screen_change,
+
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
 

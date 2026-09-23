@@ -89,6 +89,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const Self = @This();
 
         pub const API = GraphicsAPI;
+        pub const SurfaceRebind = if (@hasDecl(GraphicsAPI, "SurfaceRebind"))
+            GraphicsAPI.SurfaceRebind
+        else
+            struct {};
 
         pub const ExportedFrame = if (@hasDecl(GraphicsAPI, "ExportedFrame")) GraphicsAPI.ExportedFrame else void;
 
@@ -205,6 +209,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This is initialized as true so that we load the image
         /// on renderer initialization, not just on config change.
         bg_image_changed: bool = true,
+
+        /// True while the renderer thread is being replaced by a surface
+        /// rebind. See `beginSurfaceRebind`.
+        surface_rebinding: bool = false,
+
         /// Background image vertex buffer.
         bg_image_buffer: shaderpkg.BgImage,
         /// This value is used to force-update the swap chain copy
@@ -839,6 +848,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.* = undefined;
         }
 
+        fn unusedPrepareSurfaceRebind(_: *Self, _: *apprt.Surface) void {}
+        fn unusedDeinitSurfaceRebind(_: *Self, _: *SurfaceRebind) void {}
+        fn unusedSurfaceRebind(_: *apprt.Surface, _: *SurfaceRebind) void {}
+        fn unusedPreparedSurfaceRebind(_: *SurfaceRebind) void {}
+
         fn initShaders(self: *Self) !void {
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -885,16 +899,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Release swap chain and shaders.
                 self.releaseGpuResources();
 
-                // We don't release images in `releaseGpuResources`
-                // since it can be called whenever the terminal is
-                // occluded or unrealized, and we don't want to
-                // reupload images every time that happens.
-                self.images.deinit(self.alloc);
-                self.images = .empty;
+                // A surface rebind stops this thread only to hand the
+                // renderer to a replacement thread, which keeps drawing the
+                // same images. Nothing reuploads them (the background image
+                // is only loaded on a config change), so they must survive.
+                if (!self.surface_rebinding) {
+                    // We don't release images in `releaseGpuResources`
+                    // since it can be called whenever the terminal is
+                    // occluded or unrealized, and we don't want to
+                    // reupload images every time that happens.
+                    self.images.deinit(self.alloc);
+                    self.images = .empty;
 
-                if (self.bg_image) |img| {
-                    img.deinit(self.alloc);
-                    self.bg_image = null;
+                    if (self.bg_image) |img| {
+                        img.deinit(self.alloc);
+                        self.bg_image = null;
+                    }
                 }
             }
 
@@ -902,6 +922,61 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (@hasDecl(GraphicsAPI, "threadExit")) {
                 self.api.threadExit();
             }
+        }
+
+        /// Prepare any fallible surface rebind resources before the renderer
+        /// thread is stopped. After this succeeds, rebindSurface must not fail.
+        pub fn prepareSurfaceRebind(
+            self: *Self,
+            surface: *apprt.Surface,
+        ) !SurfaceRebind {
+            if (comptime @hasDecl(GraphicsAPI, "prepareSurfaceRebind")) {
+                return try self.api.prepareSurfaceRebind(surface);
+            } else {
+                unusedPrepareSurfaceRebind(self, surface);
+                return .{};
+            }
+        }
+
+        pub fn deinitSurfaceRebind(
+            self: *Self,
+            rebind: *SurfaceRebind,
+        ) void {
+            if (comptime @hasDecl(GraphicsAPI, "deinitSurfaceRebind")) {
+                self.api.deinitSurfaceRebind(rebind);
+            } else {
+                unusedDeinitSurfaceRebind(self, rebind);
+            }
+        }
+
+        /// Mark that the renderer thread is about to be stopped for a surface
+        /// rebind rather than for teardown. Ended by `rebindSurface`.
+        pub fn beginSurfaceRebind(self: *Self) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.surface_rebinding = true;
+        }
+
+        pub fn rebindSurface(
+            self: *Self,
+            surface: *apprt.Surface,
+            rebind: *SurfaceRebind,
+        ) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.surface_rebinding = false;
+
+            if (comptime @hasDecl(GraphicsAPI, "rebindSurfacePrepared")) {
+                self.api.rebindSurfacePrepared(surface, rebind);
+            } else if (comptime @hasDecl(GraphicsAPI, "rebindSurface")) {
+                unusedPreparedSurfaceRebind(rebind);
+                self.api.rebindSurface(surface) catch unreachable;
+            } else {
+                unusedSurfaceRebind(surface, rebind);
+            }
+
+            self.markDirty();
+            self.cells_rebuilt = true;
         }
 
         /// Called by renderer.Thread when it starts the main loop.
@@ -1140,7 +1215,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setFocus(self: *Self, focus: bool) !void {
-            assert(self.focused != focus);
+            if (self.focused == focus) return;
 
             self.focused = focus;
 

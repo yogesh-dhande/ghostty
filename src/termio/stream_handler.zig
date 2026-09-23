@@ -16,6 +16,8 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
 
+threadlocal var termio_message_capture: ?*std.ArrayListUnmanaged(termio.Message) = null;
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
@@ -34,12 +36,16 @@ pub const StreamHandler = struct {
     /// The shared render state
     renderer_state: *renderer.State,
 
-    /// The mailbox for notifying the renderer of things.
-    renderer_mailbox: *renderer.Thread.Mailbox,
+    /// The mailbox for notifying the renderer of things. Null for a headless
+    /// session, which has no renderer.
+    renderer_mailbox: ?*renderer.Thread.Mailbox,
 
     /// A handle to wake up the renderer. This hints to the renderer that
-    /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    /// a repaint should happen. Null for a headless session.
+    renderer_wakeup: ?xev.Async,
+
+    /// Serializes renderer endpoint reads with renderer thread replacement.
+    renderer_endpoint_mutex: *std.Io.Mutex,
 
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
@@ -111,7 +117,10 @@ pub const StreamHandler = struct {
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.
     pub inline fn queueRender(self: *StreamHandler) !void {
-        try self.renderer_wakeup.notify();
+        self.renderer_endpoint_mutex.lockUncancelable(global.io());
+        defer self.renderer_endpoint_mutex.unlock(global.io());
+
+        if (self.renderer_wakeup) |wakeup| try wakeup.notify();
     }
 
     /// Change the configuration for this handler.
@@ -141,8 +150,30 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (termio_message_capture) |queue| {
+            queue.append(self.alloc, msg) catch |err| {
+                log.warn("failed to capture termio message err={}", .{err});
+                msg.deinit();
+            };
+            return;
+        }
+
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
+    }
+
+    pub fn beginTermioMessageCapture(
+        self: *StreamHandler,
+        messages: *std.ArrayListUnmanaged(termio.Message),
+    ) void {
+        _ = self;
+        std.debug.assert(termio_message_capture == null);
+        termio_message_capture = messages;
+    }
+
+    pub fn endTermioMessageCapture(self: *StreamHandler) void {
+        _ = self;
+        termio_message_capture = null;
     }
 
     /// Send a renderer message and unlock the renderer state mutex
@@ -153,28 +184,41 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: renderer.Message,
     ) void {
-        // See termio.Mailbox.send for more details on how this works.
+        const io = global.io();
+        while (true) {
+            // See termio.Mailbox.send for more details on how this works.
+            self.renderer_endpoint_mutex.lockUncancelable(io);
 
-        // Try instant first. If it works then we can return.
-        if (self.renderer_mailbox.push(msg, .{ .instant = {} }) > 0) {
-            return;
+            // A headless session has no renderer to drain this mailbox, so
+            // the wait below would never be satisfied.
+            const mailbox = self.renderer_mailbox orelse {
+                self.renderer_endpoint_mutex.unlock(io);
+                return;
+            };
+
+            // Try instant first. If it works then we can return.
+            if (mailbox.push(io, msg, .{ .instant = {} }) > 0) {
+                self.renderer_endpoint_mutex.unlock(io);
+                return;
+            }
+
+            // Instant would have blocked. Wake up the renderer to allow it
+            // to process the message, then release both locks before waiting
+            // so a host rebind can retarget IO to a replacement endpoint.
+            self.renderer_wakeup.?.notify() catch |err| {
+                // This is an EXTREMELY unlikely case. We still don't return
+                // and attempt to send the message because its most likely
+                // that everything is fine, but log in case a freeze happens.
+                log.warn(
+                    "failed to notify renderer err={}",
+                    .{err},
+                );
+            };
+            self.renderer_endpoint_mutex.unlock(io);
+            self.renderer_state.mutex.unlock(io);
+            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+            self.renderer_state.mutex.lockUncancelable(io);
         }
-
-        // Instant would have blocked. Release the renderer mutex,
-        // wake up the renderer to allow it to process the message,
-        // and then try again.
-        self.renderer_state.mutex.unlock(global.io());
-        defer self.renderer_state.mutex.lockUncancelable(global.io());
-        self.renderer_wakeup.notify() catch |err| {
-            // This is an EXTREMELY unlikely case. We still don't return
-            // and attempt to send the message because its most likely
-            // that everything is fine, but log in case a freeze happens.
-            log.warn(
-                "failed to notify renderer, may deadlock err={}",
-                .{err},
-            );
-        };
-        _ = self.renderer_mailbox.push(msg, .{ .forever = {} });
     }
 
     pub fn vt(
@@ -711,7 +755,11 @@ pub const StreamHandler = struct {
             // We need to start a timer to prevent the emulator being hung
             // forever.
             .synchronized_output => {
-                if (enabled) self.messageWriter(.{ .start_synchronized_output = {} });
+                if (enabled) {
+                    self.messageWriter(.{ .start_synchronized_output = {} });
+                } else {
+                    try self.queueRender();
+                }
             },
 
             .linefeed => {

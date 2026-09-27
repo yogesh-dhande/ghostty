@@ -4,6 +4,7 @@ const std = @import("std");
 const Config = @import("Config.zig");
 const SharedDeps = @import("SharedDeps.zig");
 const GhosttyLib = @import("GhosttyLib.zig");
+const LipoStep = @import("LipoStep.zig");
 const XCFrameworkStep = @import("XCFrameworkStep.zig");
 const Target = @import("xcframework.zig").Target;
 
@@ -23,6 +24,50 @@ pub fn init(
         b,
         Config.genericMacOSTarget(b, null),
     ));
+
+    // iOS
+    const ios = try GhosttyLib.initStatic(b, &try deps.retarget(
+        b,
+        b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .ios,
+            .os_version_min = Config.osVersionMin(.ios),
+            .abi = null,
+        }),
+    ));
+
+    // iOS Simulator
+    const ios_sim_arm64 = try GhosttyLib.initStatic(b, &try deps.retarget(
+        b,
+        b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .ios,
+            .os_version_min = Config.osVersionMin(.ios),
+            .abi = .simulator,
+
+            // We force the Apple CPU model because the simulator
+            // doesn't support the generic CPU model as of Zig 0.14 due
+            // to missing "altnzcv" instructions, which is false. This
+            // surely can't be right but we can fix this if/when we get
+            // back to running simulator builds.
+            .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_a17 },
+        }),
+    ));
+    const ios_sim_x86_64 = try GhosttyLib.initStatic(b, &try deps.retarget(
+        b,
+        b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .ios,
+            .os_version_min = Config.osVersionMin(.ios),
+            .abi = .simulator,
+        }),
+    ));
+    const ios_sim_universal = LipoStep.create(b, .{
+        .name = "ghostty-ios-simulator",
+        .out_name = "libghostty-internal-fat.a",
+        .input_a = ios_sim_arm64.output,
+        .input_b = ios_sim_x86_64.output,
+    });
 
     // Generate a headers directory with only ghostty.h and the module
     // map. We can't use include/ directly because it also contains the
@@ -45,6 +90,16 @@ pub fn init(
                     .library = macos_universal.output,
                     .headers = headers,
                     .dsym = macos_universal.dsym,
+                },
+                .{
+                    .library = ios.output,
+                    .headers = headers,
+                    .dsym = ios.dsym,
+                },
+                .{
+                    .library = ios_sim_universal.output,
+                    .headers = headers,
+                    .dsym = null,
                 },
             },
 

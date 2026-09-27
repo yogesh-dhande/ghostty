@@ -1114,6 +1114,8 @@ pub fn activateInspector(self: *Surface) !void {
 /// the renderer exports. See `renderer.Health` and the renderer's
 /// `presentation_health` state for the semantics.
 pub fn reportPresentationHealth(self: *Surface, health: rendererpkg.Health) void {
+    // A headless surface has no render thread to mail.
+    if (self.headless) return;
     _ = self.renderer_thread.mailbox.push(
         global.io(),
         .{ .presentation_health = health },

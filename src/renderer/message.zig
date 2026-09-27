@@ -129,6 +129,7 @@ pub const Message = union(enum) {
             .resize,
             .inspector,
             .macos_display_id,
+            .presentation_health,
             => {},
         }
     }

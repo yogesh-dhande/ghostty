@@ -2059,7 +2059,12 @@ pub const CAPI = struct {
         var next_cell = cellForSnapshotCell(cell);
         const next_style = styleForSnapshotCell(cell, snapshot);
         if (!next_style.default()) {
-            const style_id = try page.styles.add(page.memory, next_style);
+            // Distinct errors let the caller grow style capacity only for a full style set, never
+            // for the OutOfMemory a grapheme write can also return.
+            const style_id = page.styles.add(page.memory, next_style) catch |err| switch (err) {
+                error.OutOfMemory => return error.StyleCapacityExhausted,
+                error.NeedsRehash => return error.StyleSetNeedsRehash,
+            };
             next_cell.style_id = style_id;
             row.styled = true;
         }
@@ -2078,6 +2083,33 @@ pub const CAPI = struct {
         }
         row.dirty = true;
         screen.dirty.selection = true;
+    }
+
+    /// Rewrites every row of the active page from `frame_cells`. Holds page, row, and cell pointers
+    /// for its whole run, so the caller must not grow `node`'s page except by abandoning this pass.
+    fn writeSnapshotGrid(
+        screen: *terminal.Screen,
+        node: *terminal.PageList.List.Node,
+        snapshot: Snapshot,
+        frame_cells: []const SnapshotCell,
+    ) !void {
+        const page = node.page();
+        const grid_rows = page.rows.ptr(page.memory)[0..snapshot.rows];
+
+        for (grid_rows, 0..) |*row, row_index| {
+            const cells = row.cells.ptr(page.memory)[0..snapshot.columns];
+            screen.clearCells(page, row, cells);
+            row.* = .{ .cells = row.cells, .dirty = true };
+            const frame_row = frame_cells[row_index * snapshot.columns .. (row_index + 1) * snapshot.columns];
+            if (frame_row.len > 0) {
+                const row_flags = frame_row[0].flags;
+                row.wrap = (row_flags & SnapshotFlags.row_wrap) != 0;
+                row.wrap_continuation = (row_flags & SnapshotFlags.row_wrap_continuation) != 0;
+            }
+            for (cells, frame_row) |*dst, frame_cell| {
+                try writeSnapshotCell(screen, page, row, dst, frame_cell, snapshot);
+            }
+        }
     }
 
     /// The signed, viewport-relative virtual position of an in-progress local drag's anchor (the
@@ -2327,9 +2359,10 @@ pub const CAPI = struct {
 
         // Size the page for every cluster this frame carries before touching a single cell. Growing
         // reactively (the recipe Screen.appendGrapheme follows) relocates the page and invalidates
-        // the page, row, and cell pointers the write loop below holds; deciding capacity up front
-        // keeps them valid for the whole loop. The page is already being resized and fully reset
-        // just above, so a capacity decision here costs nothing extra.
+        // the page, row, and cell pointers the write pass below holds; deciding grapheme capacity up
+        // front keeps them valid for the whole pass. (Style capacity cannot be decided up front, see
+        // the restart loop below.) The page is already being resized and fully reset just above, so
+        // a capacity decision here costs nothing extra.
         var required_grapheme_bytes: usize = 0;
         for (frame_cells) |frame_cell| {
             const extras = frame_cell.graphemeExtras();
@@ -2341,22 +2374,27 @@ pub const CAPI = struct {
             node = try screen.increaseCapacity(node, .grapheme_bytes);
         }
 
-        const page = node.page();
-        const grid_rows = page.rows.ptr(page.memory)[0..snapshot.rows];
-
-        for (grid_rows, 0..) |*row, row_index| {
-            const cells = row.cells.ptr(page.memory)[0..snapshot.columns];
-            screen.clearCells(page, row, cells);
-            row.* = .{ .cells = row.cells, .dirty = true };
-            const frame_row = frame_cells[row_index * snapshot.columns .. (row_index + 1) * snapshot.columns];
-            if (frame_row.len > 0) {
-                const row_flags = frame_row[0].flags;
-                row.wrap = (row_flags & SnapshotFlags.row_wrap) != 0;
-                row.wrap_continuation = (row_flags & SnapshotFlags.row_wrap_continuation) != 0;
-            }
-            for (cells, frame_row) |*dst, frame_cell| {
-                try writeSnapshotCell(screen, page, row, dst, frame_cell, snapshot);
-            }
+        // A frame can carry more distinct styles than the page holds (a gradient logo, a
+        // syntax-highlighted diff), and the page cannot be sized for them up front the way graphemes
+        // are: the set's capacity is a count of distinct styles that can only be learned by adding
+        // them, and a set that fills with released entries needs a rehash rather than more room. So
+        // a failed add grows the page the way Screen.manualStyleUpdate does and rewrites the whole
+        // grid on the grown page. Growing relocates the page, so the restart re-derives every pointer
+        // from the new node instead of resuming; the grid is rewritten from scratch every frame
+        // anyway. Failing the apply instead would drop the whole frame and leave the pane stale.
+        while (true) {
+            writeSnapshotGrid(screen, node, snapshot, frame_cells) catch |err| switch (err) {
+                error.StyleCapacityExhausted => {
+                    node = try screen.increaseCapacity(node, .styles);
+                    continue;
+                },
+                error.StyleSetNeedsRehash => {
+                    node = try screen.increaseCapacity(node, null);
+                    continue;
+                },
+                else => return err,
+            };
+            break;
         }
 
         screen.cursorAbsolute(
@@ -2378,7 +2416,7 @@ pub const CAPI = struct {
         screen.cursor.page_row.dirty = true;
 
         // Selection handling happens last so it resolves against the pages this frame actually
-        // wrote, after the grapheme capacity growth above.
+        // wrote, after the capacity growth above.
         if (!drag_in_progress) {
             // No local drag owns the mirror's selection: paint whatever the frame carries, and
             // drop any carry state from a drag that just ended. (Its last carrying apply already

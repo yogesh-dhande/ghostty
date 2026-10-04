@@ -221,9 +221,11 @@ const type_decls = [_]TypeDecl{
     .initUnion("GhosttyStyleColorValue", style.ColorValue, null),
     .initStruct("GhosttySysImage", sys.Image),
     .initStruct("GhosttyTerminalDesktopNotification", terminal.DesktopNotification),
+    .initStruct("GhosttyTerminalMemoryUsage", terminal.TerminalMemoryUsage),
     .initStruct("GhosttyTerminalModeConfig", terminal.ModeConfig),
     .initStruct("GhosttyTerminalProgressReport", terminal.ProgressReport),
     .initStruct("GhosttyTerminalScrollbar", terminal.TerminalScrollbar),
+    .initStruct("GhosttyTerminalSemanticPrompt", terminal.SemanticPrompt),
     .initTaggedStruct("GhosttyTerminalScrollViewport", terminal.ScrollViewport, "tag", "value", .generated),
     .initUnion(
         "GhosttyTerminalScrollViewportValue",
@@ -235,6 +237,7 @@ const type_decls = [_]TypeDecl{
     .initStruct("GhosttyTerminalSelectWordOptions", selection.SelectWordOptions),
     .initStruct("GhosttyTerminalSelectionFormatOptions", selection.FormatOptions),
     .initTaggedStruct("GhosttyTerminalUnknownSequence", terminal.UnknownSequence.C, "tag", "value", .generated),
+    .initStruct("GhosttyTerminalUnknownOscSequence", terminal.UnknownOscSequence),
     .initStruct("GhosttyTerminalUnknownStringSequence", terminal.UnknownStringSequence),
     .initUnion(
         "GhosttyTerminalUnknownSequenceValue",
@@ -271,9 +274,12 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttyMouseButton", input_mouse.Button, "GHOSTTY_MOUSE_BUTTON_"),
     .initEnum("GhosttyMouseEncoderOption", mouse_encode.Option, "GHOSTTY_MOUSE_ENCODER_OPT_"),
     .initEnum("GhosttyMouseFormat", mouse_pkg.Format, "GHOSTTY_MOUSE_FORMAT_"),
+    .initEnum("GhosttyMouseShape", mouse_pkg.Shape, "GHOSTTY_MOUSE_SHAPE_"),
     .initEnum("GhosttyMouseTrackingMode", mouse_pkg.Event, "GHOSTTY_MOUSE_TRACKING_"),
     .initEnum("GhosttyOptionAsAlt", input_config.OptionAsAlt, "GHOSTTY_OPTION_AS_ALT_"),
     .initEnum("GhosttyOscCommandData", osc.CommandData, "GHOSTTY_OSC_DATA_"),
+    .initEnum("GhosttyOscOption", osc.Option, "GHOSTTY_OSC_OPT_"),
+    .initEnum("GhosttyOscTerminator", osc.Terminator, "GHOSTTY_OSC_TERMINATOR_"),
     .initEnumSentinel(
         "GhosttyOscCommandType",
         osc.CommandType,
@@ -302,6 +308,8 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttySelectionGestureEventOption", selection_gesture.EventOption, "GHOSTTY_SELECTION_GESTURE_EVENT_OPT_"),
     .initEnum("GhosttySelectionGestureEventType", selection_gesture.EventType, "GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_"),
     .initEnum("GhosttySelectionOrder", Selection.Order, "GHOSTTY_SELECTION_ORDER_"),
+    .initEnum("GhosttySemanticPromptKind", terminal.SemanticPromptKind, "GHOSTTY_SEMANTIC_PROMPT_"),
+    .initEnum("GhosttySemanticPromptPromptKind", terminal.SemanticPromptPromptKind, "GHOSTTY_SEMANTIC_PROMPT_PROMPT_"),
     .initEnum("GhosttySgrAttributeTag", sgr.Attribute.Tag, "GHOSTTY_SGR_ATTR_"),
     .initEnum("GhosttySgrUnderline", sgr.Attribute.Underline, "GHOSTTY_SGR_UNDERLINE_"),
     .initEnumSentinel("GhosttySizeReportStyle", size_report.Style, "GHOSTTY_SIZE_REPORT_", "STYLE_MAX_VALUE"),
@@ -1044,6 +1052,15 @@ test "manifest uses public enum names" {
     const terminal_values = manifest_types.get("GhosttyTerminalOption").?.object.get("values").?.object;
     try std.testing.expectEqual(@as(i64, 6), terminal_values.get("SIZE").?.integer);
     try std.testing.expect(!terminal_values.contains("SIZE_CB"));
+    try std.testing.expectEqual(@as(i64, 42), terminal_values.get("SEMANTIC_PROMPT").?.integer);
+    try std.testing.expectEqual(@as(i64, 43), terminal_values.get("RESET").?.integer);
+
+    const semantic_prompt_values = manifest_types.get("GhosttySemanticPromptKind").?.object.get("values").?.object;
+    try std.testing.expectEqual(@as(i64, 0), semantic_prompt_values.get("INVALID").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), semantic_prompt_values.get("COMMAND_END").?.integer);
+
+    const prompt_kind_values = manifest_types.get("GhosttySemanticPromptPromptKind").?.object.get("values").?.object;
+    try std.testing.expectEqual(@as(i64, 3), prompt_kind_values.get("SECONDARY").?.integer);
 
     const osc_values = manifest_types.get("GhosttyOscCommandType").?.object.get("values").?.object;
     try std.testing.expectEqual(@as(i64, 22), osc_values.get("KITTY_TEXT_SIZING").?.integer);
@@ -1053,6 +1070,14 @@ test "manifest uses public enum names" {
     try std.testing.expectEqual(@as(i64, 26), osc_values.get("KITTY_DESKTOP_NOTIFICATION").?.integer);
     try std.testing.expect(osc_values.contains("TYPE_MAX_VALUE"));
     try std.testing.expect(!osc_values.contains("MAX_VALUE"));
+
+    const mouse_shape_values = manifest_types.get("GhosttyMouseShape").?.object.get("values").?.object;
+    try std.testing.expectEqual(@as(i64, 8), mouse_shape_values.get("TEXT").?.integer);
+    try std.testing.expectEqual(@as(i64, 33), mouse_shape_values.get("ZOOM_OUT").?.integer);
+    try std.testing.expect(mouse_shape_values.contains("MAX_VALUE"));
+
+    const terminal_data_values = manifest_types.get("GhosttyTerminalData").?.object.get("values").?.object;
+    try std.testing.expectEqual(@as(i64, 41), terminal_data_values.get("MOUSE_SHAPE").?.integer);
 
     const key_values = manifest_types.get("GhosttyKey").?.object.get("values").?.object;
     try std.testing.expect(key_values.contains("A"));

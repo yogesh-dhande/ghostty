@@ -2596,6 +2596,36 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_SELECTION_VALID = 43,
+
+  /**
+   * Column of the active screen's saved cursor (DECSC), 0-indexed. Each
+   * screen keeps its own saved cursor.
+   *
+   * Returns GHOSTTY_NO_VALUE when the active screen has no saved cursor.
+   *
+   * Output type: uint16_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SAVED_CURSOR_X = 44,
+
+  /**
+   * Row of the active screen's saved cursor (DECSC), 0-indexed, absolute
+   * (not relative to the scrolling region).
+   *
+   * Returns GHOSTTY_NO_VALUE when the active screen has no saved cursor.
+   *
+   * Output type: uint16_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SAVED_CURSOR_Y = 45,
+
+  /**
+   * Whether origin mode (DECOM) was set when the active screen's cursor was
+   * saved.
+   *
+   * Returns GHOSTTY_NO_VALUE when the active screen has no saved cursor.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_SAVED_CURSOR_ORIGIN = 46,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
@@ -2928,6 +2958,41 @@ GHOSTTY_API size_t ghostty_terminal_take_render_scroll_rects(
     GhosttyTerminalScrollRect* out,
     size_t capacity,
     bool* overflowed);
+
+/**
+ * Make a screen the terminal's active screen without the side effects of a
+ * mode-driven switch (no cursor copy, no erase, no cursor save/restore).
+ *
+ * This lets a caller read the inactive screen's grid, cursor and saved cursor
+ * through the ordinary active-screen getters and render state, then switch
+ * back. The caller must restore the original active screen.
+ *
+ * @param terminal The terminal handle
+ * @param screen The screen to make active
+ * @return GHOSTTY_SUCCESS, GHOSTTY_INVALID_VALUE for a NULL terminal, or
+ *         GHOSTTY_NO_VALUE when that screen has never been initialized
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_set_active_screen(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScreen screen);
+
+/**
+ * Report whether a tab stop is set at a column.
+ *
+ * @param terminal The terminal handle
+ * @param column Column to query (0-indexed)
+ * @param[out] out Receives true when a tab stop is set at `column`
+ * @return GHOSTTY_SUCCESS, or GHOSTTY_INVALID_VALUE for a NULL terminal or
+ *         `out`, or a column outside the terminal's width
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_tabstop(
+    GhosttyTerminal terminal,
+    uint16_t column,
+    bool* out);
 
 /**
  * Scroll the terminal viewport.

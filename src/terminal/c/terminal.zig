@@ -1710,12 +1710,21 @@ pub const TerminalData = enum(c_int) {
     mouse_shape = 41,
     memory_usage = 42,
     selection_valid = 43,
+    saved_cursor_x = 44,
+    saved_cursor_y = 45,
+    saved_cursor_origin = 46,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
         return switch (self) {
             .invalid => void,
-            .cols, .rows, .cursor_x, .cursor_y => size.CellCountInt,
+            .cols,
+            .rows,
+            .cursor_x,
+            .cursor_y,
+            .saved_cursor_x,
+            .saved_cursor_y,
+            => size.CellCountInt,
             .cursor_pending_wrap,
             .cursor_visible,
             .mouse_tracking,
@@ -1724,6 +1733,7 @@ pub const TerminalData = enum(c_int) {
             .vt_ground,
             .cursor_at_prompt,
             .selection_valid,
+            .saved_cursor_origin,
             => bool,
             .mouse_shape => mouse.Shape,
             .active_screen => TerminalScreen,
@@ -1899,6 +1909,9 @@ fn getTyped(
             const mode = out.toMode() orelse return .invalid_value;
             out.value = t.modes.get(mode);
         },
+        .saved_cursor_x => out.* = (t.screens.active.saved_cursor orelse return .no_value).x,
+        .saved_cursor_y => out.* = (t.screens.active.saved_cursor orelse return .no_value).y,
+        .saved_cursor_origin => out.* = (t.screens.active.saved_cursor orelse return .no_value).origin,
         .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
         .memory_usage => {
             // A smaller size means the caller doesn't have every field of
@@ -2068,6 +2081,49 @@ pub fn take_render_scroll_rects(
         };
     }
     return n;
+}
+
+/// Make `screen` the terminal's active screen without any of the side effects
+/// of a mode-driven screen switch (no cursor copy, no erase, no cursor
+/// save/restore, no selection or hyperlink change). It exists so an embedder
+/// can read the INACTIVE screen's grid, cursor and saved cursor through the
+/// ordinary active-screen getters and render state, then switch back.
+///
+/// Returns GHOSTTY_NO_VALUE when the requested screen has never been
+/// initialized (the alternate screen of a terminal that never entered it).
+///
+/// Fork-owned; not part of upstream libghostty-vt.
+pub fn set_active_screen(
+    terminal_: Terminal,
+    screen: TerminalScreen,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t: *ZigTerminal = wrapper.terminal;
+    if (t.screens.get(screen) == null) return .no_value;
+    if (t.screens.active_key == screen) return .success;
+    t.screens.switchTo(screen);
+    // A render state keyed on the previous screen must rebuild from this one.
+    t.flags.dirty.clear = true;
+    return .success;
+}
+
+/// Report whether a tab stop is set at `column` (0-indexed).
+///
+/// Returns GHOSTTY_INVALID_VALUE for a NULL terminal or `out`, and for a
+/// column outside the terminal's width.
+///
+/// Fork-owned; not part of upstream libghostty-vt.
+pub fn tabstop(
+    terminal_: Terminal,
+    column: u16,
+    out: ?*bool,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t: *ZigTerminal = wrapper.terminal;
+    const out_ptr = out orelse return .invalid_value;
+    if (column >= t.cols) return .invalid_value;
+    out_ptr.* = t.tabstops.get(column);
+    return .success;
 }
 
 pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
@@ -7165,4 +7221,83 @@ test "get mouse_shape" {
     vt_write(t, "\x07", 1);
     try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
     try testing.expectEqual(mouse.Shape.wait, shape);
+}
+
+test "get saved_cursor reports the active screen's DECSC state" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var x: size.CellCountInt = undefined;
+    var y: size.CellCountInt = undefined;
+    var origin: bool = undefined;
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_origin, @ptrCast(&origin)));
+
+    vt_write(t, "\x1b[3;7H\x1b7", "\x1b[3;7H\x1b7".len);
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_origin, @ptrCast(&origin)));
+    try testing.expectEqual(@as(size.CellCountInt, 6), x);
+    try testing.expectEqual(@as(size.CellCountInt, 2), y);
+    try testing.expect(!origin);
+}
+
+test "set_active_screen reads the inactive screen without mode side effects" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    // The alternate screen has never been initialized.
+    try testing.expectEqual(Result.no_value, set_active_screen(t, .alternate));
+
+    // Save a cursor on the primary screen, then enter the alternate screen
+    // with 47 (no save, no clear) and move its cursor elsewhere.
+    vt_write(t, "\x1b[2;4H\x1b7\x1b[?47h\x1b[5;9H", "\x1b[2;4H\x1b7\x1b[?47h\x1b[5;9H".len);
+    var screen: TerminalScreen = undefined;
+    try testing.expectEqual(Result.success, get(t, .active_screen, @ptrCast(&screen)));
+    try testing.expectEqual(TerminalScreen.alternate, screen);
+
+    var x: size.CellCountInt = undefined;
+    var y: size.CellCountInt = undefined;
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_x, @ptrCast(&x)));
+
+    try testing.expectEqual(Result.success, set_active_screen(t, .primary));
+    try testing.expectEqual(Result.success, get(t, .active_screen, @ptrCast(&screen)));
+    try testing.expectEqual(TerminalScreen.primary, screen);
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(@as(size.CellCountInt, 3), x);
+    try testing.expectEqual(@as(size.CellCountInt, 1), y);
+
+    // Switching back leaves the alternate screen's cursor where the program put it.
+    try testing.expectEqual(Result.success, set_active_screen(t, .alternate));
+    try testing.expectEqual(Result.success, get(t, .cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.success, get(t, .cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(@as(size.CellCountInt, 8), x);
+    try testing.expectEqual(@as(size.CellCountInt, 4), y);
+}
+
+test "tabstop reports default and customized stops" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var stop: bool = undefined;
+    try testing.expectEqual(Result.success, tabstop(t, 8, &stop));
+    try testing.expect(stop);
+    try testing.expectEqual(Result.success, tabstop(t, 5, &stop));
+    try testing.expect(!stop);
+
+    // Clear all stops, then set one at column 5.
+    vt_write(t, "\x1b[3g\x1b[6G\x1bH", "\x1b[3g\x1b[6G\x1bH".len);
+    try testing.expectEqual(Result.success, tabstop(t, 8, &stop));
+    try testing.expect(!stop);
+    try testing.expectEqual(Result.success, tabstop(t, 5, &stop));
+    try testing.expect(stop);
+
+    try testing.expectEqual(Result.invalid_value, tabstop(t, 20, &stop));
+    try testing.expectEqual(Result.invalid_value, tabstop(t, 5, null));
+    try testing.expectEqual(Result.invalid_value, tabstop(null, 5, &stop));
 }

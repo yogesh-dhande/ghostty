@@ -1713,6 +1713,8 @@ pub const TerminalData = enum(c_int) {
     saved_cursor_x = 44,
     saved_cursor_y = 45,
     saved_cursor_origin = 46,
+    rows_pruned = 47,
+    history_epoch = 48,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1757,7 +1759,10 @@ pub const TerminalData = enum(c_int) {
             .color_cursor_default,
             => color.RGB.C,
             .color_palette, .color_palette_default => color.PaletteC,
-            .kitty_image_storage_limit => u64,
+            .kitty_image_storage_limit,
+            .rows_pruned,
+            .history_epoch,
+            => u64,
             .kitty_image_medium_file,
             .kitty_image_medium_shared_mem,
             => bool,
@@ -1912,6 +1917,8 @@ fn getTyped(
         .saved_cursor_x => out.* = (t.screens.active.saved_cursor orelse return .no_value).x,
         .saved_cursor_y => out.* = (t.screens.active.saved_cursor orelse return .no_value).y,
         .saved_cursor_origin => out.* = (t.screens.active.saved_cursor orelse return .no_value).origin,
+        .rows_pruned => out.* = t.screens.active.pages.rows_pruned,
+        .history_epoch => out.* = t.history_epoch,
         .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
         .memory_usage => {
             // A smaller size means the caller doesn't have every field of
@@ -7242,6 +7249,90 @@ test "get saved_cursor reports the active screen's DECSC state" {
     try testing.expectEqual(@as(size.CellCountInt, 6), x);
     try testing.expectEqual(@as(size.CellCountInt, 2), y);
     try testing.expect(!origin);
+}
+
+test "get rows_pruned counts rows pruned off the active screen's history" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var pruned: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .rows_pruned, @ptrCast(&pruned)));
+    try testing.expectEqual(@as(u64, 0), pruned);
+
+    // The smallest scrollback keeps about one page of history, so enough
+    // lines prune many pages off the top.
+    var max_bytes: usize = 1;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &max_bytes));
+    var line_buf: [32]u8 = undefined;
+    for (0..20_000) |n| {
+        const line = std.fmt.bufPrint(&line_buf, "line {d}\r\n", .{n}) catch unreachable;
+        vt_write(t, line.ptr, line.len);
+    }
+    try testing.expectEqual(Result.success, get(t, .rows_pruned, @ptrCast(&pruned)));
+    try testing.expect(pruned > 0);
+
+    // The absolute row of the viewport top is the pruned count plus the
+    // scrollbar offset, and the text there is the line with that number.
+    var scrollbar: TerminalScrollbar = undefined;
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar)));
+    const top_line = try std.fmt.allocPrint(testing.allocator, "line {d}", .{pruned + scrollbar.offset});
+    defer testing.allocator.free(top_line);
+    const wrapper = t.?;
+    const viewport = try wrapper.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(viewport);
+    try testing.expect(std.mem.startsWith(u8, viewport, top_line));
+
+    // Reset reassigns rows rather than pruning them.
+    reset(t);
+    var after_reset: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .rows_pruned, @ptrCast(&after_reset)));
+    try testing.expectEqual(pruned, after_reset);
+}
+
+test "get history_epoch changes when absolute rows are reassigned" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var epoch: u64 = undefined;
+    var next: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&epoch)));
+
+    // Output, and a resize that only changes the row count, keep it.
+    vt_write(t, "one\r\ntwo\r\nthree\r\n", "one\r\ntwo\r\nthree\r\n".len);
+    try testing.expectEqual(Result.success, resize(t, 20, 8, 1, 1));
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expectEqual(epoch, next);
+
+    // A column change reflows.
+    try testing.expectEqual(Result.success, resize(t, 10, 8, 1, 1));
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
+    epoch = next;
+
+    // ED 3 erases scrollback.
+    vt_write(t, "\x1b[3J", "\x1b[3J".len);
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
+    epoch = next;
+
+    // Entering the alternate screen is a switch...
+    vt_write(t, "\x1b[?1049h", "\x1b[?1049h".len);
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
+    epoch = next;
+
+    // ...but inspecting the inactive screen through set_active_screen is not.
+    try testing.expectEqual(Result.success, set_active_screen(t, .primary));
+    try testing.expectEqual(Result.success, set_active_screen(t, .alternate));
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expectEqual(epoch, next);
+
+    // RIS.
+    vt_write(t, "\x1bc", "\x1bc".len);
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
 }
 
 test "set_active_screen reads the inactive screen without mode side effects" {

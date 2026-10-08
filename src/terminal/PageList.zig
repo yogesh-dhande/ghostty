@@ -456,6 +456,36 @@ limits: Limits,
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
 
+/// Rows ever dropped off the top of this list by automatic pruning (page
+/// recycling in `grow` and `Limits.enforce`). A row's absolute number is
+/// `rows_pruned + scrollbar offset + y`, which stays attached to the same
+/// text while output scrolls and prunes, so a client can hold a selection
+/// in those coordinates and project it onto any frame.
+///
+/// Erasing history, reflow and reset leave this untouched: they renumber or
+/// destroy rows without pruning them, which `Terminal.history_epoch` reports
+/// instead. A rows-only resize keeps absolute numbers valid. Each screen's
+/// list counts for itself.
+///
+/// A screen without scrollback (the alternate screen) discards the top row
+/// when its whole screen scrolls; that row counts as pruned too, so absolute
+/// rows follow text there as well. A scroll region narrower than the screen
+/// moves only its own rows and is not reflected.
+///
+/// Scrolling down (reverse index at the top margin, SD, IL) moves rows to
+/// larger indexes without renumbering, so absolute rows there keep naming
+/// screen positions, which is also where Ghostty's own tracked selection
+/// pins stay (`Terminal.insertLines` does not move tracked pins).
+///
+/// On a screen with scrollback, a region that starts at the top row but ends
+/// above the bottom scrolls its rows into history (`Screen.cursorScrollAbove`),
+/// which keeps their numbers, and moves the rows below it down a row to hold
+/// them in place. Those footer rows therefore take a new number on each
+/// scroll, and absolute rows held on them drift up a row. Ghostty's own
+/// tracked selection pins drift the same way, since that rotation does not
+/// move tracked pins either.
+rows_pruned: u64 = 0,
+
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
 
@@ -4058,6 +4088,10 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             break :prune;
         }
 
+        // Counted only past the rollback above so a refused prune is not
+        // reported as lost history.
+        self.rows_pruned += first.rows();
+
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
             if (self.viewport_pin_row_offset) |*v| {
@@ -7111,6 +7145,7 @@ const Limits = struct {
             // by paths that already adjusted total_rows.
             pagelist.erasePage(first);
             pagelist.total_rows -= first_rows;
+            pagelist.rows_pruned += first_rows;
             removed += first_rows;
         }
 
@@ -10090,6 +10125,115 @@ test "PageList grow prune required with a single page" {
         .offset = s.total_rows - s.rows,
         .len = s.rows,
     }, s.scrollbar());
+}
+
+test "PageList rows_pruned keeps the absolute row of the active top exact under grow pruning" {
+    const testing = std.testing;
+    const cols: size.CellCountInt = 80;
+    const page_rows: usize = initialCapacity(cols).rows;
+
+    var s = try init(testing.allocator, .{ .cols = cols, .rows = 24, .max_size = PagePool.item_size });
+    defer s.deinit();
+    try testing.expectEqual(@as(u64, 0), s.rows_pruned);
+
+    // Every grow adds one row at the bottom, so the active top is absolute
+    // row `grows` whether or not pages were pruned off the top meanwhile.
+    var grows: usize = 0;
+    var last_pruned: u64 = 0;
+    var saw_prune = false;
+    while (grows < 6 * page_rows) {
+        _ = try s.grow();
+        grows += 1;
+        const absolute_top = s.rows_pruned + s.scrollbar().offset;
+        try testing.expectEqual(grows, absolute_top);
+        if (s.rows_pruned != last_pruned) saw_prune = true;
+        last_pruned = s.rows_pruned;
+    }
+    try testing.expect(saw_prune);
+    try testing.expectEqual(@as(u64, s.rows + grows), s.rows_pruned + s.total_rows);
+}
+
+test "PageList rows_pruned does not count a prune that grow rolls back" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cap = try std_capacity.adjust(.{ .cols = 5 });
+    var s = try init(alloc, .{ .cols = 5, .rows = cap.rows, .max_size = 0 });
+    defer s.deinit();
+    _ = try s.grow();
+
+    // Shrink every page so popping the first would leave too few rows for
+    // the active area, which makes grow refuse the prune.
+    {
+        var it = s.pages.first;
+        while (it) |page| : (it = page.next) {
+            page.page().size.rows = 1;
+            page.page().capacity.rows = 1;
+        }
+        s.total_rows = s.totalRows();
+    }
+    const pages_before = s.totalPages();
+    _ = try s.grow();
+    try testing.expectEqual(pages_before + 1, s.totalPages());
+    try testing.expectEqual(@as(u64, 0), s.rows_pruned);
+}
+
+test "PageList rows_pruned counts Limits.enforce pruning" {
+    const testing = std.testing;
+    const cols: size.CellCountInt = 80;
+    const page_rows: usize = initialCapacity(cols).rows;
+
+    var s = try init(testing.allocator, .{ .cols = cols, .rows = 1, .max_size = null });
+    defer s.deinit();
+    try s.growRows(4 * page_rows);
+    try testing.expectEqual(@as(u64, 0), s.rows_pruned);
+
+    s.setMaxBytes(PagePool.item_size);
+    try testing.expectEqual(@as(u64, 3 * page_rows), s.rows_pruned);
+    try testing.expectEqual(@as(u64, 1 + 4 * page_rows), s.rows_pruned + s.total_rows);
+}
+
+test "PageList rows_pruned is untouched by erase history, reflow and reset" {
+    const testing = std.testing;
+    const cols: size.CellCountInt = 80;
+    const page_rows: usize = initialCapacity(cols).rows;
+
+    var s = try init(testing.allocator, .{ .cols = cols, .rows = 24, .max_size = null });
+    defer s.deinit();
+
+    // Prune once so the counter holds a nonzero value to preserve.
+    try s.growRows(4 * page_rows);
+    s.setMaxBytes(PagePool.item_size);
+    s.setMaxBytes(null);
+    const pruned = s.rows_pruned;
+    try testing.expect(pruned > 0);
+
+    // Reflow to a different column count.
+    try s.resize(.{ .cols = 40, .reflow = true });
+    try testing.expectEqual(pruned, s.rows_pruned);
+
+    s.eraseHistory(null);
+    try testing.expectEqual(pruned, s.rows_pruned);
+
+    s.reset();
+    try testing.expectEqual(pruned, s.rows_pruned);
+}
+
+test "PageList rows_pruned is untouched by a rows-only resize" {
+    const testing = std.testing;
+    const cols: size.CellCountInt = 80;
+    const page_rows: usize = initialCapacity(cols).rows;
+
+    var s = try init(testing.allocator, .{ .cols = cols, .rows = 24, .max_size = null });
+    defer s.deinit();
+    try s.growRows(2 * page_rows);
+
+    const top_before = s.rows_pruned + s.scrollbar().offset;
+    try s.resize(.{ .rows = 10, .reflow = true });
+    try testing.expectEqual(@as(u64, 0), s.rows_pruned);
+    // The shrink drops blank rows from the bottom, so the text that stays
+    // keeps its absolute number.
+    try testing.expectEqual(top_before, s.rows_pruned + s.scrollbar().offset);
 }
 
 test "PageList scrollbar with max_size 0 after grow" {

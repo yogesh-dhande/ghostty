@@ -93,6 +93,17 @@ terminal_stream: StreamHandler.Stream,
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
 
+/// Bytes handed to the stream parser so far, counted once the chunk has
+/// been parsed. Every route PTY output takes funnels through
+/// `processOutputLocked`, and this is only read or written under the
+/// renderer state mutex, so a snapshot exported under that mutex pairs
+/// its grid with exactly the byte count that produced it.
+///
+/// One gap: a handler that must wait on a full mailbox drops the mutex
+/// mid-chunk, so a snapshot taken then holds a grid ahead of this count
+/// by the rest of that chunk.
+bytes_processed: u64 = 0,
+
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
@@ -811,6 +822,11 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // Clear our selection
         self.terminal.screens.active.clearSelection();
 
+        // Away from a prompt this physically erases the rows above the
+        // cursor, shifting the rows that remain, and `history` erases the
+        // scrollback: a renumbering even when the scrollback is kept.
+        self.terminal.bumpHistoryEpoch();
+
         // Clear our scrollback
         if (history) self.terminal.eraseDisplay(.scrollback, false);
 
@@ -1032,6 +1048,7 @@ fn processOutputLocked(
     } else {
         self.terminal_stream.nextSlice(buf);
     }
+    self.bytes_processed += buf.len;
 
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.

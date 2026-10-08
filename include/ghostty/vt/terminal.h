@@ -2626,6 +2626,37 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_SAVED_CURSOR_ORIGIN = 46,
+
+  /**
+   * Rows ever dropped off the top of the active screen's history by
+   * automatic pruning (the scrollback limit). The absolute row of viewport
+   * row y is rows_pruned + scrollbar offset + y, and stays attached to the
+   * same text as output scrolls and prunes. Erasing scrollback, reflow and
+   * reset do not change it; GHOSTTY_TERMINAL_DATA_HISTORY_EPOCH reports
+   * those. It also counts the top row a screen without scrollback (such as
+   * the alternate screen) discards when its whole screen scrolls, so absolute
+   * rows follow text there too. A scroll region narrower than the screen
+   * moves only its own rows and is not reflected.
+   *
+   * Scrolling down (reverse index at the top margin, SD, IL) moves rows to
+   * larger indexes without renumbering, so absolute rows there keep naming
+   * screen positions, which is also where Ghostty's own tracked selection
+   * pins stay (insertLines does not move tracked pins).
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_ROWS_PRUNED = 47,
+
+  /**
+   * A value that changes whenever absolute rows stop naming the same text:
+   * full reset, erase of scrollback or of the rows above the cursor, a
+   * resize that changes the column count, a primary/alternate screen
+   * switch, and scrollback being disabled. A rows-only resize and pruning
+   * leave it unchanged. Only a change of value is meaningful.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_HISTORY_EPOCH = 48,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

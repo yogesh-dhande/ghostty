@@ -644,6 +644,25 @@ typedef struct {
   // cell's `link_index` is 1-based into this table. Populated on export only.
   size_t link_count;
   ghostty_terminal_snapshot_string_s* links;
+  // Rows ever pruned off the top of the exporting terminal's active screen, the terminal's history
+  // epoch, and the PTY bytes the stream parser had consumed when the grid was captured. The
+  // absolute row of viewport row y is history_rows_pruned + scrollbar_offset + y; a changed epoch
+  // means absolute rows were reassigned (reset, erase of scrollback, a column-changing resize, a
+  // screen switch). Populated on export only.
+  uint64_t history_rows_pruned;
+  uint64_t history_epoch;
+  uint64_t bytes_processed;
+  // The gesture's click cell (where the press landed) projected onto this frame's viewport; the
+  // row is signed and is off screen when the anchor's text is. Applied only. During a local drag
+  // the apply paints the client's projected selection (the selection fields), re-seats the click
+  // pin on this cell, and does not cancel on scroll_carry_valid == false; between drags it
+  // re-seats the click pin a shift-click extends from. An off-grid anchor seats the click pin on
+  // the visible edge so Ghostty's next resolution gets the pointer side right; the anchor side it
+  // resolves from that stand-in is not the selection's, so the client keeps its true anchor and
+  // repaints the merged selection with ghostty_mirror_set_selection.
+  bool drag_anchor_valid;
+  int32_t drag_anchor_x;
+  int32_t drag_anchor_y;
 } ghostty_terminal_snapshot_s;
 
 typedef struct {
@@ -1458,6 +1477,13 @@ typedef struct {
   bool anchor_clipped;
 } ghostty_mirror_selection_info_s;
 GHOSTTY_API void ghostty_mirror_selection_info(ghostty_mirror_t, ghostty_mirror_selection_info_s*);
+// Paints (or clears, when present is false) the mirror's selection from viewport coordinates and
+// schedules a render. A client that owns its selection repaints with it after each local mouse
+// event when its merged selection differs from what Ghostty's gesture resolved (an off-screen
+// anchor), so the mirror shows the client's selection between frames. Coordinates follow the
+// snapshot's selection fields: viewport-relative, already clipped to the grid by the client. The
+// gesture, click pin and drag carry are untouched and nothing is written to the clipboard.
+GHOSTTY_API void ghostty_mirror_set_selection(ghostty_mirror_t, bool present, bool rectangle, uint16_t start_x, uint16_t start_y, uint16_t end_x, uint16_t end_y);
 GHOSTTY_API bool ghostty_mirror_set_host(ghostty_mirror_t,
                                             const ghostty_surface_host_s*);
 GHOSTTY_API void ghostty_mirror_free(ghostty_mirror_t);

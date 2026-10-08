@@ -1875,6 +1875,12 @@ pub const CAPI = struct {
         /// True when the terminal has any mouse tracking mode enabled. Mirrors need this to make
         /// the same click-versus-selection decision the exporting terminal would make.
         mouse_reporting_active: bool = false,
+        /// Which pointer motion the program tracking the mouse wants: 0 none, 1 clicks only
+        /// (X10 or normal tracking), 2 button-event tracking (1002, motion while a button is
+        /// held), 3 any-event tracking (1003, motion with no button held too). Populated on
+        /// export only; applying a snapshot ignores it, and `mouse_reporting_active` stays the
+        /// field the import path reads.
+        mouse_tracking_level: u8 = 0,
         /// terminal.flags.mouse_shift_capture as 0 = unset, 1 = false, 2 = true.
         mouse_shift_capture: u8 = 0,
         /// True when the alternate screen is the terminal's active screen (DEC modes 1047/1049,
@@ -2227,10 +2233,14 @@ pub const CAPI = struct {
         return screen.pages.pin(.{ .active = .{ .x = clamped_x, .y = clamped_y } }).?;
     }
 
-    /// Whether the client-supplied anchor names a cell on this frame's grid.
-    fn anchorInGrid(snapshot: Snapshot) bool {
-        return snapshot.drag_anchor_x >= 0 and snapshot.drag_anchor_x < snapshot.columns and
-            snapshot.drag_anchor_y >= 0 and snapshot.drag_anchor_y < snapshot.rows;
+    /// The exported `mouse_tracking_level` for a terminal's mouse event mode.
+    fn mouseTrackingLevel(event: terminal.MouseEvent) u8 {
+        return switch (event) {
+            .none => 0,
+            .x10, .normal => 1,
+            .button => 2,
+            .any => 3,
+        };
     }
 
     /// Pins the client-supplied anchor on the painted grid, to seat the gesture's click pin.
@@ -2565,16 +2575,14 @@ pub const CAPI = struct {
                 // The committed selection's anchor, projected by the client onto this frame. The
                 // click pin a shift-click extends from must follow the anchor's text. Rebinding
                 // it to its pre-reset coordinate instead (`rebindOrResetClick`) leaves it one
-                // row off after any content movement. An anchor outside the grid has no cell to
-                // seat the pin on, so the gesture ends, as it does when a captured coordinate no
-                // longer fits.
+                // row off after any content movement. An anchor scrolled off the grid seats the
+                // pin on the stand-in corner, as the drag path does, so a shift-click after the
+                // user scrolled the anchor away still extends (the client paints the stand-in
+                // cell so Ghostty has a selection to extend) instead of starting a new one.
                 if (gesture.left_click_count > 0) {
-                    if (anchorInGrid(snapshot)) {
-                        const pin = clampedDragPin(screen, snapshot.drag_anchor_x, snapshot.drag_anchor_y, snapshot.columns, snapshot.rows);
-                        try gesture.rebindLeftClickPin(terminal_state, pin);
-                    } else {
-                        gesture.reset(terminal_state);
-                    }
+                    const rectangle = snapshot.selection_flags & SelectionFlags.present != 0 and
+                        snapshot.selection_flags & SelectionFlags.rectangle != 0;
+                    try gesture.rebindLeftClickPin(terminal_state, clientAnchorPin(screen, snapshot, rectangle));
                 }
                 return;
             }
@@ -3813,6 +3821,7 @@ pub const CAPI = struct {
             .scrollbar_total = @intCast(scrollbar.total),
             .scrollbar_offset = @intCast(scrollbar.offset),
             .mouse_reporting_active = terminal_state.flags.mouse_event != .none,
+            .mouse_tracking_level = mouseTrackingLevel(terminal_state.flags.mouse_event),
             .mouse_shift_capture = switch (terminal_state.flags.mouse_shift_capture) {
                 .null => 0,
                 .false => 1,
@@ -5794,7 +5803,7 @@ test "a committed client anchor re-seats the click pin that a shift-click extend
     try std.testing.expectEqual(@as(u32, 1), coord.y);
 }
 
-test "a committed client anchor outside the grid ends the click sequence" {
+test "a committed client anchor outside the grid seats the click pin on the stand-in corner" {
     var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
@@ -5802,9 +5811,29 @@ test "a committed client anchor outside the grid ends the click sequence" {
     var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
+    // Above the grid: the top-left corner cell.
     try testApplyFrame(&t, &gesture, &carry, testFrame(.{ .x = 2, .y = -1 }, true), false);
-    try std.testing.expectEqual(@as(u3, 0), gesture.left_click_count);
-    try std.testing.expect(gesture.validatedLeftClickPin(&t.screens) == null);
+    try std.testing.expect(gesture.left_click_count > 0);
+    var pin = gesture.validatedLeftClickPin(&t.screens).?;
+    var coord = testCoord(t.screens.active, pin.*);
+    try std.testing.expectEqual(@as(u16, 0), coord.x);
+    try std.testing.expectEqual(@as(u32, 0), coord.y);
+
+    // Below the grid: the bottom-right corner cell.
+    try testApplyFrame(&t, &gesture, &carry, testFrame(.{ .x = 2, .y = test_rows }, true), false);
+    try std.testing.expect(gesture.left_click_count > 0);
+    pin = gesture.validatedLeftClickPin(&t.screens).?;
+    coord = testCoord(t.screens.active, pin.*);
+    try std.testing.expectEqual(@as(u16, test_columns - 1), coord.x);
+    try std.testing.expectEqual(@as(u32, test_rows - 1), coord.y);
+}
+
+test "mouseTrackingLevel orders the modes by how much motion they want" {
+    try std.testing.expectEqual(@as(u8, 0), CAPI.mouseTrackingLevel(.none));
+    try std.testing.expectEqual(@as(u8, 1), CAPI.mouseTrackingLevel(.x10));
+    try std.testing.expectEqual(@as(u8, 1), CAPI.mouseTrackingLevel(.normal));
+    try std.testing.expectEqual(@as(u8, 2), CAPI.mouseTrackingLevel(.button));
+    try std.testing.expectEqual(@as(u8, 3), CAPI.mouseTrackingLevel(.any));
 }
 
 test "mirrorSelectionInfo reports the selection top-left first" {

@@ -634,6 +634,10 @@ typedef struct {
   uint32_t scrollbar_total;
   uint32_t scrollbar_offset;
   bool mouse_reporting_active;
+  // Which pointer motion the mouse-tracking program wants: 0 none, 1 clicks only (X10 or normal
+  // tracking), 2 button-event tracking (1002), 3 any-event tracking (1003). Populated on export
+  // only; applying a snapshot ignores it.
+  uint8_t mouse_tracking_level;
   uint8_t mouse_shift_capture;
   // True when the alternate screen is the terminal's active screen (DEC modes 1047/1049, which
   // full-screen programs such as less, vim, and coding agents enter). The alternate screen has no

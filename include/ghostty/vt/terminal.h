@@ -2657,6 +2657,21 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_TERMINAL_DATA_HISTORY_EPOCH = 48,
+
+  /**
+   * The mouse tracking mode in effect, which is what the mouse encoder
+   * reports against.
+   *
+   * Unlike GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, which reads the four
+   * tracking mode bits, this is the terminal's single tracking flag: the
+   * most recently enabled tracking mode, reset to none by disabling any
+   * tracking mode. Enabling 1003 then 1000 reads normal even though both
+   * mode bits are set, and enabling 1000 then 1003, then disabling 1003,
+   * reads none even though the 1000 bit is still set.
+   *
+   * Output type: GhosttyMouseTrackingMode * (see ghostty/vt/mouse/encoder.h)
+   */
+  GHOSTTY_TERMINAL_DATA_MOUSE_EVENT = 49,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

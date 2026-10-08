@@ -1715,6 +1715,7 @@ pub const TerminalData = enum(c_int) {
     saved_cursor_origin = 46,
     rows_pruned = 47,
     history_epoch = 48,
+    mouse_event = 49,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1738,6 +1739,7 @@ pub const TerminalData = enum(c_int) {
             .saved_cursor_origin,
             => bool,
             .mouse_shape => mouse.Shape,
+            .mouse_event => mouse.Event,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
@@ -1844,6 +1846,7 @@ fn getTyped(
             t.modes.get(.mouse_event_button) or
             t.modes.get(.mouse_event_any),
         .mouse_shape => out.* = t.mouse_shape,
+        .mouse_event => out.* = t.flags.mouse_event,
         .title => {
             const title = t.getTitle() orelse "";
             out.* = .{ .ptr = title.ptr, .len = title.len };
@@ -3652,6 +3655,52 @@ test "get mouse_tracking" {
     try testing.expectEqual(Result.success, set(t, .mode, @ptrCast(&config)));
     try testing.expectEqual(Result.success, get(t, .mouse_tracking, @ptrCast(&tracking)));
     try testing.expect(!tracking);
+}
+
+test "get mouse_event" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var event: mouse.Event = undefined;
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.none, event);
+
+    // Each tracking mode reads as itself.
+    const cases = [_]struct { seq: []const u8, expected: mouse.Event }{
+        .{ .seq = "\x1b[?9h", .expected = .x10 },
+        .{ .seq = "\x1b[?1000h", .expected = .normal },
+        .{ .seq = "\x1b[?1002h", .expected = .button },
+        .{ .seq = "\x1b[?1003h", .expected = .any },
+    };
+    for (cases) |case| {
+        vt_write(t, case.seq.ptr, case.seq.len);
+        try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+        try testing.expectEqual(case.expected, event);
+    }
+    vt_write(t, "\x1b[?1003l", 8);
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.none, event);
+
+    // The latest request wins even though both mode bits end up set, so the
+    // flag disagrees with `mouse_tracking`'s mode bits.
+    vt_write(t, "\x1b[?1003h", 8);
+    vt_write(t, "\x1b[?1000h", 8);
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.normal, event);
+
+    // Disabling any tracking mode resets the flag, whatever bits remain set.
+    vt_write(t, "\x1b[?1003l", 8);
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.none, event);
+    var tracking: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .mouse_tracking, @ptrCast(&tracking)));
+    try testing.expect(tracking);
 }
 
 test "get total_rows" {

@@ -2845,6 +2845,82 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyTerminalMemoryUsage *
    */
   GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
+
+  /**
+   * Column of the active screen's saved cursor (DECSC), 0-indexed. Each
+   * screen keeps its own saved cursor.
+   *
+   * Returns GHOSTTY_NO_VALUE when the active screen has no saved cursor.
+   *
+   * Output type: uint16_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SAVED_CURSOR_X = 44,
+
+  /**
+   * Row of the active screen's saved cursor (DECSC), 0-indexed, absolute
+   * (not relative to the scrolling region).
+   *
+   * Returns GHOSTTY_NO_VALUE when the active screen has no saved cursor.
+   *
+   * Output type: uint16_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SAVED_CURSOR_Y = 45,
+
+  /**
+   * Whether origin mode (DECOM) was set when the active screen's cursor was
+   * saved.
+   *
+   * Returns GHOSTTY_NO_VALUE when the active screen has no saved cursor.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_SAVED_CURSOR_ORIGIN = 46,
+
+  /**
+   * Rows ever dropped off the top of the active screen's history by
+   * automatic pruning (the scrollback limit). The absolute row of viewport
+   * row y is rows_pruned + scrollbar offset + y, and stays attached to the
+   * same text as output scrolls and prunes. Erasing scrollback, reflow and
+   * reset do not change it; GHOSTTY_TERMINAL_DATA_HISTORY_EPOCH reports
+   * those. It also counts the top row a screen without scrollback (such as
+   * the alternate screen) discards when its whole screen scrolls, so absolute
+   * rows follow text there too. A scroll region narrower than the screen
+   * moves only its own rows and is not reflected.
+   *
+   * Scrolling down (reverse index at the top margin, SD, IL) moves rows to
+   * larger indexes without renumbering, so absolute rows there keep naming
+   * screen positions, which is also where Ghostty's own tracked selection
+   * pins stay (insertLines does not move tracked pins).
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_ROWS_PRUNED = 47,
+
+  /**
+   * A value that changes whenever absolute rows stop naming the same text:
+   * full reset, erase of scrollback or of the rows above the cursor, a
+   * resize that changes the column count, a primary/alternate screen
+   * switch, and scrollback being disabled. A rows-only resize and pruning
+   * leave it unchanged. Only a change of value is meaningful.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_HISTORY_EPOCH = 48,
+
+  /**
+   * The mouse tracking mode in effect, which is what the mouse encoder
+   * reports against.
+   *
+   * Unlike GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, which reads the four
+   * tracking mode bits, this is the terminal's single tracking flag: the
+   * most recently enabled tracking mode, reset to none by disabling any
+   * tracking mode. Enabling 1003 then 1000 reads normal even though both
+   * mode bits are set, and enabling 1000 then 1003, then disabling 1003,
+   * reads none even though the 1000 bit is still set.
+   *
+   * Output type: GhosttyMouseTrackingMode * (see ghostty/vt/mouse/encoder.h)
+   */
+  GHOSTTY_TERMINAL_DATA_MOUSE_EVENT = 49,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
@@ -3101,6 +3177,117 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
     const GhosttyAllocator* allocator,
     uint8_t** out_ptr,
     size_t* out_len);
+
+/**
+ * A single pending render scroll rect, describing a viewport region that
+ * scrolled by a row/column delta since the last call to
+ * ghostty_terminal_take_render_scroll_rects().
+ *
+ * This is a sized struct. Use GHOSTTY_INIT_SIZED() to initialize it.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. Must be set to
+   *  sizeof(GhosttyTerminalScrollRect). */
+  size_t size;
+
+  /** First row of the scrolled region (0-indexed, viewport-relative). */
+  uint16_t row_start;
+
+  /** Number of rows in the scrolled region. */
+  uint16_t row_count;
+
+  /** First column of the scrolled region (0-indexed). */
+  uint16_t column_start;
+
+  /** Number of columns in the scrolled region. */
+  uint16_t column_count;
+
+  /** Row delta applied to the region (negative scrolls up, positive scrolls
+   *  down). */
+  int32_t delta_rows;
+
+  /** Column delta applied to the region (negative scrolls left, positive
+   *  scrolls right). */
+  int32_t delta_columns;
+} GhosttyTerminalScrollRect;
+
+/**
+ * Copy out and clear the terminal's pending render scroll rects.
+ *
+ * A terminal accumulates render scroll rects as viewport scroll deltas
+ * happen (e.g. scrolling text up as new lines are written). These are a
+ * render hint for consumers that want to shift already-rendered content
+ * instead of redrawing it from scratch; they are not authoritative and a
+ * consumer must still be able to render from the terminal's current state
+ * directly.
+ *
+ * This function copies up to `capacity` pending rects into `out`, in the
+ * order they were recorded, then unconditionally clears the pending buffer
+ * so the next call only reports rects recorded after this one. If `out` is
+ * NULL or `capacity` is 0, nothing is copied but the pending buffer is still
+ * cleared. If there are more pending rects than `capacity`, only the first
+ * `capacity` are copied and the rest are discarded by the clear.
+ *
+ * The terminal internally holds at most 64 pending rects; if more scroll
+ * operations accumulated than that internal buffer could track, the
+ * pending rects are discarded entirely, `overflowed` (if non-NULL) is set
+ * to true, and this returns 0. A consumer that observes overflow should
+ * treat its render state as needing a full redraw rather than an
+ * incremental scroll.
+ *
+ * @param terminal The terminal handle (may be NULL, in which case this
+ *                 is a no-op that returns 0)
+ * @param out Destination buffer for the copied rects (may be NULL)
+ * @param capacity Number of GhosttyTerminalScrollRect entries `out` can hold
+ * @param[out] overflowed Set to true if the pending rects overflowed the
+ *                        terminal's internal tracking and were discarded,
+ *                        false otherwise (may be NULL)
+ * @return The number of rects written to `out`
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API size_t ghostty_terminal_take_render_scroll_rects(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScrollRect* out,
+    size_t capacity,
+    bool* overflowed);
+
+/**
+ * Make a screen the terminal's active screen without the side effects of a
+ * mode-driven switch (no cursor copy, no erase, no cursor save/restore).
+ *
+ * This lets a caller read the inactive screen's grid, cursor and saved cursor
+ * through the ordinary active-screen getters and render state, then switch
+ * back. The caller must restore the original active screen.
+ *
+ * @param terminal The terminal handle
+ * @param screen The screen to make active
+ * @return GHOSTTY_SUCCESS, GHOSTTY_INVALID_VALUE for a NULL terminal, or
+ *         GHOSTTY_NO_VALUE when that screen has never been initialized
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_set_active_screen(
+    GhosttyTerminal terminal,
+    GhosttyTerminalScreen screen);
+
+/**
+ * Report whether a tab stop is set at a column.
+ *
+ * @param terminal The terminal handle
+ * @param column Column to query (0-indexed)
+ * @param[out] out Receives true when a tab stop is set at `column`
+ * @return GHOSTTY_SUCCESS, or GHOSTTY_INVALID_VALUE for a NULL terminal or
+ *         `out`, or a column outside the terminal's width
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_tabstop(
+    GhosttyTerminal terminal,
+    uint16_t column,
+    bool* out);
 
 /**
  * Scroll the terminal viewport.

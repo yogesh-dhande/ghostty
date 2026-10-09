@@ -62,6 +62,9 @@ typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
+typedef void* ghostty_session_t;
+typedef void* ghostty_renderer_t;
+typedef void* ghostty_mirror_t;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -505,10 +508,22 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+typedef enum {
+  GHOSTTY_SURFACE_IO_BACKEND_EXEC = 0,
+  GHOSTTY_SURFACE_IO_BACKEND_HOST_MANAGED = 1,
+} ghostty_surface_io_backend_e;
+
+typedef void (*ghostty_surface_receive_buffer_cb)(void*, const uint8_t*, size_t);
+typedef void (*ghostty_surface_receive_resize_cb)(void*, uint16_t, uint16_t, uint32_t, uint32_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
   void* userdata;
+  ghostty_surface_io_backend_e backend;
+  void* receive_userdata;
+  ghostty_surface_receive_buffer_cb receive_buffer;
+  ghostty_surface_receive_resize_cb receive_resize;
   double scale_factor;
   float font_size;
   const char* working_directory;
@@ -517,8 +532,21 @@ typedef struct {
   size_t env_var_count;
   const char* initial_input;
   bool wait_after_command;
+  bool use_login_shell;
+  bool use_login_shell_set;
   ghostty_surface_context_e context;
 } ghostty_surface_config_s;
+
+typedef struct {
+  ghostty_platform_e platform_tag;
+  ghostty_platform_u platform;
+  double scale_factor;
+} ghostty_surface_host_s;
+
+typedef struct {
+  ghostty_surface_config_s surface;
+  ghostty_surface_host_s parked_host;
+} ghostty_session_config_s;
 
 typedef struct {
   uint16_t columns;
@@ -528,6 +556,127 @@ typedef struct {
   uint32_t cell_width_px;
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
+
+typedef enum {
+  GHOSTTY_SESSION_STATE_SCREEN = 1u << 0,
+  GHOSTTY_SESSION_STATE_TITLE = 1u << 1,
+  GHOSTTY_SESSION_STATE_WORKING_DIRECTORY = 1u << 2,
+  GHOSTTY_SESSION_STATE_FOREGROUND_PROCESS = 1u << 3,
+  GHOSTTY_SESSION_STATE_SIZE = 1u << 4,
+} ghostty_session_state_flag_e;
+
+typedef uint32_t ghostty_session_state_flags_t;
+
+// The most codepoints a snapshot cell's grapheme cluster carries, base included. A cell whose
+// cluster is longer is exported as its base codepoint alone.
+#define GHOSTTY_TERMINAL_SNAPSHOT_MAX_GRAPHEME_CODEPOINTS 16
+
+typedef struct {
+  uint32_t codepoint;
+  uint32_t foreground_rgb;
+  uint32_t background_rgb;
+  uint16_t flags;
+  // The cluster's codepoints beyond `codepoint` (combining marks, ZWJ members, variation
+  // selectors, regional indicators). Zero and NULL for the overwhelming majority of cells, which
+  // hold a single codepoint. On an exported snapshot these are owned by the snapshot and released
+  // by `ghostty_terminal_snapshot_free`.
+  uint16_t grapheme_extra_len;
+  uint32_t* grapheme_extras;
+  // 1-based index of this cell's OSC 8 hyperlink target in the snapshot's `links` table; 0 when
+  // the cell carries no link. Populated on export only — applying a snapshot ignores it.
+  uint32_t link_index;
+} ghostty_terminal_snapshot_cell_s;
+
+// A borrowed run of bytes owned by a snapshot and released by `ghostty_terminal_snapshot_free`.
+typedef struct {
+  const uint8_t* ptr;
+  size_t len;
+} ghostty_terminal_snapshot_string_s;
+
+typedef struct {
+  uint16_t row_start;
+  uint16_t row_count;
+  uint16_t column_start;
+  uint16_t column_count;
+  int32_t delta_rows;
+  int32_t delta_columns;
+} ghostty_render_scroll_rect_s;
+
+typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+  uint16_t cursor_column;
+  uint16_t cursor_row;
+  bool cursor_visible;
+  uint32_t default_foreground_rgb;
+  uint32_t default_background_rgb;
+  size_t cell_count;
+  ghostty_terminal_snapshot_cell_s* cells;
+  size_t scroll_rect_count;
+  ghostty_render_scroll_rect_s* scroll_rects;
+  // True when scroll_rects fully describes content movement since the previous frame (no
+  // overflow of the exporting terminal's pending-scroll-rect ring buffer); false means a consumer
+  // cannot know how content moved. Populated on export only; applying a snapshot ignores
+  // scroll_rects, scroll_rect_count and this flag.
+  bool scroll_carry_valid;
+  // The selection a client paints onto a mirror: bit 0 present, bit 1 rectangle, bit 2
+  // extends_above, bit 3 extends_below. Applied only; export leaves it zero. Zero means paint no
+  // selection; selection_start_*/selection_end_* are meaningful only when bit 0 is set.
+  uint8_t selection_flags;
+  // The painted selection's endpoints, viewport-relative and clipped to the grid, ordered start
+  // before end. Zero when no selection is present.
+  uint16_t selection_start_x;
+  uint16_t selection_start_y;
+  uint16_t selection_end_x;
+  uint16_t selection_end_y;
+  // Total rows in the exporting terminal's screen plus scrollback, and the screen-space row index
+  // of the viewport top.
+  uint32_t scrollbar_total;
+  uint32_t scrollbar_offset;
+  bool mouse_reporting_active;
+  // Which pointer motion the mouse-tracking program wants: 0 none, 1 clicks only (X10 or normal
+  // tracking), 2 button-event tracking (1002), 3 any-event tracking (1003). Populated on export
+  // only; applying a snapshot ignores it.
+  uint8_t mouse_tracking_level;
+  uint8_t mouse_shift_capture;
+  // True when the alternate screen is the terminal's active screen (DEC modes 1047/1049, which
+  // full-screen programs such as less, vim, and coding agents enter). The alternate screen has no
+  // scrollback of its own, so a client routes a scroll gesture to the application rather than to a
+  // local viewport while this is set. Populated on export only; applying a snapshot ignores it.
+  bool alternate_screen_active;
+  // The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes. A
+  // cell's `link_index` is 1-based into this table. Populated on export only.
+  size_t link_count;
+  ghostty_terminal_snapshot_string_s* links;
+  // Rows ever pruned off the top of the exporting terminal's active screen, the terminal's history
+  // epoch, and the PTY bytes the stream parser had consumed when the grid was captured. The
+  // absolute row of viewport row y is history_rows_pruned + scrollbar_offset + y; a changed epoch
+  // means absolute rows were reassigned (reset, erase of scrollback, a column-changing resize, a
+  // screen switch). Populated on export only.
+  uint64_t history_rows_pruned;
+  uint64_t history_epoch;
+  uint64_t bytes_processed;
+  // The gesture's click cell (where the press landed) projected onto this frame's viewport; the
+  // row is signed and is off screen when the anchor's text is. Applied only. During a local drag
+  // the apply paints the client's projected selection (the selection fields) and re-seats the
+  // click pin on this cell; a drag whose frame carries no anchor is cancelled. Between drags it
+  // re-seats the click pin a shift-click extends from. An off-grid anchor seats the click pin on
+  // the visible edge so Ghostty's next resolution gets the pointer side right; the anchor side it
+  // resolves from that stand-in is not the selection's, so the client keeps its true anchor and
+  // repaints the merged selection with ghostty_mirror_set_selection.
+  bool drag_anchor_valid;
+  int32_t drag_anchor_x;
+  int32_t drag_anchor_y;
+} ghostty_terminal_snapshot_s;
+
+typedef struct {
+  uint32_t version;
+  uint64_t session_revision;
+  uint64_t owner_epoch;
+  uint16_t columns;
+  uint16_t rows;
+  ghostty_terminal_snapshot_s snapshot;
+} ghostty_render_frame_s;
 
 // Config types
 
@@ -1089,6 +1238,8 @@ typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
+typedef void (*ghostty_surface_data_cb)(void*, const uint8_t*, uintptr_t);
+typedef void (*ghostty_session_state_cb)(void*, ghostty_session_state_flags_t);
 
 typedef struct {
   void* userdata;
@@ -1190,8 +1341,16 @@ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, do
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+GHOSTTY_API bool ghostty_surface_set_host(ghostty_surface_t,
+                                             const ghostty_surface_host_s*);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_write_buffer(ghostty_surface_t,
+                                                 const uint8_t*,
+                                                 uintptr_t);
+GHOSTTY_API void ghostty_surface_process_exit(ghostty_surface_t,
+                                                 int32_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_bracketed_paste(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
@@ -1202,6 +1361,12 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_set_data_callback(ghostty_surface_t,
+                                                      ghostty_surface_data_cb,
+                                                      void*);
+GHOSTTY_API void ghostty_surface_send_input_raw(ghostty_surface_t,
+                                                   const uint8_t*,
+                                                   uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
@@ -1239,9 +1404,94 @@ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_export_snapshot(ghostty_surface_t,
+                                                    ghostty_terminal_snapshot_s*);
+
+GHOSTTY_API ghostty_session_config_s ghostty_session_config_new();
+GHOSTTY_API ghostty_session_t ghostty_session_new(ghostty_app_t,
+                                                     const ghostty_session_config_s*);
+GHOSTTY_API ghostty_session_t ghostty_session_new_headless(ghostty_app_t,
+                                                              const ghostty_session_config_s*);
+GHOSTTY_API void ghostty_session_free(ghostty_session_t);
+GHOSTTY_API ghostty_surface_t ghostty_session_surface(ghostty_session_t);
+GHOSTTY_API void ghostty_session_refresh(ghostty_session_t);
+GHOSTTY_API void ghostty_session_set_content_scale(ghostty_session_t, double, double);
+GHOSTTY_API void ghostty_session_set_focus(ghostty_session_t, bool);
+GHOSTTY_API void ghostty_session_set_occlusion(ghostty_session_t, bool);
+GHOSTTY_API void ghostty_session_set_size(ghostty_session_t, uint32_t, uint32_t);
+GHOSTTY_API void ghostty_session_set_grid_size(ghostty_session_t, uint16_t, uint16_t);
+GHOSTTY_API void ghostty_session_set_font_size(ghostty_session_t, float);
+GHOSTTY_API ghostty_surface_size_s ghostty_session_size(ghostty_session_t);
+GHOSTTY_API uint64_t ghostty_session_foreground_pid(ghostty_session_t);
+GHOSTTY_API bool ghostty_session_bracketed_paste(ghostty_session_t);
+GHOSTTY_API uint64_t ghostty_session_state_revision(ghostty_session_t);
+GHOSTTY_API ghostty_session_state_flags_t ghostty_session_take_pending_state_flags(ghostty_session_t);
+GHOSTTY_API ghostty_string_s ghostty_session_tty_name(ghostty_session_t);
+GHOSTTY_API ghostty_string_s ghostty_session_title(ghostty_session_t);
+GHOSTTY_API ghostty_string_s ghostty_session_working_directory(ghostty_session_t);
+GHOSTTY_API void ghostty_session_set_state_callback(ghostty_session_t,
+                                                       ghostty_session_state_cb,
+                                                       void*);
+GHOSTTY_API void ghostty_session_set_data_callback(ghostty_session_t,
+                                                      ghostty_surface_data_cb,
+                                                      void*);
+GHOSTTY_API void ghostty_session_process_output(ghostty_session_t,
+                                                   const uint8_t*,
+                                                   uintptr_t);
+GHOSTTY_API void ghostty_session_sync_io(ghostty_session_t);
+GHOSTTY_API void ghostty_session_send_input_raw(ghostty_session_t,
+                                                   const uint8_t*,
+                                                   uintptr_t);
+GHOSTTY_API bool ghostty_session_export_snapshot(ghostty_session_t,
+                                                    ghostty_terminal_snapshot_s*);
+GHOSTTY_API bool ghostty_session_export_render_frame(ghostty_session_t,
+                                                        ghostty_render_frame_s*);
+GHOSTTY_API void ghostty_render_frame_free(ghostty_render_frame_s*);
+
+GHOSTTY_API ghostty_mirror_t ghostty_mirror_new(ghostty_app_t,
+                                                   const ghostty_surface_host_s*,
+                                                   const ghostty_session_config_s*);
+GHOSTTY_API bool ghostty_mirror_apply_render_frame(ghostty_mirror_t,
+                                                      const ghostty_render_frame_s*);
+GHOSTTY_API bool ghostty_mirror_apply_render_frame_no_draw(ghostty_mirror_t,
+                                                              const ghostty_render_frame_s*);
+GHOSTTY_API ghostty_surface_t ghostty_mirror_surface(ghostty_mirror_t);
+// The mirror's painted selection in viewport coordinates, ordered top-left first. present is
+// false when the mirror has no selection.
+typedef struct {
+  bool present;
+  bool rectangle;
+  uint16_t start_x;
+  int32_t start_y;
+  uint16_t end_x;
+  int32_t end_y;
+} ghostty_mirror_selection_info_s;
+GHOSTTY_API void ghostty_mirror_selection_info(ghostty_mirror_t, ghostty_mirror_selection_info_s*);
+// Paints (or clears, when present is false) the mirror's selection from viewport coordinates and
+// schedules a render. A client that owns its selection repaints with it after each local mouse
+// event when its merged selection differs from what Ghostty's gesture resolved (an off-screen
+// anchor), so the mirror shows the client's selection between frames. Coordinates follow the
+// snapshot's selection fields: viewport-relative, already clipped to the grid by the client. The
+// gesture and click pin are untouched and nothing is written to the clipboard.
+GHOSTTY_API void ghostty_mirror_set_selection(ghostty_mirror_t, bool present, bool rectangle, uint16_t start_x, uint16_t start_y, uint16_t end_x, uint16_t end_y);
+GHOSTTY_API bool ghostty_mirror_set_host(ghostty_mirror_t,
+                                            const ghostty_surface_host_s*);
+GHOSTTY_API void ghostty_mirror_free(ghostty_mirror_t);
+
+GHOSTTY_API ghostty_renderer_t ghostty_renderer_new(const ghostty_surface_host_s*);
+GHOSTTY_API void ghostty_renderer_free(ghostty_renderer_t);
+GHOSTTY_API bool ghostty_renderer_attach(ghostty_renderer_t, ghostty_session_t);
+GHOSTTY_API bool ghostty_renderer_detach(ghostty_renderer_t);
+GHOSTTY_API ghostty_surface_t ghostty_renderer_surface(ghostty_renderer_t);
+GHOSTTY_API bool ghostty_renderer_set_host(ghostty_renderer_t,
+                                              const ghostty_surface_host_s*);
+GHOSTTY_API ghostty_session_t ghostty_renderer_session(ghostty_renderer_t);
+GHOSTTY_API bool ghostty_renderer_is_owner(ghostty_renderer_t);
+GHOSTTY_API void ghostty_terminal_snapshot_free(ghostty_terminal_snapshot_s*);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
+GHOSTTY_API void ghostty_session_set_display_id(ghostty_session_t, uint32_t);
 GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif

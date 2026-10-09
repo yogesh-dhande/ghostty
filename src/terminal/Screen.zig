@@ -955,6 +955,11 @@ pub fn cursorDownScroll(self: *Screen) !void {
 
     // If we have no scrollback, then we shift all our rows instead.
     if (self.no_scrollback) {
+        // The top row is discarded here instead of being pushed into
+        // history, which is the same loss as pruning for absolute row
+        // numbering.
+        self.pages.rows_pruned += 1;
+
         // If we have a single-row screen, we have no rows to shift
         // so our cursor is in the correct place we just have to clear
         // the cells.
@@ -1289,6 +1294,14 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
     assert(limit >= 1);
     assert(self.cursor.y >= limit);
     defer self.assertIntegrity();
+
+    // The cursor sits on the region bottom and the region top is
+    // `cursor.y - limit`, so the region is the whole screen exactly when
+    // `limit` is `rows - 1`. Its discarded top row counts as pruned so
+    // absolute row numbers keep following text. A narrower region shifts
+    // only its own rows, which a single counter cannot express, so a
+    // selection there stays at its screen position.
+    if (limit == self.pages.rows - 1) self.pages.rows_pruned += 1;
 
     const pin: *Pin = self.cursor.page_pin;
 
@@ -2145,7 +2158,15 @@ pub inline fn resize(
     // If we have no scrollback and we shrunk our rows, we must explicitly
     // erase our history. This is because PageList always keeps at least
     // a page size of history.
-    if (self.no_scrollback) self.pages.eraseHistory(null);
+    //
+    // The erased rows leave the top while the remaining rows keep their
+    // order, which is the same loss as pruning, so they are counted in
+    // rows_pruned to keep absolute row numbers attached to the same text.
+    if (self.no_scrollback) {
+        const total_before = self.pages.total_rows;
+        self.pages.eraseHistory(null);
+        self.pages.rows_pruned += total_before - self.pages.total_rows;
+    }
 
     // If our cursor was updated, we do a full reload so all our cursor
     // state is correct.

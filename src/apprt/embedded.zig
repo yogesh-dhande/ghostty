@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -24,6 +25,37 @@ const Config = configpkg.Config;
 const String = @import("../main_c.zig").String;
 
 const log = std.log.scoped(.embedded_window);
+
+fn sanitizeProcessExitCode(exit_code: i32) u32 {
+    return if (exit_code < 0) 1 else @intCast(exit_code);
+}
+
+fn sanitizeFontSize(points: f32) ?f32 {
+    if (!std.math.isFinite(points)) return null;
+    return std.math.clamp(points, 1.0, 255.0);
+}
+
+pub const SurfaceDataCallback = termio.Termio.DataCallback;
+pub const SurfaceReceiveBufferCallback = termio.HostManaged.ReceiveBufferCallback;
+pub const SurfaceReceiveResizeCallback = termio.HostManaged.ReceiveResizeCallback;
+pub const SessionStateCallback = *const fn (?*anyopaque, u32) callconv(.c) void;
+
+pub const SessionStateFlags = packed struct(u32) {
+    screen: bool = false,
+    title: bool = false,
+    working_directory: bool = false,
+    foreground_process: bool = false,
+    size: bool = false,
+    _padding: u27 = 0,
+
+    fn bits(self: @This()) u32 {
+        return @bitCast(self);
+    }
+
+    fn unionWith(self: @This(), other: @This()) @This() {
+        return @bitCast(self.bits() | other.bits());
+    }
+};
 
 pub const resourcesDir = internal_os.resourcesDir;
 
@@ -274,14 +306,15 @@ pub const App = struct {
         _ = self;
     }
 
-    /// Create a new surface for the app.
-    fn newSurface(self: *App, opts: Surface.Options) !*Surface {
+    /// Create a new surface for the app. A headless surface has no windowing
+    /// system view and no renderer; see `Surface.headless`.
+    fn newSurface(self: *App, opts: Surface.Options, headless: bool) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(self, opts);
+        try surface.init(self, opts, headless);
         errdefer surface.deinit();
 
         return surface;
@@ -338,6 +371,17 @@ pub const App = struct {
                     const alloc = self.core_app.alloc;
                     if (surface.rt_surface.title) |v| alloc.free(v);
                     surface.rt_surface.title = alloc.dupeZ(u8, value.title) catch null;
+                    surface.rt_surface.notifyOwnerSessionStateChange(.{ .title = true });
+                },
+            },
+
+            .pwd => switch (target) {
+                .app => {},
+                .surface => |surface| {
+                    const alloc = self.core_app.alloc;
+                    if (surface.rt_surface.working_directory) |v| alloc.free(v);
+                    surface.rt_surface.working_directory = alloc.dupeZ(u8, value.pwd) catch null;
+                    surface.rt_surface.notifyOwnerSessionStateChange(.{ .working_directory = true });
                 },
             },
 
@@ -444,10 +488,48 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+pub const SurfaceHost = extern struct {
+    platform_tag: c_int = 0,
+    platform: Platform.C = undefined,
+    scale_factor: f64 = 1,
+
+    pub fn isValid(self: SurfaceHost) bool {
+        _ = std.enums.fromInt(PlatformTag, self.platform_tag) orelse return false;
+        return true;
+    }
+
+    pub fn eql(self: SurfaceHost, other: SurfaceHost) bool {
+        if (self.platform_tag != other.platform_tag) return false;
+        if (self.scale_factor != other.scale_factor) return false;
+        const tag = std.enums.fromInt(PlatformTag, self.platform_tag) orelse return false;
+        return switch (tag) {
+            .macos => self.platform.macos.nsview == other.platform.macos.nsview,
+            .ios => self.platform.ios.uiview == other.platform.ios.uiview,
+        };
+    }
+};
+
+pub const SurfaceIOBackend = enum(c_int) {
+    exec = 0,
+    host_managed = 1,
+};
+
 pub const Surface = struct {
     app: *App,
-    platform: Platform,
+
+    /// The windowing system view this surface renders into. Null for a
+    /// headless surface, which has no view and no renderer to use one.
+    platform: ?Platform,
+
+    /// True when this surface hosts terminal state with no renderer at all.
+    /// See `Surface.headless` in the core surface.
+    headless: bool,
+
     userdata: ?*anyopaque = null,
+    io_backend: SurfaceIOBackend = .exec,
+    receive_userdata: ?*anyopaque = null,
+    receive_buffer: ?SurfaceReceiveBufferCallback = null,
+    receive_resize: ?SurfaceReceiveResizeCallback = null,
     core_surface: CoreSurface,
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
@@ -457,6 +539,11 @@ pub const Surface = struct {
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
+    working_directory: ?[:0]const u8 = null,
+    data_callback: ?SurfaceDataCallback = null,
+    data_callback_userdata: ?*anyopaque = null,
+    session_state_callback: ?SessionStateCallback = null,
+    session_state_userdata: ?*anyopaque = null,
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -467,6 +554,18 @@ pub const Surface = struct {
 
         /// Userdata passed to some of the callbacks.
         userdata: ?*anyopaque = null,
+
+        /// The IO backend for this embedded surface.
+        backend: SurfaceIOBackend = .exec,
+
+        /// Userdata passed to host-managed IO callbacks.
+        receive_userdata: ?*anyopaque = null,
+
+        /// Called when Ghostty wants to send input bytes to the host-owned PTY.
+        receive_buffer: ?SurfaceReceiveBufferCallback = null,
+
+        /// Called when Ghostty's terminal grid size changes.
+        receive_resize: ?SurfaceReceiveResizeCallback = null,
 
         /// The scale factor of the screen.
         scale_factor: f64 = 1,
@@ -497,15 +596,29 @@ pub const Surface = struct {
         /// Wait after the command exits
         wait_after_command: bool = false,
 
+        /// Whether command execution should use the macOS login shell wrapper.
+        use_login_shell: bool = false,
+
+        /// True when use_login_shell should override the app configuration.
+        use_login_shell_set: bool = false,
+
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
     };
 
-    pub fn init(self: *Surface, app: *App, opts: Options) !void {
+    pub fn init(self: *Surface, app: *App, opts: Options, headless: bool) !void {
         self.* = .{
             .app = app,
-            .platform = try .init(opts.platform_tag, opts.platform),
+            .platform = if (headless) null else try Platform.init(
+                opts.platform_tag,
+                opts.platform,
+            ),
+            .headless = headless,
             .userdata = opts.userdata,
+            .io_backend = opts.backend,
+            .receive_userdata = opts.receive_userdata,
+            .receive_buffer = opts.receive_buffer,
+            .receive_resize = opts.receive_resize,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -555,6 +668,9 @@ pub const Surface = struct {
                 var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
                 if (wd_val.finalize(config.arenaAlloc())) |_| {
                     config.@"working-directory" = wd_val;
+                    if (wd_val.value()) |path| {
+                        self.working_directory = app.core_app.alloc.dupeZ(u8, path) catch null;
+                    }
                 } else |err| {
                     log.warn(
                         "error finalizing working directory config dir={s} err={}",
@@ -568,7 +684,9 @@ pub const Surface = struct {
         if (opts.command) |c_command| {
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
-                config.command = .{ .shell = cmd };
+                var command: configpkg.Command = undefined;
+                try command.parseCLI(config.arenaAlloc(), cmd);
+                config.command = command;
                 config.@"wait-after-command" = true;
             }
         }
@@ -611,6 +729,9 @@ pub const Surface = struct {
         if (opts.wait_after_command) {
             config.@"wait-after-command" = true;
         }
+        if (opts.use_login_shell_set) {
+            config.@"macos-use-login-shell" = opts.use_login_shell;
+        }
 
         // Initialize our surface right away. We're given a view that is
         // ready to use.
@@ -625,9 +746,11 @@ pub const Surface = struct {
 
         // If our options requested a specific font-size, set that.
         if (opts.font_size != 0) {
-            var font_size = self.core_surface.font_size;
-            font_size.points = opts.font_size;
-            try self.core_surface.setFontSize(font_size);
+            if (sanitizeFontSize(opts.font_size)) |points| {
+                var font_size = self.core_surface.font_size;
+                font_size.points = points;
+                try self.core_surface.setFontSize(font_size);
+            }
         }
     }
 
@@ -637,6 +760,7 @@ pub const Surface = struct {
 
         // Free our title
         if (self.title) |v| self.app.core_app.alloc.free(v);
+        if (self.working_directory) |v| self.app.core_app.alloc.free(v);
 
         // Remove ourselves from the list of known surfaces in the app.
         self.app.core_app.deleteSurface(self);
@@ -684,6 +808,11 @@ pub const Surface = struct {
         func(self.userdata, process_alive);
     }
 
+    /// Read by the core surface to decide whether to build a renderer.
+    pub fn isHeadless(self: *const Surface) bool {
+        return self.headless;
+    }
+
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
         return self.content_scale;
     }
@@ -694,6 +823,29 @@ pub const Surface = struct {
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
         return self.title;
+    }
+
+    pub fn getWorkingDirectory(self: *Surface) ?[:0]const u8 {
+        return self.working_directory;
+    }
+
+    fn notifyOwnerSessionStateChange(self: *Surface, flags: SessionStateFlags) void {
+        const callback = self.session_state_callback orelse return;
+        callback(self.session_state_userdata, flags.bits());
+    }
+
+    fn setSessionStateCallback(
+        self: *Surface,
+        callback: ?SessionStateCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        self.session_state_callback = callback;
+        self.session_state_userdata = userdata;
+        self.core_surface.setScreenChangeNotificationsEnabled(callback != null);
+    }
+
+    pub fn notifyOwnerSessionScreenChange(self: *Surface) void {
+        self.notifyOwnerSessionStateChange(.{ .screen = true });
     }
 
     pub fn supportsClipboard(
@@ -1040,6 +1192,29 @@ pub const Surface = struct {
         };
     }
 
+    pub fn setHost(self: *Surface, host: SurfaceHost) !void {
+        // A headless surface has no renderer to rebind onto a host view.
+        if (self.headless) return error.SurfaceIsHeadless;
+
+        const scale_factor = @max(1, if (std.math.isNan(host.scale_factor)) 1 else host.scale_factor);
+        const platform = try Platform.init(host.platform_tag, host.platform);
+        const old_platform = self.platform;
+        const old_content_scale = self.content_scale;
+
+        self.platform = platform;
+        self.content_scale = .{
+            .x = @floatCast(scale_factor),
+            .y = @floatCast(scale_factor),
+        };
+        errdefer {
+            self.platform = old_platform;
+            self.content_scale = old_content_scale;
+        }
+
+        try self.core_surface.rebindRendererHost(self);
+        self.updateContentScale(scale_factor, scale_factor);
+    }
+
     pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) void {
         self.core_surface.colorSchemeCallback(scheme) catch |err| {
             log.err("error setting color scheme err={}", .{err});
@@ -1099,6 +1274,10 @@ pub const Surface = struct {
             );
             return;
         };
+
+        // Modifier state must be refreshed even when the position is later
+        // deduplicated so subsequent mouse events use the current modifiers.
+        self.core_surface.modsChanged(mods);
 
         // There are cases where the platform reports a mouse motion event
         // without the cursor actually moving. For example, on macOS, updating
@@ -1207,6 +1386,19 @@ pub const Surface = struct {
         }
 
         return env;
+    }
+
+    pub fn hostManagedTermioConfig(self: *const Surface) ?termio.HostManaged.Config {
+        if (self.io_backend != .host_managed) return null;
+        return .{
+            .userdata = self.receive_userdata,
+            .receive_buffer = self.receive_buffer,
+            .receive_resize = self.receive_resize,
+        };
+    }
+
+    pub fn termioBackend(self: *const Surface) SurfaceIOBackend {
+        return self.io_backend;
     }
 
     /// The cursor position from the host directly is in screen coordinates but
@@ -1570,6 +1762,1144 @@ pub const CAPI = struct {
         }
     };
 
+    const SnapshotFlags = struct {
+        const bold: u16 = 1 << 0;
+        const italic: u16 = 1 << 1;
+        const faint: u16 = 1 << 2;
+        const inverse: u16 = 1 << 4;
+        const invisible: u16 = 1 << 5;
+        const strikethrough: u16 = 1 << 6;
+        const underline: u16 = 1 << 7;
+        const spacer: u16 = 1 << 10;
+        const row_wrap: u16 = 1 << 11;
+        const row_wrap_continuation: u16 = 1 << 12;
+    };
+
+    /// Bit values for `Snapshot.selection_flags`. Kept in sync with the identically named bits
+    /// documented on `ghostty_terminal_snapshot_s` in include/ghostty.h.
+    const SelectionFlags = struct {
+        const present: u8 = 1 << 0;
+        const rectangle: u8 = 1 << 1;
+        const extends_above: u8 = 1 << 2;
+        const extends_below: u8 = 1 << 3;
+    };
+
+    const SessionConfig = extern struct {
+        surface: Surface.Options = .{},
+        parked_host: SurfaceHost = .{},
+    };
+
+    /// The most codepoints a snapshot cell's grapheme cluster carries, base included. A cell whose
+    /// cluster is longer (combining-mark spam, which no legitimate glyph needs) exports as its base
+    /// codepoint alone, which bounds both the per-cell copy the export makes and the work the apply
+    /// path does per cell.
+    const snapshot_max_grapheme_codepoints = 16;
+
+    const SnapshotCell = extern struct {
+        codepoint: u32 = 0,
+        foreground_rgb: u32 = 0,
+        background_rgb: u32 = 0,
+        flags: u16 = 0,
+        /// The cluster's codepoints beyond `codepoint` (combining marks, ZWJ members, variation
+        /// selectors, regional indicators). Zero and null for the overwhelming majority of cells,
+        /// which hold a single codepoint. Owned by the Snapshot and released by its deinit.
+        grapheme_extra_len: u16 = 0,
+        grapheme_extras: ?[*]u32 = null,
+
+        /// The 1-based index of this cell's OSC 8 hyperlink target in the snapshot's link table;
+        /// zero when the cell carries no link. Export-only: `applySnapshotToSurface` ignores it.
+        link_index: u32 = 0,
+
+        /// The cell's cluster codepoints beyond the base, clamped to the documented cap. Both the
+        /// capacity pass and the write pass of `applySnapshotToSurface` read the extras through
+        /// here so they cannot disagree about how much a cell contributes.
+        fn graphemeExtras(self: SnapshotCell) []const u32 {
+            const ptr = self.grapheme_extras orelse return &.{};
+            const len = @min(self.grapheme_extra_len, snapshot_max_grapheme_codepoints - 1);
+            return ptr[0..len];
+        }
+    };
+
+    /// A borrowed run of bytes in a snapshot. Owned by the Snapshot and released by its deinit.
+    const SnapshotString = extern struct {
+        ptr: ?[*]const u8 = null,
+        len: usize = 0,
+    };
+
+    const SnapshotScrollRect = extern struct {
+        row_start: u16 = 0,
+        row_count: u16 = 0,
+        column_start: u16 = 0,
+        column_count: u16 = 0,
+        delta_rows: i32 = 0,
+        delta_columns: i32 = 0,
+    };
+
+    const Snapshot = extern struct {
+        columns: u16 = 0,
+        rows: u16 = 0,
+        cursor_column: u16 = 0,
+        cursor_row: u16 = 0,
+        cursor_visible: bool = false,
+        default_foreground_rgb: u32 = 0,
+        default_background_rgb: u32 = 0,
+        cell_count: usize = 0,
+        cells: ?[*]SnapshotCell = null,
+        scroll_rect_count: usize = 0,
+        scroll_rects: ?[*]SnapshotScrollRect = null,
+        /// True when `scroll_rects` fully describes content movement since the previous frame (no
+        /// overflow of the exporting terminal's pending-scroll-rect ring buffer); false means a
+        /// consumer cannot know how content moved. Populated on export only; applying a snapshot
+        /// ignores `scroll_rects`, `scroll_rect_count` and this flag.
+        scroll_carry_valid: bool = false,
+        /// The selection a client paints onto a mirror, as bits from `SelectionFlags`. Applied
+        /// only; export leaves it zero. Zero (no bit set) means paint no selection;
+        /// `selection_start_*`/`selection_end_*` are meaningful only when `SelectionFlags.present`
+        /// is set.
+        selection_flags: u8 = 0,
+        /// The painted selection's endpoints, viewport-relative and clipped to the grid, ordered
+        /// start before end. Zero when no selection is present.
+        selection_start_x: u16 = 0,
+        selection_start_y: u16 = 0,
+        selection_end_x: u16 = 0,
+        selection_end_y: u16 = 0,
+        /// Total rows in the exporting terminal's screen plus scrollback, and the screen-space row
+        /// index of the viewport top. Same semantics as `PageList.scrollbar()`.
+        scrollbar_total: u32 = 0,
+        scrollbar_offset: u32 = 0,
+        /// True when the terminal has any mouse tracking mode enabled. Mirrors need this to make
+        /// the same click-versus-selection decision the exporting terminal would make.
+        mouse_reporting_active: bool = false,
+        /// Which pointer motion the program tracking the mouse wants: 0 none, 1 clicks only
+        /// (X10 or normal tracking), 2 button-event tracking (1002, motion while a button is
+        /// held), 3 any-event tracking (1003, motion with no button held too). Populated on
+        /// export only; applying a snapshot ignores it, and `mouse_reporting_active` stays the
+        /// field the import path reads.
+        mouse_tracking_level: u8 = 0,
+        /// terminal.flags.mouse_shift_capture as 0 = unset, 1 = false, 2 = true.
+        mouse_shift_capture: u8 = 0,
+        /// True when the alternate screen is the terminal's active screen (DEC modes 1047/1049,
+        /// which full-screen programs such as less, vim, and coding agents enter). The alternate
+        /// screen has no scrollback of its own, so a client routes a scroll gesture to the
+        /// application rather than to a local viewport while this is set. Exported alongside the
+        /// rest of the frame under one renderer-state lock, so it always describes the screen the
+        /// exported cells came from. Populated on export only; applying a snapshot ignores it,
+        /// since a mirror paints cells rather than switching screens of its own.
+        alternate_screen_active: bool = false,
+        /// The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes.
+        /// A cell's `link_index` is 1-based into this table. Populated on export only.
+        link_count: usize = 0,
+        links: ?[*]SnapshotString = null,
+        /// Rows ever pruned off the top of the exporting terminal's active screen
+        /// (`PageList.rows_pruned`), the terminal's `history_epoch`, and the PTY bytes the stream
+        /// parser had consumed (`Termio.bytes_processed`) when the grid was captured, all read
+        /// under the same renderer-state lock as the cells. With `scrollbar_offset` they give
+        /// every viewport row an absolute number, `history_rows_pruned + scrollbar_offset + y`,
+        /// that a client can hold a selection in; a changed `history_epoch` says those numbers
+        /// were reassigned. Populated on export only.
+        history_rows_pruned: u64 = 0,
+        history_epoch: u64 = 0,
+        bytes_processed: u64 = 0,
+        /// The gesture's click cell (the cell the press landed on) projected onto THIS frame's
+        /// viewport, set by a client that owns its selection and projects it onto each frame.
+        /// The row is signed: it is off screen when the anchor's text is. Applied only; export
+        /// never fills it.
+        ///
+        /// While a local drag is in progress the apply paints the client's projected selection
+        /// (the frame's selection fields) and re-seats the click pin on this cell; a drag
+        /// whose frame carries no anchor is cancelled. Between drags it re-seats the click pin
+        /// a later shift-click extends from.
+        ///
+        /// An off-grid anchor seats the click pin on the visible edge so Ghostty's next
+        /// resolution gets the pointer side right; the anchor side it resolves from that
+        /// stand-in is not the selection's, so the client keeps its true anchor and repaints
+        /// the merged selection with `ghostty_mirror_set_selection`.
+        drag_anchor_valid: bool = false,
+        drag_anchor_x: i32 = 0,
+        drag_anchor_y: i32 = 0,
+
+        pub fn deinit(self: *Snapshot) void {
+            if (self.cells) |ptr| {
+                const cells = ptr[0..self.cell_count];
+                freeSnapshotCellGraphemes(cells);
+                global.alloc().free(cells);
+                self.cells = null;
+            }
+            self.cell_count = 0;
+            if (self.scroll_rects) |ptr| {
+                global.alloc().free(ptr[0..self.scroll_rect_count]);
+                self.scroll_rects = null;
+            }
+            self.scroll_rect_count = 0;
+            if (self.links) |ptr| {
+                const links = ptr[0..self.link_count];
+                freeSnapshotLinkStrings(links);
+                global.alloc().free(links);
+                self.links = null;
+            }
+            self.link_count = 0;
+        }
+    };
+
+    const RenderFrame = extern struct {
+        version: u32 = 1,
+        session_revision: u64 = 0,
+        owner_epoch: u64 = 0,
+        columns: u16 = 0,
+        rows: u16 = 0,
+        snapshot: Snapshot = .{},
+
+        pub fn deinit(self: *RenderFrame) void {
+            self.snapshot.deinit();
+            self.columns = 0;
+            self.rows = 0;
+        }
+    };
+
+    /// Releases the grapheme extras every cell in the slice owns. Snapshot teardown and the export
+    /// path's failure exit both go through this, so a partially filled cell buffer cannot leak the
+    /// clusters already copied into it.
+    fn freeSnapshotCellGraphemes(cells: []SnapshotCell) void {
+        for (cells) |cell| {
+            const ptr = cell.grapheme_extras orelse continue;
+            global.alloc().free(ptr[0..cell.grapheme_extra_len]);
+        }
+    }
+
+    /// Releases the URI bytes every entry in a snapshot's link table owns, leaving the table itself
+    /// to the caller. Snapshot teardown and the export path's failure exit both go through this.
+    fn freeSnapshotLinkStrings(links: []const SnapshotString) void {
+        for (links) |link| {
+            const ptr = link.ptr orelse continue;
+            global.alloc().free(ptr[0..link.len]);
+        }
+    }
+
+    /// Releases everything a half-built snapshot export owns: the clusters of the `written` cells
+    /// already filled in, the cell buffer itself, and the link table accumulated so far. The export
+    /// returns a bool rather than an error union, so its failure exits unwind through here instead
+    /// of through `errdefer`.
+    fn abortSnapshotExport(
+        cells: []SnapshotCell,
+        written: usize,
+        links: *std.ArrayListUnmanaged(SnapshotString),
+    ) void {
+        freeSnapshotCellGraphemes(cells[0..written]);
+        if (cells.len > 0) global.alloc().free(cells);
+        freeSnapshotLinkStrings(links.items);
+        links.deinit(global.alloc());
+    }
+
+    /// The 1-based index of `uri` in a snapshot's link table, appending a copy of it when this is
+    /// the first cell to reference it. Deduplication is by URI bytes rather than by hyperlink id
+    /// because ids are page-local: the same link on two pages of one viewport has two ids, and two
+    /// unrelated links on different pages can share one.
+    fn snapshotLinkIndex(
+        links: *std.ArrayListUnmanaged(SnapshotString),
+        uri: []const u8,
+    ) !u32 {
+        for (links.items, 0..) |link, index| {
+            const existing = link.ptr orelse continue;
+            if (std.mem.eql(u8, existing[0..link.len], uri)) return @intCast(index + 1);
+        }
+        const copied = try global.alloc().dupe(u8, uri);
+        errdefer global.alloc().free(copied);
+        try links.append(global.alloc(), .{ .ptr = copied.ptr, .len = copied.len });
+        return @intCast(links.items.len);
+    }
+
+    fn unpackRGB(rgb: u32) terminal.color.RGB {
+        return .{
+            .r = @intCast((rgb >> 16) & 0xFF),
+            .g = @intCast((rgb >> 8) & 0xFF),
+            .b = @intCast(rgb & 0xFF),
+        };
+    }
+
+    fn styleForSnapshotCell(cell: SnapshotCell, snapshot: Snapshot) terminal.Style {
+        var result: terminal.Style = .{};
+        const foreground = unpackRGB(cell.foreground_rgb);
+        const background = unpackRGB(cell.background_rgb);
+        if (!foreground.eql(unpackRGB(snapshot.default_foreground_rgb))) {
+            result.fg_color = .{ .rgb = foreground };
+        }
+        if (!background.eql(unpackRGB(snapshot.default_background_rgb))) {
+            result.bg_color = .{ .rgb = background };
+        }
+        result.flags.bold = (cell.flags & SnapshotFlags.bold) != 0;
+        result.flags.italic = (cell.flags & SnapshotFlags.italic) != 0;
+        result.flags.faint = (cell.flags & SnapshotFlags.faint) != 0;
+        result.flags.inverse = (cell.flags & SnapshotFlags.inverse) != 0;
+        result.flags.invisible = (cell.flags & SnapshotFlags.invisible) != 0;
+        result.flags.strikethrough = (cell.flags & SnapshotFlags.strikethrough) != 0;
+        result.flags.underline = if ((cell.flags & SnapshotFlags.underline) != 0) .single else .none;
+        return result;
+    }
+
+    fn cellForSnapshotCell(cell: SnapshotCell) terminal.Cell {
+        if (cell.codepoint == 0) return .{};
+        var result = terminal.Cell.init(@intCast(cell.codepoint));
+        if ((cell.flags & SnapshotFlags.spacer) != 0) {
+            result.wide = .spacer_tail;
+        }
+        return result;
+    }
+
+    /// Writes a snapshot cell's cluster codepoints onto the cell just written, so a mirror renders
+    /// the whole grapheme rather than its base scalar.
+    ///
+    /// This uses `setGraphemes` (one exact allocation) rather than repeated `appendGrapheme` calls:
+    /// appending grows the cell's grapheme slice in place, which both holds the old and the new
+    /// allocation live at once and leaves the page's bitmap allocator fragmented, so a page sized
+    /// for exactly what the frame holds could still fail. `applySnapshotToSurface` sizes the page's
+    /// grapheme capacity for the sum of these exact allocations before writing any cell.
+    fn writeSnapshotCellGraphemes(
+        page: *terminal.Page,
+        row: *terminal.page.Row,
+        dst: *terminal.Cell,
+        cell: SnapshotCell,
+    ) !void {
+        const extras = cell.graphemeExtras();
+        if (extras.len == 0) return;
+
+        var cps: [snapshot_max_grapheme_codepoints - 1]u21 = undefined;
+        var len: usize = 0;
+        for (extras) |cp| {
+            // These arrive across a C ABI, so a value outside the Unicode range is representable
+            // here in a way it never is for terminal-internal data. It has no glyph and does not
+            // fit a u21, so the cluster ends there and the cell keeps what came before it.
+            if (cp > 0x10FFFF) break;
+            cps[len] = @intCast(cp);
+            len += 1;
+        }
+        if (len == 0) return;
+        try page.setGraphemes(row, dst, cps[0..len]);
+    }
+
+    fn writeSnapshotCell(
+        screen: *terminal.Screen,
+        page: *terminal.Page,
+        row: *terminal.page.Row,
+        dst: *terminal.Cell,
+        cell: SnapshotCell,
+        snapshot: Snapshot,
+    ) !void {
+        var next_cell = cellForSnapshotCell(cell);
+        const next_style = styleForSnapshotCell(cell, snapshot);
+        if (!next_style.default()) {
+            // Distinct errors let the caller grow style capacity only for a full style set, never
+            // for the OutOfMemory a grapheme write can also return.
+            const style_id = page.styles.add(page.memory, next_style) catch |err| switch (err) {
+                error.OutOfMemory => return error.StyleCapacityExhausted,
+                error.NeedsRehash => return error.StyleSetNeedsRehash,
+            };
+            next_cell.style_id = style_id;
+            row.styled = true;
+        }
+        if (next_cell.codepoint() != 0 or !next_style.default()) {
+            dst.* = next_cell;
+            if (next_cell.codepoint() != 0) try writeSnapshotCellGraphemes(page, row, dst, cell);
+        } else if (!unpackRGB(cell.background_rgb).eql(unpackRGB(snapshot.default_background_rgb))) {
+            dst.* = .{
+                .content_tag = .bg_color_rgb,
+                .content = .{ .color_rgb = .{
+                    .r = @intCast((cell.background_rgb >> 16) & 0xFF),
+                    .g = @intCast((cell.background_rgb >> 8) & 0xFF),
+                    .b = @intCast(cell.background_rgb & 0xFF),
+                } },
+            };
+        }
+        row.dirty = true;
+        screen.dirty.selection = true;
+    }
+
+    /// Rewrites every row of the active page from `frame_cells`. Holds page, row, and cell pointers
+    /// for its whole run, so the caller must not grow `node`'s page except by abandoning this pass.
+    fn writeSnapshotGrid(
+        screen: *terminal.Screen,
+        node: *terminal.PageList.List.Node,
+        snapshot: Snapshot,
+        frame_cells: []const SnapshotCell,
+    ) !void {
+        const page = node.page();
+        const grid_rows = page.rows.ptr(page.memory)[0..snapshot.rows];
+
+        for (grid_rows, 0..) |*row, row_index| {
+            const cells = row.cells.ptr(page.memory)[0..snapshot.columns];
+            screen.clearCells(page, row, cells);
+            row.* = .{ .cells = row.cells, .dirty = true };
+            const frame_row = frame_cells[row_index * snapshot.columns .. (row_index + 1) * snapshot.columns];
+            if (frame_row.len > 0) {
+                const row_flags = frame_row[0].flags;
+                row.wrap = (row_flags & SnapshotFlags.row_wrap) != 0;
+                row.wrap_continuation = (row_flags & SnapshotFlags.row_wrap_continuation) != 0;
+            }
+            for (cells, frame_row) |*dst, frame_cell| {
+                try writeSnapshotCell(screen, page, row, dst, frame_cell, snapshot);
+            }
+        }
+    }
+
+    /// Clamps a (possibly virtual: negative, or beyond the grid) coordinate into `[0, columns) x
+    /// [0, rows)` and pins it on the just-painted grid. `columns`/`rows` describe that grid, so
+    /// the lookup cannot fail and callers do not need to handle a null case.
+    fn clampedDragPin(
+        screen: *terminal.Screen,
+        x: i32,
+        y: i32,
+        columns: u16,
+        rows: u16,
+    ) terminal.Pin {
+        const clamped_x: terminal.size.CellCountInt = if (x < 0)
+            0
+        else
+            @intCast(@min(x, @as(i32, columns) - 1));
+        const clamped_y: u32 = if (y < 0)
+            0
+        else
+            @intCast(@min(y, @as(i32, rows) - 1));
+        return screen.pages.pin(.{ .active = .{ .x = clamped_x, .y = clamped_y } }).?;
+    }
+
+    /// The exported `mouse_tracking_level` for a terminal's mouse event mode.
+    fn mouseTrackingLevel(event: terminal.MouseEvent) u8 {
+        return switch (event) {
+            .none => 0,
+            .x10, .normal => 1,
+            .button => 2,
+            .any => 3,
+        };
+    }
+
+    /// Pins the client-supplied anchor on the painted grid, to seat the gesture's click pin.
+    /// The painted selection comes from the client's projection, not from this pin.
+    ///
+    /// An anchor whose text is above (below) the viewport seats the pin on the top-left
+    /// (bottom-right) corner cell, so Ghostty's next resolution gets the pointer side right.
+    /// The anchor side it resolves from that stand-in is not the selection's (the cell
+    /// half-cell rule, line whitespace trimming and word boundaries all read the stand-in), so
+    /// the client keeps its true anchor and repaints the merged selection with
+    /// `ghostty_mirror_set_selection`. Clamping only the row would keep the anchor's column
+    /// and leave the first visible row partly unselected. A rectangle keeps its column, since
+    /// the column is the rectangle's edge.
+    ///
+    /// A cell drag whose pointer is inside the stand-in cell itself is resolved with the
+    /// press's own within-cell offset, so it can resolve to no selection and clear the
+    /// mirror's. The client keeps its last merged selection for such a move; the next move
+    /// out of that cell resolves normally. Rewriting the gesture's press offset to the
+    /// stand-in's edge would avoid it but has to be undone exactly when the anchor returns,
+    /// which needs gesture identity Ghostty does not expose; a move inside one corner cell
+    /// while the anchor is off screen is rare and corrects itself.
+    fn clientAnchorPin(screen: *terminal.Screen, snapshot: Snapshot, rectangle: bool) terminal.Pin {
+        const x = snapshot.drag_anchor_x;
+        const y = snapshot.drag_anchor_y;
+        if (!rectangle) {
+            if (y < 0) return clampedDragPin(screen, 0, 0, snapshot.columns, snapshot.rows);
+            if (y >= snapshot.rows) return clampedDragPin(
+                screen,
+                snapshot.columns - 1,
+                snapshot.rows - 1,
+                snapshot.columns,
+                snapshot.rows,
+            );
+        }
+        return clampedDragPin(screen, x, y, snapshot.columns, snapshot.rows);
+    }
+
+    /// Reads the coordinate of the gesture's tracked click pin before the grid-wiping reset, for
+    /// re-anchoring afterward. Read through `validatedLeftClickPin` so
+    /// a pin belonging to a screen the gesture no longer owns is never resurrected on this one.
+    fn captureClickCoordinate(surface: *Surface, terminal_state: *terminal.Terminal) ?terminal.point.Coordinate {
+        const gesture = &surface.core_surface.mouse.selection_gesture;
+        if (gesture.left_click_count == 0) return null;
+        const pin = gesture.validatedLeftClickPin(&terminal_state.screens) orelse return null;
+        const screen = terminal_state.screens.active;
+        const pt = screen.pages.pointFromPin(.active, pin.*) orelse return null;
+        return pt.coord();
+    }
+
+    /// Re-anchors the gesture's tracked click pin at a coordinate captured before the destructive
+    /// grid reset, or ends the gesture if that coordinate no longer fits the grid this frame
+    /// painted (or was never captured at all). Used whenever the frame carries no client anchor
+    /// and no drag is in progress: a lingering multi-click still needs a valid pin for the next
+    /// click to compare against.
+    fn rebindOrResetClick(
+        gesture: *terminal.SelectionGesture,
+        terminal_state: *terminal.Terminal,
+        screen: *terminal.Screen,
+        coord: ?terminal.point.Coordinate,
+    ) !void {
+        if (coord) |c| {
+            if (screen.pages.pin(.{ .active = c })) |pin| {
+                try gesture.rebindLeftClickPin(terminal_state, pin);
+                return;
+            }
+        }
+        if (gesture.left_click_count > 0) gesture.reset(terminal_state);
+    }
+
+    /// Paints the mirror's selection from a snapshot's viewport-relative fields, or clears it when
+    /// the snapshot carries none. Goes through `Screen.select`/`clearSelection`, the same plain
+    /// mutation path local selection changes that must not copy to the clipboard use, so applying
+    /// a frame never triggers a clipboard write (only the mouse release path does that, via
+    /// `Surface.setSelectionAndCopy`, which this never calls).
+    fn applyMirrorSelectionFromSnapshot(screen: *terminal.Screen, snapshot: Snapshot) !void {
+        try paintMirrorSelection(
+            screen,
+            snapshot.selection_flags & SelectionFlags.present != 0,
+            snapshot.selection_flags & SelectionFlags.rectangle != 0,
+            .{ .x = snapshot.selection_start_x, .y = snapshot.selection_start_y },
+            .{ .x = snapshot.selection_end_x, .y = snapshot.selection_end_y },
+        );
+    }
+
+    /// A viewport cell coordinate, as the snapshot's selection fields and
+    /// `ghostty_mirror_set_selection` carry it.
+    const MirrorSelectionPoint = struct { x: u16, y: u16 };
+
+    /// Paints (or clears, when `present` is false) the screen's selection from viewport
+    /// coordinates already clipped to the grid. Shared by frame apply and
+    /// `ghostty_mirror_set_selection`. It touches only the selection: never the gesture, the
+    /// click pin, and never the clipboard.
+    fn paintMirrorSelection(
+        screen: *terminal.Screen,
+        present: bool,
+        rectangle: bool,
+        start_point: MirrorSelectionPoint,
+        end_point: MirrorSelectionPoint,
+    ) !void {
+        if (!present) {
+            screen.clearSelection();
+            return;
+        }
+
+        const start = screen.pages.pin(.{ .active = .{
+            .x = start_point.x,
+            .y = start_point.y,
+        } }) orelse {
+            screen.clearSelection();
+            return;
+        };
+        const end = screen.pages.pin(.{ .active = .{
+            .x = end_point.x,
+            .y = end_point.y,
+        } }) orelse {
+            screen.clearSelection();
+            return;
+        };
+        try screen.select(terminal.Selection.init(start, end, rectangle));
+    }
+
+    /// A local drag's selection endpoints and shape, captured as active-area coordinates before
+    /// the destructive grid reset.
+    const MirrorDragSelection = struct {
+        start: terminal.point.Coordinate,
+        end: terminal.point.Coordinate,
+        rectangle: bool,
+    };
+
+    /// Reads the live selection a local drag has already produced (via the surface's own mouse
+    /// handling, which calls into `SelectionGesture` directly and is not part of frame apply).
+    /// Null when the drag has not moved the mouse yet, so `press` has not produced a selection
+    /// (see the `SelectionGesture` doc comment: a bare press returns null by default).
+    fn captureDragSelection(terminal_state: *terminal.Terminal) ?MirrorDragSelection {
+        const screen = terminal_state.screens.active;
+        const sel = screen.selection orelse return null;
+        const start = screen.pages.pointFromPin(.active, sel.start()) orelse return null;
+        const end = screen.pages.pointFromPin(.active, sel.end()) orelse return null;
+        return .{ .start = start.coord(), .end = end.coord(), .rectangle = sel.rectangle };
+    }
+
+    /// Writes a snapshot onto a mirror surface's terminal state.
+    ///
+    /// A mirror is viewport-only: it holds no scrollback and every frame rewrites the whole grid.
+    /// Its selection is the client's: the frame's selection fields (viewport-relative, already
+    /// projected by the client onto this frame) are what gets painted.
+    ///
+    ///  * No drag in progress: the frame is authoritative. Its selection fields are painted via
+    ///    `applyMirrorSelectionFromSnapshot`, replacing whatever the mirror had. This is also
+    ///    what clears a selection the client ended.
+    ///  * A drag is in progress without a client anchor: a drag the client does not own cannot be
+    ///    followed across the grid reset (the anchor's pin does not survive `fullReset`), so the
+    ///    drag is cancelled. A grid resize under the drag cancels it too.
+    ///  * A drag is in progress with a client anchor (`drag_anchor_valid`, the click cell
+    ///    projected onto this frame's viewport): the client owns the selection, so the frame's
+    ///    projected selection is painted and the gesture's click pin is re-seated on the anchor.
+    ///    An off-grid anchor seats the click pin on the visible edge so Ghostty's next
+    ///    resolution gets the pointer side right; the anchor side it resolves from that
+    ///    stand-in is not the selection's, so the client keeps its true anchor and repaints the
+    ///    merged selection with `ghostty_mirror_set_selection`.
+    ///  * A client anchor on a frame with no drag in progress re-seats the gesture's click pin on
+    ///    the anchor, so a later shift-click extends from the selection's anchor exactly.
+    ///
+    /// A cell's OSC 8 link fields (`link_index` and the snapshot's link table) are deliberately not
+    /// applied: they are export-only. Restoring them would mean sizing a page's `string_bytes` and
+    /// `hyperlink_bytes` capacity as well, and Spaces already resolves link hover and clicks from
+    /// the Swift snapshot rather than from the mirror surface.
+    fn applySnapshotToSurface(surface: *Surface, snapshot: Snapshot) !void {
+        if (snapshot.columns == 0 or snapshot.rows == 0) return error.InvalidRenderFrame;
+        const expected_cell_count = @as(usize, snapshot.columns) * @as(usize, snapshot.rows);
+        if (snapshot.cell_count < expected_cell_count or snapshot.cells == null) return error.InvalidRenderFrame;
+
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        const terminal_state = core_surface.renderer_state.terminal;
+        const mouse = &core_surface.mouse;
+        const gesture = &mouse.selection_gesture;
+
+        // A local left-button drag is "in progress" when the button is physically down and the
+        // gesture has an active click to extend. Both conditions matter: `left_click_count` alone
+        // intentionally stays positive between the clicks of a double/triple-click sequence with
+        // the button up (see the `SelectionGesture` doc comment), and that lingering state must
+        // not lock the mirror into drag mode, which would stop painting the host's selection while
+        // the user is not actually touching this surface.
+        const left_idx = @intFromEnum(input.MouseButton.left);
+        const drag_in_progress = mouse.click_state[left_idx] == .press and gesture.left_click_count > 0;
+
+        // Grid dimensions before the resize below, compared against the snapshot's: a resize
+        // landing under a drag cancels it.
+        const grid_changed = terminal_state.cols != snapshot.columns or terminal_state.rows != snapshot.rows;
+
+        // Everything a later branch needs from the live gesture/selection is read now, before the
+        // `fullReset` below clears the selection and re-anchors every tracked pin (the click pin
+        // among them) at the top-left. Mouse input and frame applies both run on the host app's
+        // main thread and this holds the renderer state mutex, so this state cannot change under
+        // us between the read and the reset.
+        const click_coord = captureClickCoordinate(surface, terminal_state);
+        const drag_selection = if (drag_in_progress) captureDragSelection(terminal_state) else null;
+
+        try terminal_state.resize(
+            global.alloc(),
+            .{
+                .cols = @intCast(snapshot.columns),
+                .rows = @intCast(snapshot.rows),
+            },
+        );
+        terminal_state.fullReset();
+        terminal_state.colors.foreground.set(unpackRGB(snapshot.default_foreground_rgb));
+        terminal_state.colors.background.set(unpackRGB(snapshot.default_background_rgb));
+        terminal_state.flags.dirty.clear = true;
+        terminal_state.flags.dirty.palette = true;
+
+        const screen = terminal_state.screens.active;
+        const frame_cells = snapshot.cells.?[0..expected_cell_count];
+
+        // Size the page for every cluster this frame carries before touching a single cell. Growing
+        // reactively (the recipe Screen.appendGrapheme follows) relocates the page and invalidates
+        // the page, row, and cell pointers the write pass below holds; deciding grapheme capacity up
+        // front keeps them valid for the whole pass. (Style capacity cannot be decided up front, see
+        // the restart loop below.) The page is already being resized and fully reset just above, so
+        // a capacity decision here costs nothing extra.
+        var required_grapheme_bytes: usize = 0;
+        for (frame_cells) |frame_cell| {
+            const extras = frame_cell.graphemeExtras();
+            if (extras.len == 0) continue;
+            required_grapheme_bytes += terminal.page.graphemeBytesRequired(extras.len);
+        }
+        var node = screen.pages.pages.last.?;
+        while (node.page().capacity.grapheme_bytes < required_grapheme_bytes) {
+            node = try screen.increaseCapacity(node, .grapheme_bytes);
+        }
+
+        // A frame can carry more distinct styles than the page holds (a gradient logo, a
+        // syntax-highlighted diff), and the page cannot be sized for them up front the way graphemes
+        // are: the set's capacity is a count of distinct styles that can only be learned by adding
+        // them, and a set that fills with released entries needs a rehash rather than more room. So
+        // a failed add grows the page the way Screen.manualStyleUpdate does and rewrites the whole
+        // grid on the grown page. Growing relocates the page, so the restart re-derives every pointer
+        // from the new node instead of resuming; the grid is rewritten from scratch every frame
+        // anyway. Failing the apply instead would drop the whole frame and leave the pane stale.
+        while (true) {
+            writeSnapshotGrid(screen, node, snapshot, frame_cells) catch |err| switch (err) {
+                error.StyleCapacityExhausted => {
+                    node = try screen.increaseCapacity(node, .styles);
+                    continue;
+                },
+                error.StyleSetNeedsRehash => {
+                    node = try screen.increaseCapacity(node, null);
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
+
+        screen.cursorAbsolute(
+            @min(snapshot.cursor_column, snapshot.columns - 1),
+            @min(snapshot.cursor_row, snapshot.rows - 1),
+        );
+        terminal_state.modes.set(.cursor_visible, snapshot.cursor_visible);
+        // Restore the exporting terminal's mouse tracking state so this surface arbitrates clicks
+        // exactly as the exporting one would: suppressing selection while an application tracks the
+        // mouse, and honoring an explicit shift-capture request. Every active tracking mode maps to
+        // .normal because a mirror has no write sink for the report it would encode; only whether
+        // tracking is on changes surface-local behavior.
+        terminal_state.flags.mouse_event = if (snapshot.mouse_reporting_active) .normal else .none;
+        terminal_state.flags.mouse_shift_capture = switch (snapshot.mouse_shift_capture) {
+            1 => .false,
+            2 => .true,
+            else => .null,
+        };
+        screen.cursor.page_row.dirty = true;
+
+        // Selection handling happens last so it resolves against the pages this frame actually
+        // wrote, after the capacity growth above.
+        try reconcileMirrorGesture(
+            gesture,
+            terminal_state,
+            snapshot,
+            .{
+                .drag_in_progress = drag_in_progress,
+                .grid_changed = grid_changed,
+                .click_coord = click_coord,
+                .drag_selection = drag_selection,
+            },
+        );
+    }
+
+    /// What `applySnapshotToSurface` read from the live gesture and selection before the
+    /// destructive grid reset.
+    const MirrorGestureInputs = struct {
+        drag_in_progress: bool,
+        grid_changed: bool,
+        click_coord: ?terminal.point.Coordinate,
+        drag_selection: ?MirrorDragSelection,
+    };
+
+    /// Reconciles the mirror's selection and gesture click pin with a frame whose grid has just
+    /// been painted. Split out of `applySnapshotToSurface` so the gesture handling can be
+    /// exercised against a bare `Terminal` and `SelectionGesture`.
+    fn reconcileMirrorGesture(
+        gesture: *terminal.SelectionGesture,
+        terminal_state: *terminal.Terminal,
+        snapshot: Snapshot,
+        inputs: MirrorGestureInputs,
+    ) !void {
+        const screen = terminal_state.screens.active;
+        const click_coord = inputs.click_coord;
+        const drag_selection = inputs.drag_selection;
+
+        if (!inputs.drag_in_progress) {
+            // No local drag owns the mirror's selection: paint whatever the frame carries.
+            try applyMirrorSelectionFromSnapshot(screen, snapshot);
+            if (snapshot.drag_anchor_valid) {
+                // The committed selection's anchor, projected by the client onto this frame. The
+                // click pin a shift-click extends from must follow the anchor's text. Rebinding
+                // it to its pre-reset coordinate instead (`rebindOrResetClick`) leaves it one
+                // row off after any content movement. An anchor scrolled off the grid seats the
+                // pin on the stand-in corner, as the drag path does, so a shift-click after the
+                // user scrolled the anchor away still extends (the client paints the stand-in
+                // cell so Ghostty has a selection to extend) instead of starting a new one.
+                if (gesture.left_click_count > 0) {
+                    const rectangle = snapshot.selection_flags & SelectionFlags.present != 0 and
+                        snapshot.selection_flags & SelectionFlags.rectangle != 0;
+                    try gesture.rebindLeftClickPin(terminal_state, clientAnchorPin(screen, snapshot, rectangle));
+                }
+                return;
+            }
+            try rebindOrResetClick(gesture, terminal_state, screen, click_coord);
+            return;
+        }
+
+        // A drag the client does not own (no anchor in this frame's epoch) or that a grid resize
+        // landed under cannot be followed across the reset, so it ends with no selection; the
+        // user's next press starts fresh.
+        if (inputs.grid_changed or !snapshot.drag_anchor_valid) {
+            screen.clearSelection();
+            gesture.reset(terminal_state);
+            return;
+        }
+
+        // The client owns the anchor and the selection: it already projected its own selection
+        // into the frame's selection fields, so the fork paints that instead of rebuilding one
+        // from the gesture (whose word/line/output selections are stored in document order, not
+        // gesture order). Re-seating the click pin lets Ghostty's own drag code resolve the next
+        // mouse move from the anchor for every drag behavior.
+        try applyMirrorSelectionFromSnapshot(screen, snapshot);
+        // The frame's own flags are the source when it carries a selection, since that is the
+        // shape the client paints. Only a frame with no selection yet (right after the press)
+        // falls back to the live local selection's shape.
+        const rectangle = if (snapshot.selection_flags & SelectionFlags.present != 0)
+            snapshot.selection_flags & SelectionFlags.rectangle != 0
+        else if (drag_selection) |s| s.rectangle else false;
+        try gesture.rebindLeftClickPin(terminal_state, clientAnchorPin(screen, snapshot, rectangle));
+
+    }
+
+    const Session = struct {
+        app: *App,
+        surface: *Surface,
+        parked_host: SurfaceHost,
+        renderers: std.ArrayListUnmanaged(*Renderer) = .empty,
+        owner_renderer: ?*Renderer = null,
+        state_mutex: std.Io.Mutex = .init,
+        state_callback: ?SessionStateCallback = null,
+        state_callback_userdata: ?*anyopaque = null,
+        state_revision: u64 = 0,
+        pending_state_flags: SessionStateFlags = .{},
+        last_known_foreground_pid: u64 = 0,
+        last_known_surface_size: SurfaceSize = .{
+            .columns = 0,
+            .rows = 0,
+            .width_px = 0,
+            .height_px = 0,
+            .cell_width_px = 0,
+            .cell_height_px = 0,
+        },
+
+        pub fn init(self: *Session, app: *App, config: SessionConfig, headless: bool) !void {
+            const surface = try app.newSurface(config.surface, headless);
+            const parked_host: SurfaceHost = if (config.parked_host.isValid()) .{
+                .platform_tag = config.parked_host.platform_tag,
+                .platform = config.parked_host.platform,
+                .scale_factor = config.parked_host.scale_factor,
+            } else .{
+                .platform_tag = config.surface.platform_tag,
+                .platform = config.surface.platform,
+                .scale_factor = config.surface.scale_factor,
+            };
+
+            self.* = .{
+                .app = app,
+                .surface = surface,
+                .parked_host = parked_host,
+                .renderers = .empty,
+                .owner_renderer = null,
+                .state_mutex = .init,
+                .state_callback = null,
+                .state_callback_userdata = null,
+                .state_revision = 0,
+                .pending_state_flags = .{},
+                .last_known_foreground_pid = 0,
+                .last_known_surface_size = .{
+                    .columns = 0,
+                    .rows = 0,
+                    .width_px = 0,
+                    .height_px = 0,
+                    .cell_width_px = 0,
+                    .cell_height_px = 0,
+                },
+            };
+            self.surface.setSessionStateCallback(surfaceStateCallback, self);
+            self.last_known_foreground_pid = self.currentForegroundPID();
+            self.last_known_surface_size = self.currentSurfaceSize();
+        }
+
+        pub fn deinit(self: *Session) void {
+            for (self.renderers.items) |renderer_handle| {
+                renderer_handle.attached_session = null;
+                renderer_handle.role = .detached;
+            }
+            self.renderers.deinit(global.alloc());
+            self.owner_renderer = null;
+            self.surface.setSessionStateCallback(null, null);
+            self.app.closeSurface(self.surface);
+        }
+
+        pub fn attachRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session) |existing_session| {
+                if (existing_session != self) try renderer_handle.detach();
+            }
+
+            try self.promoteRenderer(renderer_handle);
+        }
+
+        pub fn attachViewer(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session) |existing_session| {
+                if (existing_session != self) try renderer_handle.detach();
+                if (existing_session == self) {
+                    try self.ensureRendererAttached(renderer_handle);
+                    if (renderer_handle.role == .detached) renderer_handle.role = .viewer;
+                    return;
+                }
+            }
+
+            try self.ensureRendererAttached(renderer_handle);
+            renderer_handle.attached_session = self;
+            if (renderer_handle.role == .detached) renderer_handle.role = .viewer;
+        }
+
+        pub fn attachInitialOwnerRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session) |existing_session| {
+                if (existing_session != self) try renderer_handle.detach();
+            }
+
+            try self.ensureRendererAttached(renderer_handle);
+            if (self.owner_renderer) |existing_owner| existing_owner.role = .viewer;
+            self.owner_renderer = renderer_handle;
+            renderer_handle.attached_session = self;
+            renderer_handle.role = .owner;
+        }
+
+        pub fn promoteRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            const old_session = renderer_handle.attached_session;
+            const old_role = renderer_handle.role;
+            const was_registered = self.indexOfRenderer(renderer_handle) != null;
+            errdefer {
+                if (!was_registered) self.removeRenderer(renderer_handle);
+                renderer_handle.attached_session = old_session;
+                renderer_handle.role = old_role;
+            }
+
+            try self.ensureRendererAttached(renderer_handle);
+
+            if (self.owner_renderer) |existing_owner| {
+                if (existing_owner == renderer_handle) {
+                    renderer_handle.attached_session = self;
+                    renderer_handle.role = .owner;
+                    return;
+                }
+            }
+
+            try self.surface.setHost(renderer_handle.host);
+            if (self.owner_renderer) |existing_owner| existing_owner.role = .viewer;
+            self.owner_renderer = renderer_handle;
+            renderer_handle.attached_session = self;
+            renderer_handle.role = .owner;
+            self.notifyStateChange(self.notifySizeIfChanged());
+        }
+
+        pub fn detachRenderer(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session != self) return;
+
+            if (self.owner_renderer == renderer_handle) {
+                try self.surface.setHost(self.parked_host);
+                self.notifyStateChange(self.notifySizeIfChanged());
+                self.owner_renderer = null;
+            }
+
+            self.removeRenderer(renderer_handle);
+            renderer_handle.attached_session = null;
+            renderer_handle.role = .detached;
+        }
+
+        pub fn detachRendererForFree(self: *Session, renderer_handle: *Renderer) !void {
+            if (renderer_handle.attached_session != self) return;
+
+            if (self.owner_renderer == renderer_handle) {
+                try self.surface.setHost(self.parked_host);
+                self.notifyStateChange(self.notifySizeIfChanged());
+                self.owner_renderer = null;
+            }
+
+            self.removeRenderer(renderer_handle);
+            renderer_handle.attached_session = null;
+            renderer_handle.role = .detached;
+        }
+
+        fn currentForegroundPID(self: *const Session) u64 {
+            return self.surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
+        }
+
+        fn currentSurfaceSize(self: *const Session) SurfaceSize {
+            const grid_size = self.surface.core_surface.size.grid();
+            return .{
+                .columns = grid_size.columns,
+                .rows = grid_size.rows,
+                .width_px = self.surface.core_surface.size.screen.width,
+                .height_px = self.surface.core_surface.size.screen.height,
+                .cell_width_px = self.surface.core_surface.size.cell.width,
+                .cell_height_px = self.surface.core_surface.size.cell.height,
+            };
+        }
+
+        pub fn setStateCallback(
+            self: *Session,
+            callback: ?SessionStateCallback,
+            userdata: ?*anyopaque,
+        ) void {
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
+
+            self.state_callback = callback;
+            self.state_callback_userdata = userdata;
+        }
+
+        pub fn notifyStateChange(self: *Session, flags: SessionStateFlags) void {
+            if (flags.bits() == 0) return;
+
+            var callback: ?SessionStateCallback = null;
+            var userdata: ?*anyopaque = null;
+            {
+                self.state_mutex.lockUncancelable(global.io());
+                defer self.state_mutex.unlock(global.io());
+
+                self.state_revision +%= 1;
+                self.pending_state_flags = self.pending_state_flags.unionWith(flags);
+                callback = self.state_callback;
+                userdata = self.state_callback_userdata;
+            }
+
+            if (callback) |cb| cb(userdata, flags.bits());
+        }
+
+        pub fn stateRevision(self: *Session) u64 {
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
+
+            return self.state_revision;
+        }
+
+        pub fn takePendingStateFlags(self: *Session) SessionStateFlags {
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
+
+            const pending = self.pending_state_flags;
+            self.pending_state_flags = .{};
+            return pending;
+        }
+
+        fn notifyForegroundProcessIfChanged(self: *Session) SessionStateFlags {
+            const current = self.currentForegroundPID();
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
+
+            if (current == self.last_known_foreground_pid) return .{};
+            self.last_known_foreground_pid = current;
+            return .{ .foreground_process = true };
+        }
+
+        fn notifySizeIfChanged(self: *Session) SessionStateFlags {
+            const current = self.currentSurfaceSize();
+            self.state_mutex.lockUncancelable(global.io());
+            defer self.state_mutex.unlock(global.io());
+
+            if (std.meta.eql(current, self.last_known_surface_size)) return .{};
+            self.last_known_surface_size = current;
+            return .{ .size = true };
+        }
+
+        fn notifyScreenMutation(self: *Session) void {
+            var flags: SessionStateFlags = .{ .screen = true };
+            flags = flags.unionWith(self.notifyForegroundProcessIfChanged());
+            self.notifyStateChange(flags);
+        }
+
+        fn surfaceStateCallback(userdata: ?*anyopaque, flags_raw: u32) callconv(.c) void {
+            const ptr = userdata orelse return;
+            const session: *Session = @ptrCast(@alignCast(ptr));
+            var flags: SessionStateFlags = @bitCast(flags_raw);
+            if (flags.screen) {
+                flags = flags.unionWith(session.notifyForegroundProcessIfChanged());
+            }
+            session.notifyStateChange(flags);
+        }
+
+        fn ensureRendererAttached(self: *Session, renderer_handle: *Renderer) !void {
+            if (self.indexOfRenderer(renderer_handle) != null) return;
+            try self.renderers.append(global.alloc(), renderer_handle);
+        }
+
+        fn indexOfRenderer(self: *const Session, renderer_handle: *Renderer) ?usize {
+            for (self.renderers.items, 0..) |existing_renderer, index| {
+                if (existing_renderer == renderer_handle) return index;
+            }
+            return null;
+        }
+
+        fn removeRenderer(self: *Session, renderer_handle: *Renderer) void {
+            const index = self.indexOfRenderer(renderer_handle) orelse return;
+            _ = self.renderers.swapRemove(index);
+        }
+    };
+
+    const RendererRole = enum {
+        detached,
+        viewer,
+        owner,
+    };
+
+    const Renderer = struct {
+        host: SurfaceHost,
+        attached_session: ?*Session = null,
+        role: RendererRole = .detached,
+
+        pub fn detach(self: *Renderer) !void {
+            const session = self.attached_session orelse return;
+            try session.detachRenderer(self);
+        }
+
+        pub fn detachForFree(self: *Renderer) !void {
+            const session = self.attached_session orelse return;
+            try session.detachRendererForFree(self);
+        }
+
+        pub fn takeOwnership(self: *Renderer) !void {
+            const session = self.attached_session orelse return error.RendererDetached;
+            try session.promoteRenderer(self);
+        }
+
+        pub fn setHost(self: *Renderer, host: SurfaceHost) !void {
+            if (self.attached_session) |session| {
+                if (self.host.eql(host)) {
+                    self.host = host;
+                    return;
+                }
+
+                if (self.role != .owner) {
+                    self.host = host;
+                    return;
+                }
+
+                try session.surface.setHost(host);
+                self.host = host;
+                session.notifyStateChange(session.notifySizeIfChanged());
+                return;
+            }
+
+            self.host = host;
+        }
+
+        pub fn isOwner(self: *const Renderer) bool {
+            return self.role == .owner;
+        }
+    };
+
+    const Mirror = struct {
+        app: *App,
+        session: *Session,
+        renderer: *Renderer,
+
+        pub fn init(
+            self: *Mirror,
+            app: *App,
+            host: SurfaceHost,
+            config: SessionConfig,
+        ) !void {
+            var mirror_config = config;
+            mirror_config.surface.platform_tag = host.platform_tag;
+            mirror_config.surface.platform = host.platform;
+            mirror_config.surface.scale_factor = host.scale_factor;
+            mirror_config.parked_host = host;
+
+            const session = try global.alloc().create(Session);
+            errdefer global.alloc().destroy(session);
+            try session.init(app, mirror_config, false);
+            errdefer session.deinit();
+
+            const renderer_handle = try global.alloc().create(Renderer);
+            errdefer global.alloc().destroy(renderer_handle);
+            renderer_handle.* = .{
+                .host = host,
+                .attached_session = null,
+            };
+            try session.attachInitialOwnerRenderer(renderer_handle);
+
+            self.* = .{
+                .app = app,
+                .session = session,
+                .renderer = renderer_handle,
+            };
+        }
+
+        pub fn deinit(self: *Mirror) void {
+            ghostty_renderer_free(self.renderer);
+            ghostty_session_free(self.session);
+        }
+    };
+
     // ghostty_point_s
     const Point = extern struct {
         tag: Tag,
@@ -1813,7 +3143,7 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
     ) !*Surface {
-        return try app.newSurface(opts.*);
+        return try app.newSurface(opts.*, false);
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -1828,6 +3158,22 @@ pub const CAPI = struct {
     /// Returns the app associated with a surface.
     export fn ghostty_surface_app(surface: *Surface) *App {
         return surface.app;
+    }
+
+    export fn ghostty_surface_write_buffer(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        const slice = ptr orelse return;
+        surface.core_surface.io.processOutputBlocking(slice[0..len], true) catch |err| {
+            log.err("error processing surface output err={}", .{err});
+            return;
+        };
+    }
+
+    export fn ghostty_surface_process_exit(surface: *Surface, exit_code: i32) void {
+        surface.core_surface.io.queueProcessExit(sanitizeProcessExitCode(exit_code), 0);
     }
 
     /// Returns the config to use for surfaces that inherit from this one.
@@ -1936,8 +3282,243 @@ pub const CAPI = struct {
         return true;
     }
 
+    fn packRGB(rgb: terminal.color.RGB) u32 {
+        return (@as(u32, rgb.r) << 16) |
+            (@as(u32, rgb.g) << 8) |
+            @as(u32, rgb.b);
+    }
+
+    fn snapshotFlagsForCell(
+        raw: terminal.Cell,
+        style: terminal.Style,
+    ) u16 {
+        var flags: u16 = 0;
+        if (style.flags.bold) flags |= SnapshotFlags.bold;
+        if (style.flags.italic) flags |= SnapshotFlags.italic;
+        if (style.flags.faint) flags |= SnapshotFlags.faint;
+        if (style.flags.inverse) flags |= SnapshotFlags.inverse;
+        if (style.flags.invisible) flags |= SnapshotFlags.invisible;
+        if (style.flags.strikethrough) flags |= SnapshotFlags.strikethrough;
+        if (style.flags.underline != .none) flags |= SnapshotFlags.underline;
+        if (raw.wide == .spacer_head or raw.wide == .spacer_tail) flags |= SnapshotFlags.spacer;
+        return flags;
+    }
+
+    fn snapshotFlagsForRow(row: terminal.page.Row) u16 {
+        var flags: u16 = 0;
+        if (row.wrap) flags |= SnapshotFlags.row_wrap;
+        if (row.wrap_continuation) flags |= SnapshotFlags.row_wrap_continuation;
+        return flags;
+    }
+
+    fn exportSnapshotFromSurface(
+        surface: *Surface,
+        result: *Snapshot,
+    ) bool {
+        result.* = .{};
+
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        const terminal_state = core_surface.renderer_state.terminal;
+        const screen = terminal_state.screens.active;
+        const previous_terminal_dirty = terminal_state.flags.dirty;
+        const previous_screen_dirty = screen.dirty;
+
+        var render_state: terminal.RenderState = .empty;
+        defer render_state.deinit(global.alloc());
+
+        render_state.update(global.alloc(), terminal_state) catch |err| {
+            log.warn("error exporting terminal snapshot err={}", .{err});
+            return false;
+        };
+
+        // Exporting a snapshot consumes terminal dirty state. Force a redraw
+        // on the next render pass so snapshot export cannot hide output.
+        terminal_state.flags.dirty = previous_terminal_dirty;
+        terminal_state.flags.dirty.clear = true;
+        screen.dirty = previous_screen_dirty;
+        screen.dirty.selection = true;
+
+        const columns: u16 = render_state.cols;
+        const rows: u16 = render_state.rows;
+        const cell_count: usize = @as(usize, columns) * @as(usize, rows);
+
+        var copied_cells: []SnapshotCell = if (cell_count > 0)
+            global.alloc().alloc(SnapshotCell, cell_count) catch |err| {
+                log.warn("error allocating snapshot cells err={}", .{err});
+                return false;
+            }
+        else
+            &.{};
+        errdefer if (cell_count > 0) global.alloc().free(copied_cells);
+
+        const row_data = render_state.row_data.slice();
+        const row_rows = row_data.items(.raw);
+        const row_cells = row_data.items(.cells);
+        const row_pins = row_data.items(.pin);
+        const palette = &render_state.colors.palette;
+        const default_fg = render_state.colors.foreground;
+        const default_bg = render_state.colors.background;
+        var cell_index: usize = 0;
+        var links: std.ArrayListUnmanaged(SnapshotString) = .empty;
+
+        for (0..rows) |row_index| {
+            const cells_slice = row_cells[row_index].slice();
+            const raws = cells_slice.items(.raw);
+            const styles = cells_slice.items(.style);
+            const graphemes = cells_slice.items(.grapheme);
+            const row_flags = snapshotFlagsForRow(row_rows[row_index]);
+
+            // A cell's OSC 8 target lives in the page its row pins, not in the render state's
+            // copied cell data. Dereferencing the pin's node is only safe while the terminal
+            // cannot change under us — the condition RenderState.linkCells documents — which holds
+            // here because the renderer state mutex is held for the whole export.
+            const link_pin = row_pins[row_index];
+            const link_page = link_pin.node.page();
+
+            for (0..columns) |column_index| {
+                const raw = raws[column_index];
+                const style: terminal.Style = if (raw.hasStyling()) styles[column_index] else .{};
+                const foreground = style.fg(.{
+                    .default = default_fg,
+                    .palette = palette,
+                });
+                const background = style.bg(&raw, palette) orelse default_bg;
+
+                // The render state's grapheme slice is only initialized for cells tagged
+                // codepoint_grapheme; it is undefined otherwise, so the tag gates the read.
+                // Over-cap clusters export as the base codepoint alone, matching the degradation
+                // the other snapshot producers apply.
+                var extras: []u32 = &.{};
+                if (raw.hasGrapheme()) grapheme: {
+                    const cps = graphemes[column_index];
+                    if (cps.len == 0 or cps.len >= snapshot_max_grapheme_codepoints) break :grapheme;
+                    extras = global.alloc().alloc(u32, cps.len) catch |err| {
+                        log.warn("error allocating snapshot grapheme cluster err={}", .{err});
+                        abortSnapshotExport(copied_cells, cell_index, &links);
+                        return false;
+                    };
+                    for (cps, extras) |cp, *dst| dst.* = @intCast(cp);
+                }
+
+                var link_index: u32 = 0;
+                if (raw.hyperlink) link: {
+                    const rac = link_page.getRowAndCell(column_index, link_pin.y);
+                    const id = link_page.lookupHyperlink(rac.cell) orelse break :link;
+                    const entry = link_page.hyperlink_set.get(link_page.memory, id);
+                    link_index = snapshotLinkIndex(
+                        &links,
+                        entry.uri.slice(link_page.memory),
+                    ) catch |err| {
+                        log.warn("error copying snapshot hyperlink err={}", .{err});
+                        if (extras.len > 0) global.alloc().free(extras);
+                        abortSnapshotExport(copied_cells, cell_index, &links);
+                        return false;
+                    };
+                }
+
+                copied_cells[cell_index] = .{
+                    .codepoint = if (raw.hasText()) @intCast(raw.codepoint()) else 0,
+                    .foreground_rgb = packRGB(foreground),
+                    .background_rgb = packRGB(background),
+                    .flags = snapshotFlagsForCell(raw, style) | row_flags,
+                    .grapheme_extra_len = @intCast(extras.len),
+                    .grapheme_extras = if (extras.len > 0) extras.ptr else null,
+                    .link_index = link_index,
+                };
+                cell_index += 1;
+            }
+        }
+
+        // Hand the accumulated link table to the snapshot as an exactly sized allocation, so its
+        // deinit can free it without knowing the list's capacity.
+        const copied_links: []SnapshotString = links.toOwnedSlice(global.alloc()) catch |err| {
+            log.warn("error allocating snapshot links err={}", .{err});
+            abortSnapshotExport(copied_cells, cell_index, &links);
+            return false;
+        };
+
+        const cursor = render_state.cursor.viewport;
+        // Captured once and reused both for the flag on the result below and to decide whether
+        // pending_scroll_rects is trustworthy: an overflowed ring buffer means rects were dropped,
+        // so a consumer cannot reconstruct movement from them and must not try.
+        var scroll_carry_valid = !terminal_state.pendingRenderScrollRectsOverflowed();
+        const pending_scroll_rects = if (scroll_carry_valid)
+            terminal_state.pendingRenderScrollRects()
+        else
+            &[_]terminal.Terminal.RenderScrollRect{};
+        var copied_scroll_rects: []SnapshotScrollRect = &.{};
+        var scroll_rect_count = pending_scroll_rects.len;
+        if (pending_scroll_rects.len > 0) {
+            copied_scroll_rects = global.alloc().alloc(SnapshotScrollRect, pending_scroll_rects.len) catch |err| blk: {
+                log.warn("error allocating snapshot scroll rects err={}", .{err});
+                // Rects existed but could not be exported (and the pending buffer is cleared
+                // below regardless), so this frame does not describe how content moved; a
+                // consumer must not trust an empty rect list.
+                scroll_carry_valid = false;
+                scroll_rect_count = 0;
+                break :blk &.{};
+            };
+            if (scroll_rect_count > 0) {
+                for (pending_scroll_rects, 0..) |operation, index| {
+                    copied_scroll_rects[index] = .{
+                        .row_start = operation.row_start,
+                        .row_count = operation.row_count,
+                        .column_start = operation.column_start,
+                        .column_count = operation.column_count,
+                        .delta_rows = operation.delta_rows,
+                        .delta_columns = operation.delta_columns,
+                    };
+                }
+            }
+        }
+
+        const scrollbar = screen.pages.scrollbar();
+
+        result.* = .{
+            .columns = columns,
+            .rows = rows,
+            .cursor_column = if (cursor) |vp| @intCast(vp.x) else 0,
+            .cursor_row = if (cursor) |vp| @intCast(vp.y) else 0,
+            .cursor_visible = render_state.cursor.visible and cursor != null,
+            .default_foreground_rgb = packRGB(default_fg),
+            .default_background_rgb = packRGB(default_bg),
+            .cell_count = cell_count,
+            .cells = if (cell_count > 0) copied_cells.ptr else null,
+            .scroll_rect_count = scroll_rect_count,
+            .scroll_rects = if (scroll_rect_count > 0) copied_scroll_rects.ptr else null,
+            .scroll_carry_valid = scroll_carry_valid,
+            .scrollbar_total = @intCast(scrollbar.total),
+            .scrollbar_offset = @intCast(scrollbar.offset),
+            .mouse_reporting_active = terminal_state.flags.mouse_event != .none,
+            .mouse_tracking_level = mouseTrackingLevel(terminal_state.flags.mouse_event),
+            .mouse_shift_capture = switch (terminal_state.flags.mouse_shift_capture) {
+                .null => 0,
+                .false => 1,
+                .true => 2,
+            },
+            .alternate_screen_active = terminal_state.screens.active_key == .alternate,
+            .link_count = copied_links.len,
+            .links = if (copied_links.len > 0) copied_links.ptr else null,
+            .history_rows_pruned = screen.pages.rows_pruned,
+            .history_epoch = terminal_state.history_epoch,
+            .bytes_processed = core_surface.io.bytes_processed,
+        };
+        terminal_state.clearPendingRenderScrollRects();
+        return true;
+    }
+
     export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
+    }
+
+    export fn ghostty_surface_export_snapshot(
+        surface: *Surface,
+        result: *Snapshot,
+    ) bool {
+        return exportSnapshotFromSurface(surface, result);
     }
 
     /// Tell the surface that it needs to schedule a render
@@ -1955,6 +3536,18 @@ pub const CAPI = struct {
     /// to the pty and the renderer.
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
+    }
+
+    /// Rebind the renderer for a live surface to a replacement host view.
+    export fn ghostty_surface_set_host(
+        surface: *Surface,
+        host: *const SurfaceHost,
+    ) bool {
+        surface.setHost(host.*) catch |err| {
+            log.err("error rebinding surface host err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// Return the size information a surface has.
@@ -1975,6 +3568,17 @@ pub const CAPI = struct {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
     }
 
+    /// Reports whether the running application currently has bracketed paste
+    /// (DECSET 2004) enabled — the same live mode `ghostty_surface_text`'s paste
+    /// encoding is derived from, so an embedder can know ahead of a text write
+    /// whether that write will reach the PTY framed.
+    export fn ghostty_surface_bracketed_paste(surface: *Surface) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        return core_surface.io.terminal.modes.get(.bracketed_paste);
+    }
+
     /// Returns the PTY name for the surface. The returned string must be
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {
@@ -1985,6 +3589,460 @@ pub const CAPI = struct {
         };
 
         return .fromSlice(copy);
+    }
+
+    export fn ghostty_session_config_new() SessionConfig {
+        return .{
+            .surface = ghostty_surface_config_new(),
+            .parked_host = .{},
+        };
+    }
+
+    fn sessionNew(
+        app: *App,
+        config: *const SessionConfig,
+        headless: bool,
+    ) ?*Session {
+        const session = global.alloc().create(Session) catch |err| {
+            log.err("error allocating session err={}", .{err});
+            return null;
+        };
+        session.init(app, config.*, headless) catch |err| {
+            log.err("error initializing session err={}", .{err});
+            global.alloc().destroy(session);
+            return null;
+        };
+        return session;
+    }
+
+    export fn ghostty_session_new(
+        app: *App,
+        config: *const SessionConfig,
+    ) ?*Session {
+        return sessionNew(app, config, false);
+    }
+
+    /// A session with terminal state, a host-managed or exec IO backend and no
+    /// renderer: no renderer thread, no graphics objects and no platform view.
+    /// The platform and parked host fields of the config are ignored.
+    export fn ghostty_session_new_headless(
+        app: *App,
+        config: *const SessionConfig,
+    ) ?*Session {
+        return sessionNew(app, config, true);
+    }
+
+    export fn ghostty_session_free(session: *Session) void {
+        session.deinit();
+        global.alloc().destroy(session);
+    }
+
+    export fn ghostty_session_surface(session: *Session) *Surface {
+        return session.surface;
+    }
+
+    export fn ghostty_session_refresh(session: *Session) void {
+        session.surface.refresh();
+        session.notifyStateChange(session.notifyForegroundProcessIfChanged());
+    }
+
+    export fn ghostty_session_set_content_scale(session: *Session, x: f64, y: f64) void {
+        session.surface.updateContentScale(x, y);
+        session.notifyStateChange(session.notifySizeIfChanged());
+    }
+
+    export fn ghostty_session_set_focus(session: *Session, focused: bool) void {
+        session.surface.focusCallback(focused);
+    }
+
+    export fn ghostty_session_set_occlusion(session: *Session, visible: bool) void {
+        session.surface.occlusionCallback(visible);
+    }
+
+    export fn ghostty_session_set_size(session: *Session, w: u32, h: u32) void {
+        session.surface.updateSize(w, h);
+        var flags = session.notifySizeIfChanged();
+        flags = flags.unionWith(.{ .screen = true });
+        flags = flags.unionWith(session.notifyForegroundProcessIfChanged());
+        session.notifyStateChange(flags);
+    }
+
+    export fn ghostty_session_set_grid_size(session: *Session, columns: u16, rows: u16) void {
+        const current_size = ghostty_session_size(session);
+        const cell_width = if (current_size.cell_width_px > 0) current_size.cell_width_px else 9;
+        const cell_height = if (current_size.cell_height_px > 0) current_size.cell_height_px else 18;
+        const width_px = @as(u32, columns) * @as(u32, cell_width);
+        const height_px = @as(u32, rows) * @as(u32, cell_height);
+        ghostty_session_set_size(session, width_px, height_px);
+    }
+
+    export fn ghostty_session_set_font_size(session: *Session, points: f32) void {
+        if (points <= 0) return;
+        const clamped_points = sanitizeFontSize(points) orelse return;
+
+        var font_size = session.surface.core_surface.font_size;
+        font_size.points = clamped_points;
+        session.surface.core_surface.setFontSize(font_size) catch |err| {
+            log.err("error setting session font size err={}", .{err});
+            return;
+        };
+        session.surface.core_surface.font_size_adjusted = true;
+        var flags = session.notifySizeIfChanged();
+        flags = flags.unionWith(.{ .screen = true });
+        session.notifyStateChange(flags);
+    }
+
+    export fn ghostty_session_size(session: *Session) SurfaceSize {
+        return ghostty_surface_size(session.surface);
+    }
+
+    export fn ghostty_session_foreground_pid(session: *Session) u64 {
+        return ghostty_surface_foreground_pid(session.surface);
+    }
+
+    export fn ghostty_session_bracketed_paste(session: *Session) bool {
+        return ghostty_surface_bracketed_paste(session.surface);
+    }
+
+    export fn ghostty_session_state_revision(session: *Session) u64 {
+        return session.stateRevision();
+    }
+
+    export fn ghostty_session_take_pending_state_flags(session: *Session) u32 {
+        return session.takePendingStateFlags().bits();
+    }
+
+    export fn ghostty_session_tty_name(session: *Session) String {
+        return ghostty_surface_tty_name(session.surface);
+    }
+
+    export fn ghostty_session_title(session: *Session) String {
+        const title = session.surface.getTitle() orelse return .empty;
+        const copy = session.app.core_app.alloc.dupeZ(u8, title) catch |err| {
+            log.err("error allocating session title err={}", .{err});
+            return .empty;
+        };
+        return .fromSlice(copy);
+    }
+
+    export fn ghostty_session_working_directory(session: *Session) String {
+        if (session.surface.getWorkingDirectory()) |working_directory| {
+            const copy = session.app.core_app.alloc.dupeZ(u8, working_directory) catch |err| {
+                log.err("error allocating session working directory err={}", .{err});
+                return .empty;
+            };
+            return .fromSlice(copy);
+        }
+
+        const cwd = session.surface.core_surface.pwd(session.app.core_app.alloc) catch |err| {
+            log.err("error resolving session working directory err={}", .{err});
+            return .empty;
+        } orelse return .empty;
+        defer session.app.core_app.alloc.free(cwd);
+
+        const copy = session.app.core_app.alloc.dupeZ(u8, cwd) catch |err| {
+            log.err("error allocating session working directory copy err={}", .{err});
+            return .empty;
+        };
+        return .fromSlice(copy);
+    }
+
+    export fn ghostty_session_set_state_callback(
+        session: *Session,
+        callback: ?SessionStateCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        session.setStateCallback(callback, userdata);
+    }
+
+    export fn ghostty_session_set_data_callback(
+        session: *Session,
+        callback: ?SurfaceDataCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        ghostty_surface_set_data_callback(session.surface, callback, userdata);
+    }
+
+    export fn ghostty_session_process_output(
+        session: *Session,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        const slice = ptr orelse return;
+        session.surface.core_surface.io.processOutputBlocking(slice[0..len], true) catch |err| {
+            log.err("error processing session output err={}", .{err});
+            return;
+        };
+        session.notifyScreenMutation();
+    }
+
+    /// Wait until this session's IO thread has processed everything queued before this call.
+    ///
+    /// Host-managed sessions receive their input through that thread's mailbox and emit it to the host
+    /// through the receive-buffer callback while handling it, with no completion signal of its own.
+    /// This posts a no-op message through the same FIFO mailbox and returns once the thread has reached
+    /// it, which proves the earlier input was handled — and therefore handed to the host — first.
+    /// Nothing is parsed and no terminal state is touched, so it is safe to call at any point in the
+    /// output stream.
+    export fn ghostty_session_sync_io(session: *Session) void {
+        session.surface.core_surface.io.syncBlocking() catch |err| {
+            log.warn("error syncing session io err={}", .{err});
+        };
+    }
+
+    export fn ghostty_session_send_input_raw(
+        session: *Session,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        ghostty_surface_send_input_raw(session.surface, ptr, len);
+        session.notifyStateChange(session.notifyForegroundProcessIfChanged());
+    }
+
+    export fn ghostty_session_export_snapshot(
+        session: *Session,
+        result: *Snapshot,
+    ) bool {
+        return exportSnapshotFromSurface(session.surface, result);
+    }
+
+    export fn ghostty_session_export_render_frame(
+        session: *Session,
+        result: *RenderFrame,
+    ) bool {
+        result.* = .{};
+        if (!ghostty_session_export_snapshot(session, &result.snapshot)) return false;
+        result.version = 1;
+        result.session_revision = session.stateRevision();
+        result.owner_epoch = 0;
+        result.columns = result.snapshot.columns;
+        result.rows = result.snapshot.rows;
+        return true;
+    }
+
+    export fn ghostty_render_frame_free(frame: *RenderFrame) void {
+        frame.deinit();
+    }
+
+    export fn ghostty_mirror_new(
+        app: *App,
+        host: *const SurfaceHost,
+        config: *const SessionConfig,
+    ) ?*Mirror {
+        const mirror = global.alloc().create(Mirror) catch |err| {
+            log.err("error allocating mirror err={}", .{err});
+            return null;
+        };
+        mirror.init(app, host.*, config.*) catch |err| {
+            log.err("error initializing mirror err={}", .{err});
+            global.alloc().destroy(mirror);
+            return null;
+        };
+        return mirror;
+    }
+
+    export fn ghostty_mirror_apply_render_frame(
+        mirror: *Mirror,
+        frame: *const RenderFrame,
+    ) bool {
+        if (frame.version != 1) return false;
+        applySnapshotToSurface(mirror.session.surface, frame.snapshot) catch |err| {
+            log.err("error applying mirror render frame err={}", .{err});
+            return false;
+        };
+        mirror.session.surface.core_surface.draw() catch |err| {
+            log.err("error redrawing mirror render frame err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Applies a mirror render frame without presenting it.
+    ///
+    /// Identical to `ghostty_mirror_apply_render_frame` except that it does not call
+    /// `core_surface.draw()`. `applySnapshotToSurface` takes the renderer state mutex itself, so the
+    /// surface's terminal state is fully updated by the time this returns; only the present is left to
+    /// the caller.
+    ///
+    /// The draw the other entry point runs is `drawFrame(sync: true)`, which blocks the calling thread
+    /// on the swap chain. It also presents whichever cells were last *built*, and building happens on
+    /// the render thread only when woken by `ghostty_surface_refresh`, which the apply does not call --
+    /// so that draw re-presents the previous frame rather than the one it just applied. An embedder
+    /// that presents on its own cadence (refresh then draw, once per display interval) therefore pays
+    /// a GPU wait per applied frame for a present it does not use. This entry point is for that
+    /// embedder.
+    export fn ghostty_mirror_apply_render_frame_no_draw(
+        mirror: *Mirror,
+        frame: *const RenderFrame,
+    ) bool {
+        if (frame.version != 1) return false;
+        applySnapshotToSurface(mirror.session.surface, frame.snapshot) catch |err| {
+            log.err("error applying mirror render frame err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_mirror_surface(mirror: *Mirror) *Surface {
+        return mirror.session.surface;
+    }
+
+    /// Mirrors `ghostty_mirror_selection_info_s` in include/ghostty.h.
+    const MirrorSelectionInfo = extern struct {
+        present: bool = false,
+        rectangle: bool = false,
+        start_x: u16 = 0,
+        start_y: i32 = 0,
+        end_x: u16 = 0,
+        end_y: i32 = 0,
+    };
+
+    /// Reports a mirror surface's current painted selection in viewport coordinates, ordered
+    /// top-left first via the same `Selection.topLeft`/`bottomRight` logic the export path uses
+    /// (exact, including rectangle-selection column mirroring).
+    export fn ghostty_mirror_selection_info(mirror: *Mirror, out: *MirrorSelectionInfo) void {
+        const surface = mirror.session.surface;
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        out.* = mirrorSelectionInfo(core_surface.renderer_state.terminal.screens.active);
+    }
+
+    /// Paints (or clears, when `present` is false) the mirror's selection from viewport
+    /// coordinates and schedules a render.
+    ///
+    /// A client that owns its selection repaints with it after each local mouse event when its
+    /// merged selection differs from what Ghostty's gesture resolved (an off-screen anchor), so
+    /// the mirror shows the client's selection between frames. The coordinates have the same
+    /// space and clipping contract as a snapshot's selection fields: viewport-relative and
+    /// already clipped to the grid by the client. The gesture and the click pin are never
+    /// touched, and nothing is written to the clipboard.
+    export fn ghostty_mirror_set_selection(
+        mirror: *Mirror,
+        present: bool,
+        rectangle: bool,
+        start_x: u16,
+        start_y: u16,
+        end_x: u16,
+        end_y: u16,
+    ) void {
+        const surface = mirror.session.surface;
+        const core_surface = &surface.core_surface;
+        {
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer core_surface.renderer_state.mutex.unlock(global.io());
+
+            paintMirrorSelection(
+                core_surface.renderer_state.terminal.screens.active,
+                present,
+                rectangle,
+                .{ .x = start_x, .y = start_y },
+                .{ .x = end_x, .y = end_y },
+            ) catch |err| {
+                log.err("error painting mirror selection err={}", .{err});
+                return;
+            };
+        }
+        // Refresh only after releasing the renderer state lock, as every other
+        // mutation-then-refresh entry point does.
+        surface.refresh();
+    }
+
+    fn mirrorSelectionInfo(screen: *terminal.Screen) MirrorSelectionInfo {
+        const sel = screen.selection orelse return .{};
+        const tl = screen.pages.pointFromPin(.active, sel.topLeft(screen)) orelse return .{};
+        const br = screen.pages.pointFromPin(.active, sel.bottomRight(screen)) orelse return .{};
+        return .{
+            .present = true,
+            .rectangle = sel.rectangle,
+            .start_x = tl.coord().x,
+            .start_y = @intCast(tl.coord().y),
+            .end_x = br.coord().x,
+            .end_y = @intCast(br.coord().y),
+        };
+    }
+
+    export fn ghostty_mirror_set_host(
+        mirror: *Mirror,
+        host: *const SurfaceHost,
+    ) bool {
+        return ghostty_renderer_set_host(mirror.renderer, host);
+    }
+
+    export fn ghostty_mirror_free(mirror: *Mirror) void {
+        mirror.deinit();
+        global.alloc().destroy(mirror);
+    }
+
+    export fn ghostty_renderer_new(host: *const SurfaceHost) ?*Renderer {
+        const renderer_handle = global.alloc().create(Renderer) catch |err| {
+            log.err("error allocating renderer err={}", .{err});
+            return null;
+        };
+        renderer_handle.* = .{
+            .host = host.*,
+            .attached_session = null,
+        };
+        return renderer_handle;
+    }
+
+    export fn ghostty_renderer_free(renderer_handle: *Renderer) void {
+        renderer_handle.detachForFree() catch |err| {
+            log.err(
+                "error detaching renderer during free; renderer not freed err={}",
+                .{err},
+            );
+            return;
+        };
+        global.alloc().destroy(renderer_handle);
+    }
+
+    export fn ghostty_renderer_attach(
+        renderer_handle: *Renderer,
+        session: *Session,
+    ) bool {
+        session.attachRenderer(renderer_handle) catch |err| {
+            log.err("error attaching renderer err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_renderer_detach(renderer_handle: *Renderer) bool {
+        renderer_handle.detach() catch |err| {
+            log.err("error detaching renderer err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_renderer_surface(renderer_handle: *Renderer) ?*Surface {
+        const session = renderer_handle.attached_session orelse return null;
+        return session.surface;
+    }
+
+    export fn ghostty_renderer_set_host(
+        renderer_handle: *Renderer,
+        host: *const SurfaceHost,
+    ) bool {
+        renderer_handle.setHost(host.*) catch |err| {
+            log.err("error rebinding renderer host err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    export fn ghostty_renderer_session(renderer_handle: *Renderer) ?*Session {
+        return renderer_handle.attached_session;
+    }
+
+    export fn ghostty_renderer_is_owner(renderer_handle: *const Renderer) bool {
+        return renderer_handle.isOwner();
+    }
+
+    export fn ghostty_terminal_snapshot_free(snapshot: *Snapshot) void {
+        snapshot.deinit();
     }
 
     /// Update the color scheme of the surface.
@@ -2073,6 +4131,29 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.textCallback(ptr[0..len]);
+    }
+
+    /// Register a callback for raw PTY output bytes before Ghostty parses them.
+    export fn ghostty_surface_set_data_callback(
+        surface: *Surface,
+        callback: ?SurfaceDataCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.data_callback = callback;
+        surface.data_callback_userdata = userdata;
+        surface.core_surface.io.setDataCallback(callback, userdata);
+    }
+
+    /// Send raw PTY bytes directly to the child process.
+    export fn ghostty_surface_send_input_raw(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) void {
+        if (ptr == null or len == 0) return;
+        surface.core_surface.sendInputRaw(ptr.?[0..len]) catch |err| {
+            log.warn("error sending raw input err={}", .{err});
+        };
     }
 
     /// Set the preedit text for the surface. This is used for IME
@@ -2407,12 +4488,11 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            _ = surface.renderer_thread.mailbox.push(
-                global.io(),
-                .{ .macos_display_id = display_id },
-                .{ .forever = {} },
-            );
-            surface.renderer_thread.wakeup.notify() catch {};
+            surface.queueRendererMessageFromAnyThread(.{ .macos_display_id = display_id });
+        }
+
+        export fn ghostty_session_set_display_id(session: *Session, display_id: u32) void {
+            ghostty_surface_set_display_id(session.surface, display_id);
         }
 
         /// This returns a CTFontRef that should be used for quicklook
@@ -2424,6 +4504,10 @@ pub const CAPI = struct {
             if (comptime font.options.backend != .coretext) {
                 return null;
             }
+
+            // A headless surface has no renderer to read the font grid from,
+            // and nothing to QuickLook in.
+            if (ptr.core_surface.headless) return null;
 
             // We'll need content scale so fail early if we can't get it.
             const content_scale = ptr.getContentScale() catch return null;
@@ -2523,3 +4607,542 @@ pub const CAPI = struct {
         }
     };
 };
+
+// Tests below cover the pure or `*terminal.Screen`-only pieces of the mirror selection model
+// (frame-selection painting) and the gesture reconciliation against a bare `Terminal`. The
+// orchestration around them in `applySnapshotToSurface` (in-progress-drag detection off
+// `Surface.core_surface.mouse` and the `Surface.refresh()` call) needs a full apprt `Surface`,
+// and this codebase has no test harness that constructs one with a real `App`/window/renderer
+// callback set; only the pieces it wires together are covered here.
+
+test "clampedDragPin clamps a virtual position to row 0 / column 0 and to the grid extent" {
+    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
+        .cols = 10,
+        .rows = 5,
+        .max_scrollback_bytes = 4096,
+    });
+    defer s.deinit();
+
+    const negative_pin = CAPI.clampedDragPin(&s, -3, -7, 10, 5);
+    const negative = s.pages.pointFromPin(.active, negative_pin).?.coord();
+    try std.testing.expectEqual(@as(u16, 0), negative.x);
+    try std.testing.expectEqual(@as(u32, 0), negative.y);
+
+    const overflow_pin = CAPI.clampedDragPin(&s, 25, 25, 10, 5);
+    const overflow = s.pages.pointFromPin(.active, overflow_pin).?.coord();
+    try std.testing.expectEqual(@as(u16, 9), overflow.x);
+    try std.testing.expectEqual(@as(u32, 4), overflow.y);
+}
+
+test "applyMirrorSelectionFromSnapshot paints an equivalent selection and clears when absent" {
+    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback_bytes = 4096,
+    });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
+
+    try CAPI.applyMirrorSelectionFromSnapshot(&s, .{
+        .selection_flags = CAPI.SelectionFlags.present,
+        .selection_start_x = 1,
+        .selection_start_y = 0,
+        .selection_end_x = 3,
+        .selection_end_y = 1,
+    });
+
+    {
+        const sel = s.selection.?;
+        const start = s.pages.pointFromPin(.active, sel.start()).?.coord();
+        const end = s.pages.pointFromPin(.active, sel.end()).?.coord();
+        try std.testing.expectEqual(@as(u16, 1), start.x);
+        try std.testing.expectEqual(@as(u32, 0), start.y);
+        try std.testing.expectEqual(@as(u16, 3), end.x);
+        try std.testing.expectEqual(@as(u32, 1), end.y);
+        try std.testing.expect(!sel.rectangle);
+    }
+
+    // A snapshot with no selection flags clears whatever was painted.
+    try CAPI.applyMirrorSelectionFromSnapshot(&s, .{});
+    try std.testing.expect(s.selection == null);
+}
+
+test "applyMirrorSelectionFromSnapshot paints a rectangle selection" {
+    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback_bytes = 4096,
+    });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
+
+    try CAPI.applyMirrorSelectionFromSnapshot(&s, .{
+        .selection_flags = CAPI.SelectionFlags.present | CAPI.SelectionFlags.rectangle,
+        .selection_start_x = 1,
+        .selection_start_y = 0,
+        .selection_end_x = 3,
+        .selection_end_y = 1,
+    });
+
+    try std.testing.expect(s.selection.?.rectangle);
+}
+
+// Gesture-level tests for the client-supplied anchor, and the click-pin re-seat.
+// They drive `reconcileMirrorGesture` and `mirrorSelectionInfo` with a bare `Terminal` and
+// `SelectionGesture`, replaying what `applySnapshotToSurface` does around them: read the live
+// gesture state, wipe the grid with `fullReset`, then reconcile.
+
+const test_columns: u16 = 10;
+const test_rows: u16 = 5;
+
+const test_cell_width: u32 = 10;
+const test_padding_left: u32 = 0;
+
+fn testGestureDragGeometry() terminal.SelectionGesture.Drag.Geometry {
+    return .{ .columns = test_columns, .cell_width = test_cell_width, .padding_left = test_padding_left, .screen_height = 1000 };
+}
+
+/// Presses at (press_x, press_y) and drags to (drag_x, drag_y), painting the drag's selection the
+/// way the surface does. Pointer positions sit at each cell's left edge.
+fn testStartDrag(
+    t: *terminal.Terminal,
+    gesture: *terminal.SelectionGesture,
+    press_x: u16,
+    press_y: u32,
+    drag_x: u16,
+    drag_y: u32,
+    rectangle: bool,
+) !void {
+    const screen = t.screens.active;
+    _ = try gesture.press(t, .{
+        .time = std.Io.Timestamp.now(std.testing.io, .awake),
+        .pin = screen.pages.pin(.{ .active = .{ .x = press_x, .y = press_y } }).?,
+        .xpos = @as(f64, @floatFromInt(press_x)) * 10 + 1,
+        .ypos = @as(f64, @floatFromInt(press_y)) * 10 + 1,
+        .max_distance = 10,
+        .repeat_interval = std.math.maxInt(u64),
+        .word_boundary_codepoints = &.{},
+    });
+    if (gesture.drag(t, .{
+        .pin = screen.pages.pin(.{ .active = .{ .x = drag_x, .y = drag_y } }).?,
+        .xpos = @as(f64, @floatFromInt(drag_x)) * 10 + 9,
+        .ypos = @as(f64, @floatFromInt(drag_y)) * 10 + 1,
+        .rectangle = rectangle,
+        .word_boundary_codepoints = &.{},
+        .geometry = testGestureDragGeometry(),
+    })) |selection| try screen.select(selection);
+}
+
+/// One frame apply's worth of gesture handling, minus painting cells.
+fn testApplyFrame(
+    t: *terminal.Terminal,
+    gesture: *terminal.SelectionGesture,
+    snapshot: CAPI.Snapshot,
+    drag_in_progress: bool,
+) !void {
+    try testApplyFrameWithText(t, gesture, snapshot, drag_in_progress, "");
+}
+
+/// Like `testApplyFrame`, but repaints `text` onto the wiped grid the way a real frame repaints
+/// its cells, for gestures (word selection) that read the grid's contents.
+fn testApplyFrameWithText(
+    t: *terminal.Terminal,
+    gesture: *terminal.SelectionGesture,
+    snapshot: CAPI.Snapshot,
+    drag_in_progress: bool,
+    text: []const u8,
+) !void {
+    const screen = t.screens.active;
+    const click_coord: ?terminal.point.Coordinate = if (gesture.validatedLeftClickPin(&t.screens)) |pin|
+        screen.pages.pointFromPin(.active, pin.*).?.coord()
+    else
+        null;
+    const drag_selection = if (drag_in_progress) CAPI.captureDragSelection(t) else null;
+    const grid_changed = t.cols != snapshot.columns or t.rows != snapshot.rows;
+    t.fullReset();
+    try t.printString(text);
+    try CAPI.reconcileMirrorGesture(gesture, t, snapshot, .{
+        .drag_in_progress = drag_in_progress,
+        .grid_changed = grid_changed,
+        .click_coord = click_coord,
+        .drag_selection = drag_selection,
+    });
+}
+
+fn testFrame(anchor: ?struct { x: i32, y: i32 }) CAPI.Snapshot {
+    return .{
+        .columns = test_columns,
+        .rows = test_rows,
+        .drag_anchor_valid = anchor != null,
+        .drag_anchor_x = if (anchor) |a| a.x else 0,
+        .drag_anchor_y = if (anchor) |a| a.y else 0,
+    };
+}
+
+/// A frame carrying the client's projected selection (viewport coordinates, start before end),
+/// as a client that owns its selection writes it.
+fn testFrameWithSelection(
+    anchor: struct { x: i32, y: i32 },
+    start: struct { x: u16, y: u16 },
+    end: struct { x: u16, y: u16 },
+    rectangle: bool,
+) CAPI.Snapshot {
+    var frame = testFrame(.{ .x = anchor.x, .y = anchor.y });
+    frame.selection_flags = CAPI.SelectionFlags.present |
+        (if (rectangle) CAPI.SelectionFlags.rectangle else 0);
+    frame.selection_start_x = start.x;
+    frame.selection_start_y = start.y;
+    frame.selection_end_x = end.x;
+    frame.selection_end_y = end.y;
+    return frame;
+}
+
+fn testCoord(screen: *terminal.Screen, pin: terminal.Pin) terminal.point.Coordinate {
+    return screen.pages.pointFromPin(.active, pin).?.coord();
+}
+
+fn expectSelectionCells(
+    screen: *terminal.Screen,
+    start: struct { x: u16, y: u32 },
+    end: struct { x: u16, y: u32 },
+    rectangle: bool,
+) !void {
+    const sel = screen.selection.?;
+    try std.testing.expectEqual(rectangle, sel.rectangle);
+    try std.testing.expectEqual(start.x, testCoord(screen, sel.start()).x);
+    try std.testing.expectEqual(start.y, testCoord(screen, sel.start()).y);
+    try std.testing.expectEqual(end.x, testCoord(screen, sel.end()).x);
+    try std.testing.expectEqual(end.y, testCoord(screen, sel.end()).y);
+}
+
+fn expectClickPin(t: *terminal.Terminal, gesture: *terminal.SelectionGesture, x: u16, y: u32) !void {
+    const pin = gesture.validatedLeftClickPin(&t.screens).?;
+    const coord = testCoord(t.screens.active, pin.*);
+    try std.testing.expectEqual(x, coord.x);
+    try std.testing.expectEqual(y, coord.y);
+}
+
+test "a client anchor keeps a drag alive and paints the client's projection" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
+
+    // Content moved up two rows under the drag; the client knows, so its projection of its
+    // selection is what gets painted.
+    const frame = testFrameWithSelection(.{ .x = 2, .y = 1 }, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 2 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
+
+    try expectSelectionCells(t.screens.active, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 2 }, false);
+    try expectClickPin(&t, &gesture, 2, 1);
+}
+
+test "a drag without a client anchor cancels" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
+    try testApplyFrame(&t, &gesture, testFrame(null), true);
+
+    try std.testing.expect(t.screens.active.selection == null);
+    try std.testing.expectEqual(@as(u3, 0), gesture.left_click_count);
+}
+
+test "a grid size change cancels a drag even when the client supplies an anchor" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
+    // The frame is one row taller than the grid the drag started on.
+    var frame = testFrame(.{ .x = 2, .y = 1 });
+    frame.rows = test_rows + 1;
+    try testApplyFrame(&t, &gesture, frame, true);
+
+    try std.testing.expect(t.screens.active.selection == null);
+    try std.testing.expectEqual(@as(u3, 0), gesture.left_click_count);
+}
+
+test "a client anchor above the viewport paints the client's selection and seats the click pin top-left" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 5, 1, 4, 2, false);
+    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
+
+    // The painted selection is the client's projection, not a rebuild from the pin.
+    try expectSelectionCells(t.screens.active, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
+    // The anchor's whole row is above the viewport, so the pin sits at the corner (not (5, 0)).
+    try expectClickPin(&t, &gesture, 0, 0);
+}
+
+test "a client anchor below the viewport seats the click pin bottom-right" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 3, 3, 2, 1, false);
+    const frame = testFrameWithSelection(.{ .x = 3, .y = 9 }, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
+
+    try expectSelectionCells(t.screens.active, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
+    try expectClickPin(&t, &gesture, test_columns - 1, test_rows - 1);
+}
+
+test "a client anchor above the viewport keeps a rectangle selection's column" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 5, 1, 7, 2, true);
+    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, .{ .x = 5, .y = 0 }, .{ .x = 7, .y = 2 }, true);
+    try testApplyFrame(&t, &gesture, frame, true);
+
+    try expectSelectionCells(t.screens.active, .{ .x = 5, .y = 0 }, .{ .x = 7, .y = 2 }, true);
+    try expectClickPin(&t, &gesture, 5, 0);
+}
+
+fn testPress(t: *terminal.Terminal, gesture: *terminal.SelectionGesture, x: u16, y: u32, xpos: f64) !void {
+    _ = try gesture.press(t, .{
+        .time = std.Io.Timestamp.now(std.testing.io, .awake),
+        .pin = t.screens.active.pages.pin(.{ .active = .{ .x = x, .y = y } }).?,
+        .xpos = xpos,
+        .ypos = @as(f64, @floatFromInt(y)) * 10 + 1,
+        .max_distance = 10,
+        .repeat_interval = std.math.maxInt(u64),
+        .word_boundary_codepoints = &.{},
+    });
+}
+
+fn testCellDrag(screen: *terminal.Screen, x: u16, y: u32, xpos: f64) terminal.SelectionGesture.Drag {
+    return .{
+        .pin = screen.pages.pin(.{ .active = .{ .x = x, .y = y } }).?,
+        .xpos = xpos,
+        .ypos = @as(f64, @floatFromInt(y)) * 10 + 1,
+        .rectangle = false,
+        .word_boundary_codepoints = &.{},
+        .geometry = testGestureDragGeometry(),
+    };
+}
+
+test "a further drag with the anchor above the viewport resolves the pointer side to the pointer's cell" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testPress(&t, &gesture, 5, 1, 58);
+    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
+
+    const screen = t.screens.active;
+    const selection = gesture.drag(&t, testCellDrag(screen, 4, 2, 49)).?;
+    try std.testing.expectEqual(@as(u16, 4), testCoord(screen, selection.bottomRight(screen)).x);
+    try std.testing.expectEqual(@as(u32, 2), testCoord(screen, selection.bottomRight(screen)).y);
+}
+
+test "a further drag with the anchor below the viewport resolves the pointer side to the pointer's cell" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testPress(&t, &gesture, 3, 3, 31);
+    const frame = testFrameWithSelection(.{ .x = 3, .y = 9 }, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
+
+    const screen = t.screens.active;
+    const selection = gesture.drag(&t, testCellDrag(screen, 2, 1, 21)).?;
+    try std.testing.expectEqual(@as(u16, 2), testCoord(screen, selection.topLeft(screen)).x);
+    try std.testing.expectEqual(@as(u32, 1), testCoord(screen, selection.topLeft(screen)).y);
+}
+
+test "paintMirrorSelection paints a stream selection, a rectangle, and clears when absent" {
+    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
+        .cols = test_columns,
+        .rows = test_rows,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+
+    try CAPI.paintMirrorSelection(&s, true, false, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 3 });
+    try expectSelectionCells(&s, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 3 }, false);
+
+    try CAPI.paintMirrorSelection(&s, true, true, .{ .x = 1, .y = 0 }, .{ .x = 4, .y = 2 });
+    try expectSelectionCells(&s, .{ .x = 1, .y = 0 }, .{ .x = 4, .y = 2 }, true);
+
+    try CAPI.paintMirrorSelection(&s, false, false, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 3 });
+    try std.testing.expect(s.selection == null);
+}
+
+test "paintMirrorSelection leaves the gesture's click pin and click count alone" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
+    const count_before = gesture.left_click_count;
+    try std.testing.expect(count_before > 0);
+
+    const screen = t.screens.active;
+    try CAPI.paintMirrorSelection(screen, true, false, .{ .x = 0, .y = 0 }, .{ .x = 6, .y = 4 });
+    try expectSelectionCells(screen, .{ .x = 0, .y = 0 }, .{ .x = 6, .y = 4 }, false);
+    try std.testing.expectEqual(count_before, gesture.left_click_count);
+    try expectClickPin(&t, &gesture, 2, 3);
+
+    try CAPI.paintMirrorSelection(screen, false, false, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 });
+    try std.testing.expect(screen.selection == null);
+    try std.testing.expectEqual(count_before, gesture.left_click_count);
+    try expectClickPin(&t, &gesture, 2, 3);
+}
+
+test "a backward word drag continues from the click word after a client-anchor frame" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+    const text = "aa bb cc";
+    try t.printString(text);
+
+    // Double-click "cc" (cells 6..7), then drag back onto "aa". Ghostty stores this selection in
+    // document order, so its end is the click word's end, not the pointer side.
+    const screen = t.screens.active;
+    const time = std.Io.Timestamp.now(std.testing.io, .awake);
+    const press_event: terminal.SelectionGesture.Press = .{
+        .time = time,
+        .pin = screen.pages.pin(.{ .active = .{ .x = 6, .y = 0 } }).?,
+        .xpos = 61,
+        .ypos = 1,
+        .max_distance = 10,
+        .repeat_interval = std.math.maxInt(u64),
+        .word_boundary_codepoints = &.{' '},
+    };
+    _ = try gesture.press(&t, press_event);
+    if (try gesture.press(&t, press_event)) |selection| try screen.select(selection);
+    if (gesture.drag(&t, testWordDrag(screen, 1))) |selection| try screen.select(selection);
+    try expectSelectionCells(screen, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 0 }, false);
+
+    // The client projects the same selection and the click cell onto the next frame.
+    const frame = testFrameWithSelection(.{ .x = 6, .y = 0 }, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 0 }, false);
+    try testApplyFrameWithText(&t, &gesture, frame, true, text);
+    const repainted = t.screens.active;
+    try expectSelectionCells(repainted, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 0 }, false);
+    try expectClickPin(&t, &gesture, 6, 0);
+
+    // The next mouse move resolves from the re-seated pin: pointer word start to click word end.
+    const next = gesture.drag(&t, testWordDrag(repainted, 3)).?;
+    try std.testing.expectEqual(@as(u16, 3), testCoord(repainted, next.start()).x);
+    try std.testing.expectEqual(@as(u16, 7), testCoord(repainted, next.end()).x);
+    try std.testing.expectEqual(@as(u32, 0), testCoord(repainted, next.start()).y);
+    try std.testing.expectEqual(@as(u32, 0), testCoord(repainted, next.end()).y);
+}
+
+/// A drag event on row 0 at `x` inside a double-click (word) gesture.
+fn testWordDrag(screen: *terminal.Screen, x: u16) terminal.SelectionGesture.Drag {
+    return .{
+        .pin = screen.pages.pin(.{ .active = .{ .x = x, .y = 0 } }).?,
+        .xpos = @as(f64, @floatFromInt(x)) * 10 + 5,
+        .ypos = 1,
+        .rectangle = false,
+        .word_boundary_codepoints = &.{' '},
+        .geometry = testGestureDragGeometry(),
+    };
+}
+
+test "a committed client anchor re-seats the click pin that a shift-click extends from" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    // A finished click-drag whose text has since moved up two rows.
+    try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
+    try std.testing.expect(gesture.left_click_count > 0);
+
+    // Without an anchor the pin goes back to its pre-reset cell, one stale position.
+    try testApplyFrame(&t, &gesture, testFrame(null), false);
+    var pin = gesture.validatedLeftClickPin(&t.screens).?;
+    try std.testing.expectEqual(@as(u32, 3), testCoord(t.screens.active, pin.*).y);
+
+    // With the committed anchor projected onto the frame, it follows the text.
+    try testApplyFrame(&t, &gesture, testFrame(.{ .x = 2, .y = 1 }), false);
+    pin = gesture.validatedLeftClickPin(&t.screens).?;
+    const coord = testCoord(t.screens.active, pin.*);
+    try std.testing.expectEqual(@as(u16, 2), coord.x);
+    try std.testing.expectEqual(@as(u32, 1), coord.y);
+}
+
+test "a committed client anchor outside the grid seats the click pin on the stand-in corner" {
+    var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
+    defer t.deinit(std.testing.allocator);
+    var gesture: terminal.SelectionGesture = .init;
+    defer gesture.deinit(&t);
+
+    try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
+    // Above the grid: the top-left corner cell.
+    try testApplyFrame(&t, &gesture, testFrame(.{ .x = 2, .y = -1 }), false);
+    try std.testing.expect(gesture.left_click_count > 0);
+    var pin = gesture.validatedLeftClickPin(&t.screens).?;
+    var coord = testCoord(t.screens.active, pin.*);
+    try std.testing.expectEqual(@as(u16, 0), coord.x);
+    try std.testing.expectEqual(@as(u32, 0), coord.y);
+
+    // Below the grid: the bottom-right corner cell.
+    try testApplyFrame(&t, &gesture, testFrame(.{ .x = 2, .y = test_rows }), false);
+    try std.testing.expect(gesture.left_click_count > 0);
+    pin = gesture.validatedLeftClickPin(&t.screens).?;
+    coord = testCoord(t.screens.active, pin.*);
+    try std.testing.expectEqual(@as(u16, test_columns - 1), coord.x);
+    try std.testing.expectEqual(@as(u32, test_rows - 1), coord.y);
+}
+
+test "mouseTrackingLevel orders the modes by how much motion they want" {
+    try std.testing.expectEqual(@as(u8, 0), CAPI.mouseTrackingLevel(.none));
+    try std.testing.expectEqual(@as(u8, 1), CAPI.mouseTrackingLevel(.x10));
+    try std.testing.expectEqual(@as(u8, 1), CAPI.mouseTrackingLevel(.normal));
+    try std.testing.expectEqual(@as(u8, 2), CAPI.mouseTrackingLevel(.button));
+    try std.testing.expectEqual(@as(u8, 3), CAPI.mouseTrackingLevel(.any));
+}
+
+test "mirrorSelectionInfo reports the selection top-left first" {
+    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
+        .cols = test_columns,
+        .rows = test_rows,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+
+    // A selection stored with its later cell first.
+    const anchor = s.pages.pin(.{ .active = .{ .x = 6, .y = 3 } }).?;
+    const head = s.pages.pin(.{ .active = .{ .x = 1, .y = 1 } }).?;
+    try s.select(terminal.Selection.init(anchor, head, false));
+    var info = CAPI.mirrorSelectionInfo(&s);
+    try std.testing.expect(info.present);
+    try std.testing.expectEqual(@as(u16, 1), info.start_x);
+    try std.testing.expectEqual(@as(i32, 1), info.start_y);
+    try std.testing.expectEqual(@as(u16, 6), info.end_x);
+    try std.testing.expectEqual(@as(i32, 3), info.end_y);
+
+    // A rectangle mirrors its columns into top-left/bottom-right order.
+    const rect_anchor = s.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
+    const rect_head = s.pages.pin(.{ .active = .{ .x = 2, .y = 3 } }).?;
+    try s.select(terminal.Selection.init(rect_anchor, rect_head, true));
+    info = CAPI.mirrorSelectionInfo(&s);
+    try std.testing.expectEqual(@as(u16, 2), info.start_x);
+    try std.testing.expectEqual(@as(u16, 6), info.end_x);
+
+    // No selection, nothing reported.
+    s.clearSelection();
+    try std.testing.expect(!CAPI.mirrorSelectionInfo(&s).present);
+}

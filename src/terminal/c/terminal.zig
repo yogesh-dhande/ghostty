@@ -1809,12 +1809,24 @@ pub const TerminalData = enum(c_int) {
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
     memory_usage = 42,
+    saved_cursor_x = 44,
+    saved_cursor_y = 45,
+    saved_cursor_origin = 46,
+    rows_pruned = 47,
+    history_epoch = 48,
+    mouse_event = 49,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
         return switch (self) {
             .invalid => void,
-            .cols, .rows, .cursor_x, .cursor_y => size.CellCountInt,
+            .cols,
+            .rows,
+            .cursor_x,
+            .cursor_y,
+            .saved_cursor_x,
+            .saved_cursor_y,
+            => size.CellCountInt,
             .cursor_pending_wrap,
             .cursor_visible,
             .mouse_tracking,
@@ -1822,8 +1834,10 @@ pub const TerminalData = enum(c_int) {
             .vt_processing_error,
             .vt_ground,
             .cursor_at_prompt,
+            .saved_cursor_origin,
             => bool,
             .mouse_shape => mouse.Shape,
+            .mouse_event => mouse.Event,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
@@ -1845,7 +1859,10 @@ pub const TerminalData = enum(c_int) {
             .color_cursor_default,
             => color.RGB.C,
             .color_palette, .color_palette_default => color.PaletteC,
-            .kitty_image_storage_limit => u64,
+            .kitty_image_storage_limit,
+            .rows_pruned,
+            .history_epoch,
+            => u64,
             .kitty_image_medium_file,
             .kitty_image_medium_shared_mem,
             => bool,
@@ -1927,6 +1944,7 @@ fn getTyped(
             t.modes.get(.mouse_event_button) or
             t.modes.get(.mouse_event_any),
         .mouse_shape => out.* = t.mouse_shape,
+        .mouse_event => out.* = t.flags.mouse_event,
         .title => {
             const title = t.getTitle() orelse "";
             out.* = .{ .ptr = title.ptr, .len = title.len };
@@ -1993,6 +2011,11 @@ fn getTyped(
             const mode = out.toMode() orelse return .invalid_value;
             out.value = t.modes.get(mode);
         },
+        .saved_cursor_x => out.* = (t.screens.active.saved_cursor orelse return .no_value).x,
+        .saved_cursor_y => out.* = (t.screens.active.saved_cursor orelse return .no_value).y,
+        .saved_cursor_origin => out.* = (t.screens.active.saved_cursor orelse return .no_value).origin,
+        .rows_pruned => out.* = t.screens.active.pages.rows_pruned,
+        .history_epoch => out.* = t.history_epoch,
         .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
         .memory_usage => {
             // A smaller size means the caller doesn't have every field of
@@ -2079,6 +2102,131 @@ pub fn point_from_grid_ref(
     const pt = t.screens.active.pages.pointFromPin(tag, p) orelse
         return .no_value;
     if (out) |o| o.* = pt.coord();
+    return .success;
+}
+
+/// The fixed capacity of Terminal.pending_render_scroll_rects. Mirrored
+/// here so callers of take_render_scroll_rects know the buffer size that
+/// is guaranteed to never overflow.
+pub const max_render_scroll_rects = 64;
+
+/// C: GhosttyTerminalScrollRect
+pub const TerminalScrollRect = extern struct {
+    size: usize = @sizeOf(TerminalScrollRect),
+    row_start: size.CellCountInt = 0,
+    row_count: size.CellCountInt = 0,
+    column_start: size.CellCountInt = 0,
+    column_count: size.CellCountInt = 0,
+    delta_rows: i32 = 0,
+    delta_columns: i32 = 0,
+};
+
+/// Copies the terminal's pending render scroll rects (viewport scroll
+/// deltas accumulated since the last call) into the caller-provided buffer,
+/// then unconditionally clears the pending buffer. This is the vt-facing
+/// consumer of Terminal.pendingRenderScrollRects(); nothing else in the vt
+/// render_state path reads or clears it.
+///
+/// Returns the number of rects written, which is min(pending count, capacity),
+/// or 0 with `overflowed` set when the caller's `GhosttyTerminalScrollRect.size`
+/// does not match this build's (see the sized-struct check below): the pending
+/// rects were discarded unread, exactly what `overflowed` tells a caller.
+/// If the terminal accumulated more scroll operations than its internal
+/// fixed buffer (max_render_scroll_rects) could hold, the pending rects are
+/// discarded entirely (this mirrors Terminal.pendingRenderScrollRectsOverflowed()),
+/// `overflowed` is set to true if non-NULL, and this returns 0. The pending
+/// buffer is cleared in both the overflow and non-overflow cases, and also
+/// when `out` is NULL or `capacity` is 0 (draining without reading).
+pub fn take_render_scroll_rects(
+    terminal_: Terminal,
+    out: ?[*]TerminalScrollRect,
+    capacity: usize,
+    overflowed: ?*bool,
+) callconv(lib.calling_conv) usize {
+    if (overflowed) |o| o.* = false;
+
+    const wrapper = terminal_ orelse return 0;
+    const t: *ZigTerminal = wrapper.terminal;
+
+    // This call always takes ownership of whatever is pending, regardless
+    // of whether the caller supplied a destination buffer with enough
+    // capacity to read all of it.
+    defer t.clearPendingRenderScrollRects();
+
+    if (t.pendingRenderScrollRectsOverflowed()) {
+        if (overflowed) |o| o.* = true;
+        return 0;
+    }
+
+    const rects = t.pendingRenderScrollRects();
+    const dest = out orelse return 0;
+    const n = @min(rects.len, capacity);
+    // TerminalScrollRect is a sized struct, but `dest[i]` below strides by this
+    // build's native @sizeOf: a caller compiled against a different struct size
+    // would be written at the wrong offsets from the second element on. Refuse a
+    // mismatched size outright (the pending buffer is still drained, per the
+    // contract above), the same way other sized-struct outputs reject on size.
+    // Report the refusal through `overflowed`: both cases mean "pending scroll
+    // state was discarded unread", and it is the one signal a size-mismatched
+    // caller can still read, telling it to drop its incremental scroll carry
+    // instead of mistaking the 0 for "nothing scrolled".
+    if (n > 0 and dest[0].size != @sizeOf(TerminalScrollRect)) {
+        if (overflowed) |o| o.* = true;
+        return 0;
+    }
+    for (rects[0..n], 0..) |r, i| {
+        dest[i] = .{
+            .row_start = r.row_start,
+            .row_count = r.row_count,
+            .column_start = r.column_start,
+            .column_count = r.column_count,
+            .delta_rows = r.delta_rows,
+            .delta_columns = r.delta_columns,
+        };
+    }
+    return n;
+}
+
+/// Make `screen` the terminal's active screen without any of the side effects
+/// of a mode-driven screen switch (no cursor copy, no erase, no cursor
+/// save/restore, no selection or hyperlink change). It exists so an embedder
+/// can read the INACTIVE screen's grid, cursor and saved cursor through the
+/// ordinary active-screen getters and render state, then switch back.
+///
+/// Returns GHOSTTY_NO_VALUE when the requested screen has never been
+/// initialized (the alternate screen of a terminal that never entered it).
+///
+/// Fork-owned; not part of upstream libghostty-vt.
+pub fn set_active_screen(
+    terminal_: Terminal,
+    screen: TerminalScreen,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t: *ZigTerminal = wrapper.terminal;
+    if (t.screens.get(screen) == null) return .no_value;
+    if (t.screens.active_key == screen) return .success;
+    t.screens.switchTo(screen);
+    // A render state keyed on the previous screen must rebuild from this one.
+    t.flags.dirty.clear = true;
+    return .success;
+}
+
+/// Report whether a tab stop is set at `column` (0-indexed).
+///
+/// Returns GHOSTTY_INVALID_VALUE for a NULL terminal or `out`, and for a
+/// column outside the terminal's width.
+///
+/// Fork-owned; not part of upstream libghostty-vt.
+pub fn tabstop(
+    terminal_: Terminal,
+    column: u16,
+    out: ?*bool,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t: *ZigTerminal = wrapper.terminal;
+    const out_ptr = out orelse return .invalid_value;
+    if (column >= t.cols) return .invalid_value;
+    out_ptr.* = t.tabstops.get(column);
     return .success;
 }
 
@@ -3601,6 +3749,52 @@ test "get mouse_tracking" {
     try testing.expectEqual(Result.success, set(t, .mode, @ptrCast(&config)));
     try testing.expectEqual(Result.success, get(t, .mouse_tracking, @ptrCast(&tracking)));
     try testing.expect(!tracking);
+}
+
+test "get mouse_event" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var event: mouse.Event = undefined;
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.none, event);
+
+    // Each tracking mode reads as itself.
+    const cases = [_]struct { seq: []const u8, expected: mouse.Event }{
+        .{ .seq = "\x1b[?9h", .expected = .x10 },
+        .{ .seq = "\x1b[?1000h", .expected = .normal },
+        .{ .seq = "\x1b[?1002h", .expected = .button },
+        .{ .seq = "\x1b[?1003h", .expected = .any },
+    };
+    for (cases) |case| {
+        vt_write(t, case.seq.ptr, case.seq.len);
+        try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+        try testing.expectEqual(case.expected, event);
+    }
+    vt_write(t, "\x1b[?1003l", 8);
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.none, event);
+
+    // The latest request wins even though both mode bits end up set, so the
+    // flag disagrees with `mouse_tracking`'s mode bits.
+    vt_write(t, "\x1b[?1003h", 8);
+    vt_write(t, "\x1b[?1000h", 8);
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.normal, event);
+
+    // Disabling any tracking mode resets the flag, whatever bits remain set.
+    vt_write(t, "\x1b[?1003l", 8);
+    try testing.expectEqual(Result.success, get(t, .mouse_event, @ptrCast(&event)));
+    try testing.expectEqual(mouse.Event.none, event);
+    var tracking: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .mouse_tracking, @ptrCast(&tracking)));
+    try testing.expect(tracking);
 }
 
 test "get total_rows" {
@@ -7133,6 +7327,131 @@ test "get_multi null keys returns invalid_value" {
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
 }
 
+test "take_render_scroll_rects returns pending rects and clears them" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer free(t);
+
+    // Fill the 3-row active area with three CRLF-terminated lines, then
+    // print a fourth without a trailing newline. The fourth line's CRLF
+    // is the only linefeed issued while the cursor sits on the bottom
+    // margin row, so it triggers exactly one row of scroll (a plain "\n"
+    // without carriage return would instead walk the cursor across
+    // columns as it drops rows, scrolling twice and merging into a single
+    // delta_rows == -2 entry, which is not what this test wants to
+    // exercise).
+    vt_write(t, "a\r\nb\r\nc\r\nd", 10);
+
+    // Sized-struct contract: the caller initializes each slot's `size`
+    // (C callers via GHOSTTY_INIT_SIZED); take_render_scroll_rects refuses
+    // a mismatched size, so an `undefined` buffer would be rejected.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
+    var overflowed = true;
+    const n = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expect(n > 0);
+    try testing.expect(!overflowed);
+    try testing.expectEqual(@as(i32, -1), out[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), out[0].delta_columns);
+    try testing.expectEqual(@as(size.CellCountInt, 3), out[0].row_count);
+    try testing.expectEqual(@as(size.CellCountInt, 10), out[0].column_count);
+
+    // A second call reports nothing: the first call cleared the buffer.
+    overflowed = true;
+    const n2 = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n2);
+    try testing.expect(!overflowed);
+}
+
+test "take_render_scroll_rects rejects a mismatched caller struct size via overflowed" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer free(t);
+
+    // Same single-scroll setup as the "returns pending rects" test above.
+    vt_write(t, "a\r\nb\r\nc\r\nd", 10);
+
+    // A caller compiled against a different (here: smaller) struct size must be
+    // refused: n == 0 with `overflowed` set, telling it the pending scroll state
+    // was discarded unread rather than that nothing scrolled.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{ .size = @sizeOf(TerminalScrollRect) - 1 });
+    var overflowed = false;
+    const n = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expect(overflowed);
+
+    // The refusal still drained the pending buffer, per the take-ownership
+    // contract: a correctly sized follow-up call sees nothing.
+    var sized_out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
+    overflowed = true;
+    const n2 = take_render_scroll_rects(t, &sized_out, sized_out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n2);
+    try testing.expect(!overflowed);
+}
+
+test "take_render_scroll_rects on a null terminal is a no-op" {
+    // Sized-struct contract: the caller initializes each slot's `size`
+    // (C callers via GHOSTTY_INIT_SIZED); take_render_scroll_rects refuses
+    // a mismatched size, so an `undefined` buffer would be rejected.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
+    var overflowed = false;
+    const n = take_render_scroll_rects(null, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expect(!overflowed);
+}
+
+test "take_render_scroll_rects reports overflow after more than max_render_scroll_rects non-mergeable rects" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer free(t);
+
+    // Push some scrollback so the viewport has at least one row to toggle
+    // into. The exact scrollback depth doesn't matter here (unlike the
+    // "returns pending rects" test above, this test never inspects
+    // delta_rows), only that offset 0 and offset 1 are both reachable.
+    vt_write(t, "a\r\nb\r\nc\r\nd", 10);
+
+    // Sized-struct contract: the caller initializes each slot's `size`
+    // (C callers via GHOSTTY_INIT_SIZED); take_render_scroll_rects refuses
+    // a mismatched size, so an `undefined` buffer would be rejected.
+    var out: [max_render_scroll_rects]TerminalScrollRect = @splat(.{});
+    var overflowed = false;
+    // Drain the single rect the write above already recorded so the count
+    // below starts from zero.
+    _ = take_render_scroll_rects(t, &out, out.len, &overflowed);
+
+    // recordRenderScrollRect only merges a new rect into the last one when
+    // both share the same scroll direction. Alternating delta = -1 (toward
+    // scrollback) and delta = +1 (back toward the active area) therefore
+    // never merges: each call flips the offset between 0 and 1 and appends
+    // a distinct entry. The (max_render_scroll_rects + 1)th such call
+    // overflows the fixed-size buffer.
+    var i: usize = 0;
+    while (i < max_render_scroll_rects + 1) : (i += 1) {
+        const delta: isize = if (i % 2 == 0) -1 else 1;
+        scroll_viewport(t, .{ .tag = .delta, .value = .{ .delta = delta } });
+    }
+
+    overflowed = false;
+    const n = take_render_scroll_rects(t, &out, out.len, &overflowed);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expect(overflowed);
+}
+
 test "get mouse_shape" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
@@ -7167,4 +7486,167 @@ test "get mouse_shape" {
     vt_write(t, "\x07", 1);
     try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
     try testing.expectEqual(mouse.Shape.wait, shape);
+}
+
+test "get saved_cursor reports the active screen's DECSC state" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var x: size.CellCountInt = undefined;
+    var y: size.CellCountInt = undefined;
+    var origin: bool = undefined;
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_origin, @ptrCast(&origin)));
+
+    vt_write(t, "\x1b[3;7H\x1b7", "\x1b[3;7H\x1b7".len);
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_origin, @ptrCast(&origin)));
+    try testing.expectEqual(@as(size.CellCountInt, 6), x);
+    try testing.expectEqual(@as(size.CellCountInt, 2), y);
+    try testing.expect(!origin);
+}
+
+test "get rows_pruned counts rows pruned off the active screen's history" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var pruned: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .rows_pruned, @ptrCast(&pruned)));
+    try testing.expectEqual(@as(u64, 0), pruned);
+
+    // The smallest scrollback keeps about one page of history, so enough
+    // lines prune many pages off the top.
+    var max_bytes: usize = 1;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &max_bytes));
+    var line_buf: [32]u8 = undefined;
+    for (0..20_000) |n| {
+        const line = std.fmt.bufPrint(&line_buf, "line {d}\r\n", .{n}) catch unreachable;
+        vt_write(t, line.ptr, line.len);
+    }
+    try testing.expectEqual(Result.success, get(t, .rows_pruned, @ptrCast(&pruned)));
+    try testing.expect(pruned > 0);
+
+    // The absolute row of the viewport top is the pruned count plus the
+    // scrollbar offset, and the text there is the line with that number.
+    var scrollbar: TerminalScrollbar = undefined;
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar)));
+    const top_line = try std.fmt.allocPrint(testing.allocator, "line {d}", .{pruned + scrollbar.offset});
+    defer testing.allocator.free(top_line);
+    const wrapper = t.?;
+    const viewport = try wrapper.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(viewport);
+    try testing.expect(std.mem.startsWith(u8, viewport, top_line));
+
+    // Reset reassigns rows rather than pruning them.
+    reset(t);
+    var after_reset: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .rows_pruned, @ptrCast(&after_reset)));
+    try testing.expectEqual(pruned, after_reset);
+}
+
+test "get history_epoch changes when absolute rows are reassigned" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var epoch: u64 = undefined;
+    var next: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&epoch)));
+
+    // Output, and a resize that only changes the row count, keep it.
+    vt_write(t, "one\r\ntwo\r\nthree\r\n", "one\r\ntwo\r\nthree\r\n".len);
+    try testing.expectEqual(Result.success, resize(t, 20, 8, 1, 1));
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expectEqual(epoch, next);
+
+    // A column change reflows.
+    try testing.expectEqual(Result.success, resize(t, 10, 8, 1, 1));
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
+    epoch = next;
+
+    // ED 3 erases scrollback.
+    vt_write(t, "\x1b[3J", "\x1b[3J".len);
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
+    epoch = next;
+
+    // Entering the alternate screen is a switch...
+    vt_write(t, "\x1b[?1049h", "\x1b[?1049h".len);
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
+    epoch = next;
+
+    // ...but inspecting the inactive screen through set_active_screen is not.
+    try testing.expectEqual(Result.success, set_active_screen(t, .primary));
+    try testing.expectEqual(Result.success, set_active_screen(t, .alternate));
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expectEqual(epoch, next);
+
+    // RIS.
+    vt_write(t, "\x1bc", "\x1bc".len);
+    try testing.expectEqual(Result.success, get(t, .history_epoch, @ptrCast(&next)));
+    try testing.expect(next != epoch);
+}
+
+test "set_active_screen reads the inactive screen without mode side effects" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    // The alternate screen has never been initialized.
+    try testing.expectEqual(Result.no_value, set_active_screen(t, .alternate));
+
+    // Save a cursor on the primary screen, then enter the alternate screen
+    // with 47 (no save, no clear) and move its cursor elsewhere.
+    vt_write(t, "\x1b[2;4H\x1b7\x1b[?47h\x1b[5;9H", "\x1b[2;4H\x1b7\x1b[?47h\x1b[5;9H".len);
+    var screen: TerminalScreen = undefined;
+    try testing.expectEqual(Result.success, get(t, .active_screen, @ptrCast(&screen)));
+    try testing.expectEqual(TerminalScreen.alternate, screen);
+
+    var x: size.CellCountInt = undefined;
+    var y: size.CellCountInt = undefined;
+    try testing.expectEqual(Result.no_value, get(t, .saved_cursor_x, @ptrCast(&x)));
+
+    try testing.expectEqual(Result.success, set_active_screen(t, .primary));
+    try testing.expectEqual(Result.success, get(t, .active_screen, @ptrCast(&screen)));
+    try testing.expectEqual(TerminalScreen.primary, screen);
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.success, get(t, .saved_cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(@as(size.CellCountInt, 3), x);
+    try testing.expectEqual(@as(size.CellCountInt, 1), y);
+
+    // Switching back leaves the alternate screen's cursor where the program put it.
+    try testing.expectEqual(Result.success, set_active_screen(t, .alternate));
+    try testing.expectEqual(Result.success, get(t, .cursor_x, @ptrCast(&x)));
+    try testing.expectEqual(Result.success, get(t, .cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(@as(size.CellCountInt, 8), x);
+    try testing.expectEqual(@as(size.CellCountInt, 4), y);
+}
+
+test "tabstop reports default and customized stops" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 5));
+    defer free(t);
+
+    var stop: bool = undefined;
+    try testing.expectEqual(Result.success, tabstop(t, 8, &stop));
+    try testing.expect(stop);
+    try testing.expectEqual(Result.success, tabstop(t, 5, &stop));
+    try testing.expect(!stop);
+
+    // Clear all stops, then set one at column 5.
+    vt_write(t, "\x1b[3g\x1b[6G\x1bH", "\x1b[3g\x1b[6G\x1bH".len);
+    try testing.expectEqual(Result.success, tabstop(t, 8, &stop));
+    try testing.expect(!stop);
+    try testing.expectEqual(Result.success, tabstop(t, 5, &stop));
+    try testing.expect(stop);
+
+    try testing.expectEqual(Result.invalid_value, tabstop(t, 20, &stop));
+    try testing.expectEqual(Result.invalid_value, tabstop(t, 5, null));
+    try testing.expectEqual(Result.invalid_value, tabstop(null, 5, &stop));
 }

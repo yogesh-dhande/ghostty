@@ -280,6 +280,8 @@ pub fn needsConfirmQuit(self: *const App) bool {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
+    defer self.flushScreenChangeNotifications();
+
     while (self.mailbox.pop(global.io())) |message| {
         if (comptime std.log.logEnabled(.debug, .app)) {
             switch (message) {
@@ -311,6 +313,12 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
                 return;
             },
         }
+    }
+}
+
+fn flushScreenChangeNotifications(self: *App) void {
+    for (self.surfaces.items) |surface| {
+        surface.core().flushScreenChangeNotification();
     }
 }
 

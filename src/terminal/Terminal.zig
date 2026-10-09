@@ -48,6 +48,20 @@ const TABSTOP_INTERVAL = 8;
 /// The set of screens behind this terminal (e.g. primary vs alternate).
 screens: ScreenSet,
 
+/// Changes whenever absolute row numbers (`PageList.rows_pruned` + scrollbar
+/// offset + y) stop naming the same text, so a client holding a selection in
+/// those coordinates must drop it: a full reset, an erase of scrollback or of
+/// the rows above the cursor (ED 3, clear screen), a resize that changes the
+/// column count (reflow), a primary/alternate screen switch, and the scrollback
+/// being disabled. Pruning is not one of them (`rows_pruned` accounts for it)
+/// and neither is a rows-only resize. Only the value changing is meaningful.
+///
+/// Scrolling down (reverse index at the top margin, SD, IL) moves rows to
+/// larger indexes without renumbering, so absolute rows there keep naming
+/// screen positions, which is also where Ghostty's own tracked selection
+/// pins stay (`insertLines` does not move tracked pins).
+history_epoch: u64 = 0,
+
 /// Whether we're currently writing to the status line (DECSASD and DECSSDT).
 /// We don't support a status line currently so we just black hole this
 /// data so that it doesn't mess up our main display.
@@ -66,6 +80,12 @@ height_px: u32 = 0,
 
 /// The current scrolling region.
 scrolling_region: ScrollingRegion,
+
+/// Scroll operations that happened since the last embedded snapshot export.
+/// These are only a render hint; the exported snapshot remains authoritative.
+pending_render_scroll_rects: [64]RenderScrollRect = undefined,
+pending_render_scroll_rect_count: u8 = 0,
+pending_render_scroll_rect_overflow: bool = false,
 
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
@@ -264,6 +284,109 @@ pub const ScrollingRegion = struct {
     left: size.CellCountInt,
     right: size.CellCountInt,
 };
+
+pub const RenderScrollRect = struct {
+    row_start: size.CellCountInt,
+    row_count: size.CellCountInt,
+    column_start: size.CellCountInt,
+    column_count: size.CellCountInt,
+    delta_rows: i32,
+    delta_columns: i32,
+};
+
+pub fn pendingRenderScrollRects(self: *const Terminal) []const RenderScrollRect {
+    const count: usize = @intCast(self.pending_render_scroll_rect_count);
+    return self.pending_render_scroll_rects[0..count];
+}
+
+pub fn pendingRenderScrollRectsOverflowed(self: *const Terminal) bool {
+    return self.pending_render_scroll_rect_overflow;
+}
+
+pub fn clearPendingRenderScrollRects(self: *Terminal) void {
+    self.pending_render_scroll_rect_count = 0;
+    self.pending_render_scroll_rect_overflow = false;
+}
+
+fn recordRenderScrollRect(
+    self: *Terminal,
+    row_start: size.CellCountInt,
+    row_count: size.CellCountInt,
+    column_start: size.CellCountInt,
+    column_count: size.CellCountInt,
+    delta_rows: i32,
+    delta_columns: i32,
+) void {
+    if (self.pending_render_scroll_rect_overflow) return;
+    // No-op: nothing in the rect to move.
+    if (row_count == 0 or column_count == 0) return;
+    // No-op: the rect was recorded but nothing actually moved.
+    if (delta_rows == 0 and delta_columns == 0) return;
+
+    const row_end = @as(usize, row_start) + @as(usize, row_count);
+    const column_end = @as(usize, column_start) + @as(usize, column_count);
+    // Out of bounds for this rect: leave the pending carry as-is (untouched, not poisoned).
+    if (row_end > self.rows or column_end > self.cols) return;
+
+    // A delta whose magnitude reaches or exceeds the rect's own extent moves every row (or
+    // column) out of the rect in a single step. That is real movement, not a no-op, but the
+    // rect-plus-delta model cannot describe "the whole region emptied out and something
+    // unrelated took its place": there is no meaningful shift amount to hand a consumer. Poison
+    // the carry exactly like the accumulated-delta overflow below does, so a consumer (e.g. a
+    // delta-frame encoder) sees `scroll_carry_valid = false` and falls back to a full diff rather
+    // than trusting an empty or partial rect list to reconstruct the movement.
+    if (delta_rows != 0 and @as(u32, @abs(delta_rows)) >= @as(u32, row_count)) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+    if (delta_columns != 0 and @as(u32, @abs(delta_columns)) >= @as(u32, column_count)) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+
+    if (self.pending_render_scroll_rect_count > 0) {
+        const last_index: usize = @intCast(self.pending_render_scroll_rect_count - 1);
+        const last = &self.pending_render_scroll_rects[last_index];
+        if (last.row_start == row_start and
+            last.row_count == row_count and
+            last.column_start == column_start and
+            last.column_count == column_count and
+            last.delta_columns == 0 and
+            delta_columns == 0 and
+            last.delta_rows != 0 and
+            delta_rows != 0 and
+            (last.delta_rows > 0) == (delta_rows > 0))
+        {
+            const combined_delta_rows = last.delta_rows + delta_rows;
+            if (@as(u32, @abs(combined_delta_rows)) >= @as(u32, row_count)) {
+                self.pending_render_scroll_rect_count = 0;
+                self.pending_render_scroll_rect_overflow = true;
+                return;
+            }
+            last.delta_rows = combined_delta_rows;
+            return;
+        }
+    }
+
+    const operation_index: usize = @intCast(self.pending_render_scroll_rect_count);
+    if (operation_index >= self.pending_render_scroll_rects.len) {
+        self.pending_render_scroll_rect_count = 0;
+        self.pending_render_scroll_rect_overflow = true;
+        return;
+    }
+
+    self.pending_render_scroll_rects[operation_index] = .{
+        .row_start = row_start,
+        .row_count = row_count,
+        .column_start = column_start,
+        .column_count = column_count,
+        .delta_rows = delta_rows,
+        .delta_columns = delta_columns,
+    };
+    self.pending_render_scroll_rect_count += 1;
+}
 
 /// Terminal-level cursor state shared by all screens.
 pub const Cursor = struct {
@@ -510,7 +633,17 @@ pub fn setScrollbackMaxBytes(self: *Terminal, max: ?usize) void {
     primary.pages.setMaxBytes(max);
     primary.no_scrollback = max == 0;
 
-    if (primary.no_scrollback) primary.eraseHistory(null);
+    if (primary.no_scrollback) {
+        primary.eraseHistory(null);
+        self.bumpHistoryEpoch();
+    }
+}
+
+/// Record that absolute row numbers no longer name the same text. See
+/// `history_epoch`. Callers outside the terminal that erase rows directly
+/// (the clear-screen action) call this too.
+pub fn bumpHistoryEpoch(self: *Terminal) void {
+    self.history_epoch +%= 1;
 }
 
 /// Change the primary screen's maximum number of physical scrollback lines.
@@ -2459,6 +2592,14 @@ pub fn index(self: *Terminal) !void {
             (!screen.no_scrollback or
                 self.scrolling_region.bottom == 0))
         {
+            self.recordRenderScrollRect(
+                0,
+                self.scrolling_region.bottom + 1,
+                0,
+                self.cols,
+                -1,
+                0,
+            );
             // If a bottom margin is set, kitty image placements may
             // need adjusting around the scroll. The rare placements-
             // present case is handled out of line so this hot path
@@ -2485,6 +2626,17 @@ pub fn index(self: *Terminal) !void {
             return;
         }
 
+        // Otherwise use a fast path function to efficiently scroll
+        // the contents of the scrolling region.
+        self.recordRenderScrollRect(
+            self.scrolling_region.top,
+            self.scrolling_region.bottom - self.scrolling_region.top + 1,
+            0,
+            self.cols,
+            -1,
+            0,
+        );
+
         // Kitty image placements may need adjusting around the scroll;
         // handled out of line like the scrollback path above.
         if (comptime build_options.kitty_graphics) {
@@ -2495,8 +2647,6 @@ pub fn index(self: *Terminal) !void {
             }
         }
 
-        // Otherwise use a fast path function to efficiently scroll
-        // the contents of the scrolling region.
         try screen.cursorScrollRegionUp(
             self.scrolling_region.bottom - self.scrolling_region.top,
         );
@@ -2789,6 +2939,14 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
         // Clamp count to the scroll region height.
         const region_height = self.scrolling_region.bottom + 1;
         const adjusted_count = @min(count, region_height);
+        self.recordRenderScrollRect(
+            0,
+            self.scrolling_region.bottom + 1,
+            0,
+            self.cols,
+            -@as(i32, @intCast(adjusted_count)),
+            0,
+        );
 
         // TODO: Create an optimized version that can scroll N times
         // This isn't critical because in most cases, scrollUp is used
@@ -2845,12 +3003,27 @@ pub const ScrollViewport = union(Tag) {
 
 /// Scroll the viewport of the terminal grid.
 pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
+    const before_offset = self.screens.active.pages.scrollbar().offset;
     self.screens.active.scroll(switch (behavior) {
         .top => .{ .top = {} },
         .bottom => .{ .active = {} },
         .delta => |delta| .{ .delta_row = delta },
         .row => |row| .{ .row = row },
     });
+    const after_offset = self.screens.active.pages.scrollbar().offset;
+
+    if (after_offset == before_offset) return;
+    const scroll_rows = if (after_offset > before_offset)
+        after_offset - before_offset
+    else
+        before_offset - after_offset;
+    if (scroll_rows >= @as(usize, self.rows)) return;
+
+    const delta_rows: i32 = if (after_offset > before_offset)
+        -@as(i32, @intCast(scroll_rows))
+    else
+        @as(i32, @intCast(scroll_rows));
+    self.recordRenderScrollRect(0, self.rows, 0, self.cols, delta_rows, 0);
 }
 
 /// Return the current compression activity value.
@@ -3054,6 +3227,14 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+    self.recordRenderScrollRect(
+        self.screens.active.cursor.y,
+        @intCast(rem),
+        self.scrolling_region.left,
+        self.scrolling_region.right - self.scrolling_region.left + 1,
+        @as(i32, @intCast(adjusted_count)),
+        0,
+    );
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
@@ -3227,6 +3408,14 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We can only insert lines up to our remaining lines in the scroll
     // region. So we take whichever is smaller.
     const adjusted_count = @min(count, rem);
+    self.recordRenderScrollRect(
+        self.screens.active.cursor.y,
+        @intCast(rem),
+        self.scrolling_region.left,
+        self.scrolling_region.right - self.scrolling_region.left + 1,
+        -@as(i32, @intCast(adjusted_count)),
+        0,
+    );
 
     // Create a new tracked pin which we'll use to navigate the page list
     // so that if we need to adjust capacity it will be properly tracked.
@@ -3768,7 +3957,10 @@ pub fn eraseDisplay(
             assert(!self.screens.active.cursor.pending_wrap);
         },
 
-        .scrollback => self.screens.active.eraseHistory(null),
+        .scrollback => {
+            self.screens.active.eraseHistory(null);
+            self.bumpHistoryEpoch();
+        },
     }
 }
 
@@ -4183,6 +4375,10 @@ pub fn resize(
 
         log.warn("alternate screen resize failed, replacing it err={}", .{err});
 
+        // The alternate screen's rows are dropped or blanked below even
+        // when only the row count changed.
+        self.bumpHistoryEpoch();
+
         // If the alternate screen isn't active, then we just free it
         // and move on. It'll be reallocated when it gets reinitialized lazily.
         // In this case, we just lose the prior data if the terminal program
@@ -4240,6 +4436,10 @@ pub fn resize(
         self.tabstops.deinit(alloc);
         self.tabstops = v;
         new_tabstops = null;
+
+        // Tabstops are replaced exactly when the column count changed, and
+        // that is the case that reflows (renumbers) the primary screen.
+        self.bumpHistoryEpoch();
     }
 
     // Whenever we resize we just mark it as a screen clear
@@ -4858,6 +5058,10 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
     // Finalize the switch
     self.screens.switchTo(key);
 
+    // Each screen numbers its own rows, so absolute rows held against the
+    // screen we left name nothing here.
+    self.bumpHistoryEpoch();
+
     return old;
 }
 
@@ -4981,6 +5185,9 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
 /// this will reuse the existing memory. In the latter case, memory may
 /// be wasted (since its unused) but it isn't leaked.
 pub fn fullReset(self: *Terminal) void {
+    // Reset destroys the history (and the alternate screen) outright.
+    self.bumpHistoryEpoch();
+
     // Ensure we're back on primary screen
     self.screens.switchTo(.primary);
 
@@ -6943,6 +7150,61 @@ test "Terminal: print writes to bottom if scrolled" {
         .x = t.screens.active.cursor.x,
         .y = t.screens.active.cursor.y,
     } }));
+}
+
+test "Terminal: scrollViewport records render scroll rect for scrollback" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 1,
+        .rows = 4,
+        .max_scrollback_bytes = 20,
+    });
+    defer t.deinit(testing.allocator);
+
+    for ("abcdef") |c| try t.print(c);
+    t.clearPendingRenderScrollRects();
+
+    t.scrollViewport(.{ .delta = -1 });
+    var rects = t.pendingRenderScrollRects();
+    try testing.expectEqual(@as(usize, 1), rects.len);
+    try testing.expectEqual(@as(size.CellCountInt, 0), rects[0].row_start);
+    try testing.expectEqual(@as(size.CellCountInt, 4), rects[0].row_count);
+    try testing.expectEqual(@as(size.CellCountInt, 0), rects[0].column_start);
+    try testing.expectEqual(@as(size.CellCountInt, 1), rects[0].column_count);
+    try testing.expectEqual(@as(i32, 1), rects[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), rects[0].delta_columns);
+
+    t.clearPendingRenderScrollRects();
+    t.scrollViewport(.{ .delta = 1 });
+    rects = t.pendingRenderScrollRects();
+    try testing.expectEqual(@as(usize, 1), rects.len);
+    try testing.expectEqual(@as(i32, -1), rects[0].delta_rows);
+    try testing.expectEqual(@as(i32, 0), rects[0].delta_columns);
+
+    t.clearPendingRenderScrollRects();
+    t.scrollViewport(.{ .delta = 1 });
+    try testing.expectEqual(@as(usize, 0), t.pendingRenderScrollRects().len);
+}
+
+test "Terminal: whole-region scroll poisons the render scroll rect carry" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    try t.printString("ABCDE");
+    t.clearPendingRenderScrollRects();
+
+    // scrollUp clamps its count to the (unmargined, full-screen) scroll region height, so
+    // scrollUp(5) here records a delta whose magnitude equals row_count: the same shape CSI S
+    // hits with a parameter >= the scroll region's height, or deleteLines covering the full
+    // region. recordRenderScrollRect's whole-region guards used to silently drop this rect
+    // instead of poisoning the carry the way the accumulated-delta overflow branch does, which
+    // left scroll_carry_valid true with an empty rect list for the frame: a consumer (e.g. a
+    // delta-frame encoder) then trusted an empty rect list for a frame whose content did move.
+    try t.scrollUp(5);
+
+    try testing.expect(t.pendingRenderScrollRectsOverflowed());
+    try testing.expectEqual(@as(usize, 0), t.pendingRenderScrollRects().len);
 }
 
 test "Terminal: print charset" {
@@ -15888,6 +16150,239 @@ test "Terminal: cursor defaults do not override explicit cursor" {
     try testing.expect(t.cursor.is_default);
     try testing.expectEqual(.underline, t.screens.active.cursor.cursor_style);
     try testing.expect(!t.modes.get(.cursor_blinking));
+}
+
+/// Prints "line N" rows for N in [first, last) so row k of the screen holds
+/// "line k" while nothing has scrolled or been erased.
+fn printNumberedLines(t: *Terminal, first: usize, last: usize) !void {
+    var buf: [32]u8 = undefined;
+    for (first..last) |n| {
+        const text = std.fmt.bufPrint(&buf, "line {d}", .{n}) catch unreachable;
+        try t.printString(text);
+        t.carriageReturn();
+        try t.linefeed();
+    }
+}
+
+/// The number in the first line of the viewport ("line N"), which is the
+/// text's absolute row in a terminal that printed one line per row.
+fn firstViewportLineNumber(t: *Terminal) !usize {
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    const line = std.mem.sliceTo(str, '\n');
+    return try std.fmt.parseInt(usize, line["line ".len..], 10);
+}
+
+test "Terminal: absolute rows follow their text through scrollback pruning" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 20,
+        .rows = 5,
+        .max_scrollback_bytes = 1,
+    });
+    defer t.deinit(testing.allocator);
+    const epoch = t.history_epoch;
+
+    // Enough lines to cycle the retained history many times over.
+    const page_rows = t.screens.active.pages.pages.first.?.capacity().rows;
+    try printNumberedLines(&t, 0, 6 * page_rows);
+
+    const pages = &t.screens.active.pages;
+    try testing.expect(pages.rows_pruned > 0);
+    const absolute_top = pages.rows_pruned + pages.scrollbar().offset;
+    try testing.expectEqual(absolute_top, try firstViewportLineNumber(&t));
+
+    // Pruning is accounted for by the counter, so it leaves the epoch alone.
+    try testing.expectEqual(epoch, t.history_epoch);
+}
+
+fn expectAbsoluteTopFollowsText(t: *Terminal) !void {
+    const pages = &t.screens.active.pages;
+    try testing.expect(pages.rows_pruned > 0);
+    try testing.expectEqual(
+        pages.rows_pruned + pages.scrollbar().offset,
+        try firstViewportLineNumber(t),
+    );
+}
+
+test "Terminal: absolute rows follow text on a screen scrolling without scrollback" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    try t.switchScreenMode(.@"1049", true);
+    t.setCursorPos(1, 1);
+    const epoch = t.history_epoch;
+
+    // Default margins: linefeed at the bottom discards the top row.
+    try printNumberedLines(&t, 0, 20);
+    try expectAbsoluteTopFollowsText(&t);
+
+    // CSI S on the alternate screen.
+    try t.scrollUp(3);
+    try testing.expectEqual(@as(u64, 19), t.screens.active.pages.rows_pruned);
+    try expectAbsoluteTopFollowsText(&t);
+
+    // Scrolling never renumbers rows, so it leaves the epoch alone.
+    try testing.expectEqual(epoch, t.history_epoch);
+}
+
+test "Terminal: absolute rows follow text under a full-screen DECSTBM region" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    try t.switchScreenMode(.@"1049", true);
+    t.setTopAndBottomMargin(1, 5);
+    t.setCursorPos(1, 1);
+    const epoch = t.history_epoch;
+
+    try printNumberedLines(&t, 0, 20);
+    try expectAbsoluteTopFollowsText(&t);
+    try testing.expectEqual(epoch, t.history_epoch);
+}
+
+test "Terminal: absolute rows follow text on a primary screen without scrollback" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 20,
+        .rows = 5,
+        .max_scrollback_bytes = 0,
+    });
+    defer t.deinit(testing.allocator);
+    const epoch = t.history_epoch;
+
+    try printNumberedLines(&t, 0, 20);
+    try expectAbsoluteTopFollowsText(&t);
+    try t.scrollUp(2);
+    try testing.expectEqual(epoch, t.history_epoch);
+}
+
+test "Terminal: absolute rows follow text through row resizes on the alternate screen" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 8 });
+    defer t.deinit(testing.allocator);
+
+    try t.switchScreenMode(.@"1049", true);
+    t.setCursorPos(1, 1);
+    try printNumberedLines(&t, 0, 20);
+    const epoch = t.history_epoch;
+
+    // Shrinking pushes the top rows into history, which the screen then
+    // erases; they count as pruned.
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 4 });
+    try expectAbsoluteTopFollowsText(&t);
+    try testing.expectEqual(epoch, t.history_epoch);
+
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 8 });
+    try expectAbsoluteTopFollowsText(&t);
+    try testing.expectEqual(epoch, t.history_epoch);
+}
+
+test "Terminal: absolute rows follow text through row resizes without scrollback" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 20,
+        .rows = 8,
+        .max_scrollback_bytes = 0,
+    });
+    defer t.deinit(testing.allocator);
+
+    try printNumberedLines(&t, 0, 20);
+    const epoch = t.history_epoch;
+
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 4 });
+    try expectAbsoluteTopFollowsText(&t);
+    try testing.expectEqual(epoch, t.history_epoch);
+
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 8 });
+    try expectAbsoluteTopFollowsText(&t);
+    try testing.expectEqual(epoch, t.history_epoch);
+}
+
+test "Terminal: absolute rows follow text on a one-row screen without scrollback" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 20,
+        .rows = 1,
+        .max_scrollback_bytes = 0,
+    });
+    defer t.deinit(testing.allocator);
+
+    try printNumberedLines(&t, 0, 7);
+    try testing.expectEqual(@as(u64, 7), t.screens.active.pages.rows_pruned);
+}
+
+test "Terminal: a scroll region narrower than the screen leaves rows_pruned unchanged" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 6 });
+    defer t.deinit(testing.allocator);
+
+    try t.switchScreenMode(.@"1049", true);
+    const epoch = t.history_epoch;
+
+    // Rows 1..4 (zero-based) form the region; scroll it by linefeed and CSI S.
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(5, 1);
+    for (0..10) |_| try t.linefeed();
+    try t.scrollUp(3);
+
+    try testing.expectEqual(@as(u64, 0), t.screens.active.pages.rows_pruned);
+    try testing.expectEqual(epoch, t.history_epoch);
+}
+
+test "Terminal: history_epoch changes when absolute rows are reassigned" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(testing.allocator);
+    try printNumberedLines(&t, 0, 12);
+
+    // Erase scrollback (ED 3).
+    var epoch = t.history_epoch;
+    t.eraseDisplay(.scrollback, false);
+    try testing.expect(t.history_epoch != epoch);
+
+    // Full reset (RIS).
+    epoch = t.history_epoch;
+    t.fullReset();
+    try testing.expect(t.history_epoch != epoch);
+
+    // Entering and leaving the alternate screen, by mode and directly. A
+    // switch to the screen already active is not a switch.
+    epoch = t.history_epoch;
+    try t.switchScreenMode(.@"1049", true);
+    try testing.expect(t.history_epoch != epoch);
+    epoch = t.history_epoch;
+    try t.switchScreenMode(.@"1049", true);
+    try testing.expectEqual(epoch, t.history_epoch);
+    try t.switchScreenMode(.@"1049", false);
+    try testing.expect(t.history_epoch != epoch);
+    epoch = t.history_epoch;
+    try testing.expect(try t.switchScreen(.primary) == null);
+    try testing.expectEqual(epoch, t.history_epoch);
+
+    // The primary screen's scrollback being disabled erases it.
+    epoch = t.history_epoch;
+    t.setScrollbackMaxBytes(1);
+    try testing.expectEqual(epoch, t.history_epoch);
+    t.setScrollbackMaxBytes(0);
+    try testing.expect(t.history_epoch != epoch);
+}
+
+test "Terminal: history_epoch changes with the column count but not the row count" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(testing.allocator);
+    try printNumberedLines(&t, 0, 12);
+
+    const before = try t.screens.active.dumpStringAlloc(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(before);
+    const epoch = t.history_epoch;
+    const pruned = t.screens.active.pages.rows_pruned;
+
+    // A rows-only resize keeps every row's number, so the text is still
+    // where a client left it.
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 3 });
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 8 });
+    try testing.expectEqual(epoch, t.history_epoch);
+    try testing.expectEqual(pruned, t.screens.active.pages.rows_pruned);
+    const after = try t.screens.active.dumpStringAlloc(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    // A column change reflows, which renumbers rows.
+    try t.resize(testing.allocator, .{ .cols = 10, .rows = 8 });
+    try testing.expect(t.history_epoch != epoch);
 }
 
 test "Terminal: fullReset with a non-empty pen" {

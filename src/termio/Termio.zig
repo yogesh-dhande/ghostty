@@ -25,6 +25,13 @@ const compat_file = @import("../lib/compat/file.zig");
 
 const log = std.log.scoped(.io_exec);
 
+pub const DataCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+
+const DataCallbackState = struct {
+    callback: ?DataCallback,
+    userdata: ?*anyopaque,
+};
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -46,14 +53,31 @@ terminal: terminalpkg.Terminal,
 renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// a repaint should happen. Null for a headless session, which has no renderer
+/// thread: every renderer notification below then becomes a structural no-op
+/// rather than a send that nothing can ever drain.
+renderer_wakeup: ?xev.Async,
 
-/// The mailbox for notifying the renderer of things.
-renderer_mailbox: *renderer.Thread.Mailbox,
+/// The mailbox for notifying the renderer of things. Null for a headless
+/// session. Set and cleared together with `renderer_wakeup`.
+renderer_mailbox: ?*renderer.Thread.Mailbox,
+
+/// Whether this session was created without a renderer thread. Immutable after
+/// init — a headless session can never gain a renderer (rebind refuses it) — so
+/// hot paths may read this without holding `renderer_endpoint_mutex`, unlike
+/// `renderer_mailbox`, which endpoint rebinding mutates under that mutex.
+headless: bool,
+
+/// Serializes renderer endpoint reads with renderer thread replacement.
+renderer_endpoint_mutex: std.Io.Mutex = .init,
 
 /// The mailbox for communicating with the surface.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Optional callback notified with raw PTY output before terminal parsing.
+data_callback_mutex: std.Io.Mutex = .init,
+data_callback: ?DataCallback = null,
+data_callback_userdata: ?*anyopaque = null,
 
 /// The cached size info
 size: renderer.Size,
@@ -68,6 +92,17 @@ terminal_stream: StreamHandler.Stream,
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
+
+/// Bytes handed to the stream parser so far, counted once the chunk has
+/// been parsed. Every route PTY output takes funnels through
+/// `processOutputLocked`, and this is only read or written under the
+/// renderer state mutex, so a snapshot exported under that mutex pairs
+/// its grid with exactly the byte count that produced it.
+///
+/// One gap: a handler that must wait on a full mailbox drops the mutex
+/// mid-chunk, so a snapshot taken then holds a grid ahead of this count
+/// by the rest of that chunk.
+bytes_processed: u64 = 0,
 
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
@@ -196,6 +231,7 @@ pub const DerivedConfig = struct {
     xt_checksum_report: bool,
     xt_checksum_extension: terminalpkg.xt_checksum.Flags,
     conditional_state: configpkg.ConditionalState,
+    scrollback_compression: bool,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -235,6 +271,7 @@ pub const DerivedConfig = struct {
             .xt_checksum_report = config.@"vt-xt-checksum-report",
             .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
             .conditional_state = config._conditional_state,
+            .scrollback_compression = config.@"scrollback-compression",
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -318,6 +355,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
+        .renderer_endpoint_mutex = &self.renderer_endpoint_mutex,
         .size = &self.size,
         .terminal = &self.terminal,
         .osc_color_report_format = opts.config.osc_color_report_format,
@@ -339,6 +377,8 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
+        .headless = opts.renderer_mailbox == null,
+        .renderer_endpoint_mutex = .init,
         .surface_mailbox = opts.surface_mailbox,
         .size = opts.size,
         .backend = backend,
@@ -446,6 +486,95 @@ pub fn queueMessage(
     self.mailbox.notify();
 }
 
+/// Process PTY output supplied by a host-managed embedder. Processing this via
+/// the IO mailbox preserves ordering with earlier resize/focus messages while
+/// still returning only after the bytes have been parsed.
+pub fn processOutputBlocking(
+    self: *Termio,
+    data: []const u8,
+    notify_screen_change: bool,
+) !void {
+    if (data.len == 0) return;
+
+    if (try termio.Thread.processOutputOnCurrentThread(
+        self,
+        data,
+        notify_screen_change,
+    )) return;
+
+    var output: termio.Message.BlockingOutput = .{
+        .data = data,
+        .notify_screen_change = notify_screen_change,
+    };
+    if (!self.mailbox.sendAndNotifyBlocking(.{
+        .pty_output_blocking = &output,
+    })) return error.TermioMailboxUnavailable;
+    try output.wait();
+}
+
+/// Wait until this terminal's IO thread has processed every message queued before this call.
+///
+/// The message carries nothing and its handler does nothing: it neither parses bytes nor touches the
+/// terminal, so it is safe to issue at any moment, including while the stream parser sits mid-sequence.
+/// That is the point of it — a host-managed embedder that has queued input needs to know when that
+/// input has been handed to its receive-buffer callback, and injecting synthetic bytes to find out
+/// would feed the parser (a DCS passthrough state forwards them, a partial UTF-8 codepoint is
+/// invalidated by them).
+///
+/// Refuses to run on the IO thread itself, where waiting for that thread cannot complete.
+pub fn syncBlocking(self: *Termio) !void {
+    if (termio.Thread.isCurrentThread(self)) return error.TermioSyncOnIoThread;
+
+    var sync: termio.Message.BlockingSync = .{};
+    if (!self.mailbox.sendAndNotifyBlocking(.{
+        .sync_blocking = &sync,
+    })) return error.TermioMailboxUnavailable;
+    try sync.wait();
+}
+
+/// Queue a host-managed process exit. This must go through the IO mailbox so
+/// prior host output is parsed before the app observes process termination.
+pub fn queueProcessExit(self: *Termio, exit_code: u32, runtime_ms: u64) void {
+    if (termio.Thread.queueProcessExitOnCurrentThread(
+        self,
+        exit_code,
+        runtime_ms,
+    ) catch |err| {
+        log.err("error processing host-managed process exit err={}", .{err});
+        return;
+    }) return;
+
+    self.queueMessage(.{
+        .process_exit = .{
+            .exit_code = exit_code,
+            .runtime_ms = runtime_ms,
+        },
+    }, .unlocked);
+}
+
+/// Set the callback notified with raw PTY output before terminal parsing.
+pub fn setDataCallback(
+    self: *Termio,
+    callback: ?DataCallback,
+    userdata: ?*anyopaque,
+) void {
+    self.data_callback_mutex.lockUncancelable(global.io());
+    defer self.data_callback_mutex.unlock(global.io());
+
+    self.data_callback = callback;
+    self.data_callback_userdata = userdata;
+}
+
+fn dataCallback(self: *Termio) DataCallbackState {
+    self.data_callback_mutex.lockUncancelable(global.io());
+    defer self.data_callback_mutex.unlock(global.io());
+
+    return .{
+        .callback = self.data_callback,
+        .userdata = self.data_callback_userdata,
+    };
+}
+
 /// Queue a write directly to the pty.
 ///
 /// If you're using termio.Thread, this must ONLY be called from the
@@ -460,6 +589,86 @@ pub inline fn queueWrite(
     linefeed: bool,
 ) !void {
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
+}
+
+/// Retarget renderer notifications to a replacement renderer thread.
+pub fn setRendererEndpoint(
+    self: *Termio,
+    renderer_wakeup: xev.Async,
+    renderer_mailbox: *renderer.Thread.Mailbox,
+) void {
+    self.renderer_endpoint_mutex.lockUncancelable(global.io());
+    defer self.renderer_endpoint_mutex.unlock(global.io());
+
+    self.renderer_wakeup = renderer_wakeup;
+    self.renderer_mailbox = renderer_mailbox;
+    self.terminal_stream.handler.renderer_wakeup = renderer_wakeup;
+    self.terminal_stream.handler.renderer_mailbox = renderer_mailbox;
+}
+
+/// Retarget renderer notifications and move messages still queued on the
+/// previous renderer thread into the replacement mailbox.
+pub fn setRendererEndpointAndDrain(
+    self: *Termio,
+    renderer_wakeup: xev.Async,
+    renderer_mailbox: *renderer.Thread.Mailbox,
+    old_renderer_thread: *renderer.Thread,
+) void {
+    self.renderer_endpoint_mutex.lockUncancelable(global.io());
+    defer self.renderer_endpoint_mutex.unlock(global.io());
+
+    self.renderer_wakeup = renderer_wakeup;
+    self.renderer_mailbox = renderer_mailbox;
+    self.terminal_stream.handler.renderer_wakeup = renderer_wakeup;
+    self.terminal_stream.handler.renderer_mailbox = renderer_mailbox;
+    old_renderer_thread.drainMailboxTo(renderer_mailbox);
+}
+
+/// Wake this session's scrollback compression scheduler.
+///
+/// A rendered session schedules compression on its renderer thread, which wakes
+/// on every terminal mutation, so it has no scheduler here and this is a flag
+/// check. A headless session has no renderer thread at all, so its IO thread
+/// owns the scheduler and this shared parse path is what signals it. The flag
+/// is immutable, so this hot path stays lock-free while renderer endpoint
+/// rebinding mutates `renderer_mailbox` under the endpoint mutex.
+fn wakeCompression(self: *Termio) void {
+    if (!self.headless) return;
+    termio.Thread.wakeCompressionForTermio(self);
+}
+
+/// Notify the current renderer endpoint.
+pub fn notifyRenderer(self: *Termio) !void {
+    self.renderer_endpoint_mutex.lockUncancelable(global.io());
+    defer self.renderer_endpoint_mutex.unlock(global.io());
+
+    const wakeup = self.renderer_wakeup orelse return;
+    try wakeup.notify();
+}
+
+/// Send a renderer message without blocking endpoint replacement.
+fn sendRendererMessage(self: *Termio, msg: renderer.Message) void {
+    while (true) {
+        self.renderer_endpoint_mutex.lockUncancelable(global.io());
+        // A headless session has no renderer to drain this mailbox, so the
+        // retry below would spin forever and hang the IO thread (and, through
+        // processOutputBlocking, the host's PTY reader with it).
+        const mailbox = self.renderer_mailbox orelse {
+            self.renderer_endpoint_mutex.unlock(global.io());
+            return;
+        };
+        if (mailbox.push(global.io(), msg, .{ .instant = {} }) > 0) {
+            self.renderer_wakeup.?.notify() catch {};
+            self.renderer_endpoint_mutex.unlock(global.io());
+            return;
+        }
+
+        self.renderer_wakeup.?.notify() catch |err| {
+            log.warn("failed to notify renderer err={}", .{err});
+        };
+        self.renderer_endpoint_mutex.unlock(global.io());
+        std.Io.sleep(global.io(), .fromMilliseconds(1), .awake) catch {};
+    }
 }
 
 /// Update the configuration.
@@ -521,8 +730,12 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Update PTY-backed processes before resizing the terminal. Host-managed
+    // resize callbacks run after the terminal grid is updated because hosts
+    // may synchronously feed output back into Ghostty.
+    try self.backend.resizeBeforeTerminal(grid_size, size.terminal());
+
+    var report_size = false;
 
     // Enter the critical area that we want to keep small
     {
@@ -542,15 +755,32 @@ pub fn resize(
             },
         );
 
-        // If we have size reporting enabled we need to send a report.
-        if (self.terminal.modes.get(.in_band_size_reports)) {
-            try self.sizeReportLocked(td, .mode_2048);
-        }
+        // Capture the mode that was active for this resize. The report write is
+        // delayed until host-managed resize callbacks have run.
+        report_size = self.terminal.modes.get(.in_band_size_reports);
     }
 
     // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
-    self.renderer_wakeup.notify() catch {};
+    self.sendRendererMessage(.{ .resize = size });
+
+    // Notify host-managed backends after the terminal grid and renderer resize
+    // message are updated so synchronous host output parses against the new
+    // dimensions.
+    try self.backend.resizeAfterTerminal(grid_size, size.terminal());
+
+    // In-band size reports must be emitted after host-managed resize callbacks
+    // so the host-owned PTY has its winsize updated before receiving the report.
+    if (report_size and self.backend.isHostManaged()) {
+        report_size = report_size: {
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+
+            break :report_size self.terminal.modes.get(.in_band_size_reports);
+        };
+    }
+    if (report_size) {
+        try self.sizeReport(td, .mode_2048);
+    }
 }
 
 /// Make a size report.
@@ -588,11 +818,17 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.modes.set(.synchronized_output, false);
-    self.renderer_wakeup.notify() catch {};
+
+    self.renderer_endpoint_mutex.lockUncancelable(global.io());
+    defer self.renderer_endpoint_mutex.unlock(global.io());
+
+    if (self.renderer_wakeup) |wakeup| wakeup.notify() catch {};
 }
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    var send_form_feed = false;
+
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
@@ -605,6 +841,11 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
 
         // Clear our selection
         self.terminal.screens.active.clearSelection();
+
+        // Away from a prompt this physically erases the rows above the
+        // cursor, shifting the rows that remain, and `history` erases the
+        // scrollback: a renumbering even when the scrollback is kept.
+        self.terminal.bumpHistoryEpoch();
 
         // Clear our scrollback
         if (history) self.terminal.eraseDisplay(.scrollback, false);
@@ -629,22 +870,25 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
                 &self.terminal,
                 .{ .all = true },
             );
-
-            return;
+        } else {
+            // At a prompt, we want to first fully clear the screen, and then after
+            // send a FF (0x0C) to the shell so that it can repaint the screen.
+            // Mark the current row as a not a prompt so we can properly
+            // clear the full screen in the next eraseDisplay call.
+            // TODO: fix this
+            // self.terminal.markSemanticPrompt(.command);
+            // assert(!self.terminal.cursorIsAtPrompt());
+            self.terminal.eraseDisplay(.complete, false);
+            send_form_feed = true;
         }
-
-        // At a prompt, we want to first fully clear the screen, and then after
-        // send a FF (0x0C) to the shell so that it can repaint the screen.
-        // Mark the current row as a not a prompt so we can properly
-        // clear the full screen in the next eraseDisplay call.
-        // TODO: fix this
-        // self.terminal.markSemanticPrompt(.command);
-        // assert(!self.terminal.cursorIsAtPrompt());
-        self.terminal.eraseDisplay(.complete, false);
     }
 
-    // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+    self.notifyScreenChange();
+
+    if (send_form_feed) {
+        // If we reached here it means we're at a prompt, so we send a form-feed.
+        try self.queueWrite(td, &[_]u8{0x0C}, false);
+    }
 }
 
 /// Scroll the viewport
@@ -652,20 +896,37 @@ pub fn scrollViewport(
     self: *Termio,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
-    self.terminal.scrollViewport(scroll);
+    const screen_changed = changed: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        const before = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        self.terminal.scrollViewport(scroll);
+        const after = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        break :changed !before.eql(after);
+    };
+
+    if (screen_changed) self.notifyScreenChange();
 }
 
 /// Jump the viewport to the prompt.
 pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
-    {
+    const screen_changed = changed: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
-        self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
-    }
 
-    try self.renderer_wakeup.notify();
+        const before = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+        const after = self.terminal.screens.active.pages.getTopLeft(.viewport);
+        break :changed !before.eql(after);
+    };
+
+    if (screen_changed) self.notifyScreenChange();
+
+    self.renderer_endpoint_mutex.lockUncancelable(global.io());
+    defer self.renderer_endpoint_mutex.unlock(global.io());
+
+    if (self.renderer_wakeup) |wakeup| try wakeup.notify();
 }
 
 /// Called when focus is gained or lost (when focus events are enabled)
@@ -693,17 +954,78 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // We are modifying terminal state from here on out and we need
-    // the lock to grab our read data.
+    self.processOutputWithScreenChange(buf, true);
+}
+
+/// Process output while capturing any termio messages generated by terminal
+/// parsing. Capture state is thread-local so concurrent PTY readers cannot
+/// observe or write to the caller-owned message list even if parsing drops the
+/// renderer state lock.
+pub fn processOutputCaptureMessages(
+    self: *Termio,
+    buf: []const u8,
+    notify_screen_change: bool,
+    messages: *std.ArrayListUnmanaged(termio.Message),
+) void {
+    const data_callback = self.dataCallback();
+    if (data_callback.callback) |callback| {
+        callback(data_callback.userdata, buf.ptr, buf.len);
+    }
+
+    // Registered before the state lock so it runs after the unlock: the wake
+    // reads the terminal's activity token under a try-lock and would otherwise
+    // always find it contended.
+    defer self.wakeCompression();
+
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
-    self.processOutputLocked(buf);
+
+    const handler = &self.terminal_stream.handler;
+    handler.beginTermioMessageCapture(messages);
+    handler.termio_messaged = false;
+    defer {
+        handler.endTermioMessageCapture();
+        handler.termio_messaged = false;
+    }
+
+    self.processOutputLocked(buf, notify_screen_change);
+}
+
+/// Process output without queueing an app-thread screen-change notification.
+/// Callers use this when they report the session mutation synchronously.
+pub fn processOutputNoScreenChange(self: *Termio, buf: []const u8) void {
+    self.processOutputWithScreenChange(buf, false);
+}
+
+fn processOutputWithScreenChange(
+    self: *Termio,
+    buf: []const u8,
+    notify_screen_change: bool,
+) void {
+    const data_callback = self.dataCallback();
+    if (data_callback.callback) |callback| {
+        callback(data_callback.userdata, buf.ptr, buf.len);
+    }
+
+    // We are modifying terminal state from here on out and we need
+    // the lock to grab our read data. The compression wake is registered first
+    // so it runs after the unlock; see processOutputCaptureMessages.
+    defer self.wakeCompression();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.processOutputLocked(buf, notify_screen_change);
 }
 
 /// Process output from readdata but the lock is already held.
-fn processOutputLocked(self: *Termio, buf: []const u8) void {
+fn processOutputLocked(
+    self: *Termio,
+    buf: []const u8,
+    notify_screen_change: bool,
+) void {
     // Schedule a render. We can call this first because we have the lock.
-    self.terminal_stream.handler.queueRender() catch unreachable;
+    self.terminal_stream.handler.queueRender() catch |err| {
+        log.warn("error queueing render for terminal output err={}", .{err});
+    };
 
     // Whenever a character is typed, we ensure the cursor is in the
     // non-blink state so it is rendered if visible. If we're under
@@ -718,7 +1040,11 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         }
 
         self.last_cursor_reset = now;
-        _ = self.renderer_mailbox.push(global.io(), .{
+        self.renderer_endpoint_mutex.lockUncancelable(global.io());
+        defer self.renderer_endpoint_mutex.unlock(global.io());
+
+        const mailbox = self.renderer_mailbox orelse break :cursor_reset;
+        _ = mailbox.push(global.io(), .{
             .reset_cursor_blink = {},
         }, .{ .instant = {} });
     }
@@ -742,6 +1068,7 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     } else {
         self.terminal_stream.nextSlice(buf);
     }
+    self.bytes_processed += buf.len;
 
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.
@@ -749,6 +1076,19 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.handler.termio_messaged = false;
         self.mailbox.notify();
     }
+
+    if (notify_screen_change) self.notifyScreenChange();
+}
+
+fn notifyScreenChange(self: *Termio) void {
+    if (comptime !@hasDecl(apprt.runtime.Surface, "notifyOwnerSessionScreenChange")) return;
+    if (!self.surface_mailbox.surface.queueScreenChangeNotification()) return;
+
+    // This is a coalesced hint for session state consumers. If the app
+    // mailbox is full, the failed push still wakes the app thread and
+    // App.drainMailbox will flush the pending notification without blocking
+    // the IO thread.
+    _ = self.surface_mailbox.push(.screen_change, .{ .instant = {} });
 }
 
 /// Sends a DSR response for the current color scheme to the pty.

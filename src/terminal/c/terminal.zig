@@ -1709,7 +1709,6 @@ pub const TerminalData = enum(c_int) {
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
     memory_usage = 42,
-    selection_valid = 43,
     saved_cursor_x = 44,
     saved_cursor_y = 45,
     saved_cursor_origin = 46,
@@ -1735,7 +1734,6 @@ pub const TerminalData = enum(c_int) {
             .vt_processing_error,
             .vt_ground,
             .cursor_at_prompt,
-            .selection_valid,
             .saved_cursor_origin,
             => bool,
             .mouse_shape => mouse.Shape,
@@ -1894,10 +1892,6 @@ fn getTyped(
         .selection => out.* = selection_c.CSelection.fromZig(
             t.screens.active.selection orelse return .no_value,
         ),
-        .selection_valid => {
-            const sel = t.screens.active.selection orelse return .no_value;
-            out.* = !sel.start().garbage and !sel.end().garbage;
-        },
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
         .vt_processing_error => out.* = wrapper.stream.handler.semantic_failure,
         .vt_ground => out.* = wrapper.stream.ground(),
@@ -6993,129 +6987,6 @@ test "get_multi null keys returns invalid_value" {
     var cols: u16 = 0;
     var values = [_]?*anyopaque{@ptrCast(&cols)};
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
-}
-
-test "get selection_valid returns no_value without a selection" {
-    var t: Terminal = null;
-    try testing.expectEqual(Result.success, new(
-        &lib.alloc.test_allocator,
-        &t,
-        80,
-        24,
-    ));
-    defer free(t);
-
-    var valid: bool = undefined;
-    try testing.expectEqual(Result.no_value, get(t, .selection_valid, @ptrCast(&valid)));
-}
-
-test "get selection_valid returns true for a live selection" {
-    var t: Terminal = null;
-    try testing.expectEqual(Result.success, new(
-        &lib.alloc.test_allocator,
-        &t,
-        80,
-        24,
-    ));
-    defer free(t);
-
-    vt_write(t, "Hello", 5);
-
-    var start_ref: grid_ref_c.CGridRef = .{};
-    try testing.expectEqual(Result.success, grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 0, .y = 0 } },
-    }, &start_ref));
-
-    var end_ref: grid_ref_c.CGridRef = .{};
-    try testing.expectEqual(Result.success, grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 4, .y = 0 } },
-    }, &end_ref));
-
-    const sel: selection_c.CSelection = .{
-        .start = start_ref,
-        .end = end_ref,
-        .rectangle = false,
-    };
-    try testing.expectEqual(Result.success, set(t, .selection, @ptrCast(&sel)));
-
-    var valid: bool = undefined;
-    try testing.expectEqual(Result.success, get(t, .selection_valid, @ptrCast(&valid)));
-    try testing.expect(valid);
-}
-
-test "get selection_valid is false after scrollback trim garbages the tracked pin" {
-    var t: Terminal = null;
-    try testing.expectEqual(Result.success, new(
-        &lib.alloc.test_allocator,
-        &t,
-        80,
-        3,
-    ));
-    defer free(t);
-
-    // Track a selection over the very first content we write. Once we've
-    // scrolled far enough into history and clamped scrollback down, this
-    // is the content that gets pruned first.
-    vt_write(t, "Hi", 2);
-
-    var start_ref: grid_ref_c.CGridRef = .{};
-    try testing.expectEqual(Result.success, grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 0, .y = 0 } },
-    }, &start_ref));
-
-    var end_ref: grid_ref_c.CGridRef = .{};
-    try testing.expectEqual(Result.success, grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 1, .y = 0 } },
-    }, &end_ref));
-
-    const sel: selection_c.CSelection = .{
-        .start = start_ref,
-        .end = end_ref,
-        .rectangle = false,
-    };
-    try testing.expectEqual(Result.success, set(t, .selection, @ptrCast(&sel)));
-    try testing.expect(t.?.terminal.screens.active.selection.?.tracked());
-
-    var valid: bool = undefined;
-    try testing.expectEqual(Result.success, get(t, .selection_valid, @ptrCast(&valid)));
-    try testing.expect(valid);
-
-    // Grow scrollback well past a single page of history. `lines.min` is
-    // exactly one page's row capacity for this column count (see
-    // PageList.Limits), so growing several multiples of it guarantees
-    // multiple complete historical pages exist before we clamp down.
-    const min_lines = t.?.terminal.screens.active.pages.limits.lines.min;
-    const newlines = try testing.allocator.alloc(u8, min_lines * 4);
-    defer testing.allocator.free(newlines);
-    @memset(newlines, '\n');
-    vt_write(t, newlines.ptr, newlines.len);
-
-    // Clamping max_scrollback_lines enforces immediately (PageList.setMaxLines
-    // -> Limits.enforce), pruning complete historical pages until only about
-    // one page's worth of history (the enforced minimum) remains. That prunes
-    // the page our selection's start pin still points into, marking it
-    // garbage per PageList's tracked-pin garbage-marking (PageList.zig
-    // Limits.enforce, and the equivalent path in PageList.grow's prune
-    // branch).
-    var tiny_max_lines: usize = 1;
-    try testing.expectEqual(Result.success, set(t, .scrollback_max_lines, @ptrCast(&tiny_max_lines)));
-    try testing.expect(t.?.terminal.screens.active.selection.?.start().garbage);
-
-    try testing.expectEqual(Result.success, get(t, .selection_valid, @ptrCast(&valid)));
-    try testing.expect(!valid);
-
-    // This is exactly the gap selection_valid exists to close: the raw
-    // GHOSTTY_TERMINAL_DATA_SELECTION read is untouched by this change and
-    // still reports success, with endpoints silently collapsed to wherever
-    // the garbage pin was relocated. A caller that only reads
-    // GHOSTTY_TERMINAL_DATA_SELECTION has no way to tell those endpoints no
-    // longer describe the original selection.
-    var out: selection_c.CSelection = undefined;
-    try testing.expectEqual(Result.success, get(t, .selection, @ptrCast(&out)));
 }
 
 test "take_render_scroll_rects returns pending rects and clears them" {

@@ -2577,27 +2577,6 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
 
   /**
-   * Whether the active screen's current selection is valid.
-   *
-   * A tracked selection endpoint can be marked garbage when scrollback
-   * trimming discards the page it pointed into and cannot relocate it to a
-   * sensical position. When that happens, GHOSTTY_TERMINAL_DATA_SELECTION
-   * still returns a snapshot, but its endpoints have collapsed to whatever
-   * position the garbage pin was left at (typically the top-left of the
-   * active screen) and no longer describe the original selection. Query
-   * this value first to detect that case before trusting the selection
-   * snapshot's endpoints.
-   *
-   * Returns GHOSTTY_NO_VALUE when there is no active selection. Returns true
-   * when a selection exists and neither endpoint pin is garbage (this
-   * includes untracked selections, which are never garbage). Returns false
-   * when a selection exists and at least one endpoint pin is garbage.
-   *
-   * Output type: bool *
-   */
-  GHOSTTY_TERMINAL_DATA_SELECTION_VALID = 43,
-
-  /**
    * Column of the active screen's saved cursor (DECSC), 0-indexed. Each
    * screen keeps its own saved cursor.
    *

@@ -615,15 +615,15 @@ typedef struct {
   size_t scroll_rect_count;
   ghostty_render_scroll_rect_s* scroll_rects;
   // True when scroll_rects fully describes content movement since the previous frame (no
-  // overflow of the exporting terminal's pending-scroll-rect ring buffer). A mirror's local
-  // drag-carry math is only valid to apply when this is true; false means the mirror cannot know
-  // how content moved and must cancel any in-progress drag instead of guessing.
+  // overflow of the exporting terminal's pending-scroll-rect ring buffer); false means a consumer
+  // cannot know how content moved. Populated on export only; applying a snapshot ignores
+  // scroll_rects, scroll_rect_count and this flag.
   bool scroll_carry_valid;
-  // Bit 0 present, bit 1 rectangle, bit 2 extends_above, bit 3 extends_below. Zero means the
-  // exporting terminal has no selection to paint; selection_start_*/selection_end_* are
-  // meaningful only when bit 0 is set.
+  // The selection a client paints onto a mirror: bit 0 present, bit 1 rectangle, bit 2
+  // extends_above, bit 3 extends_below. Applied only; export leaves it zero. Zero means paint no
+  // selection; selection_start_*/selection_end_* are meaningful only when bit 0 is set.
   uint8_t selection_flags;
-  // The exported selection's endpoints, viewport-relative and clipped to the grid, ordered start
+  // The painted selection's endpoints, viewport-relative and clipped to the grid, ordered start
   // before end. Zero when no selection is present.
   uint16_t selection_start_x;
   uint16_t selection_start_y;
@@ -658,8 +658,8 @@ typedef struct {
   uint64_t bytes_processed;
   // The gesture's click cell (where the press landed) projected onto this frame's viewport; the
   // row is signed and is off screen when the anchor's text is. Applied only. During a local drag
-  // the apply paints the client's projected selection (the selection fields), re-seats the click
-  // pin on this cell, and does not cancel on scroll_carry_valid == false; between drags it
+  // the apply paints the client's projected selection (the selection fields) and re-seats the
+  // click pin on this cell; a drag whose frame carries no anchor is cancelled. Between drags it
   // re-seats the click pin a shift-click extends from. An off-grid anchor seats the click pin on
   // the visible edge so Ghostty's next resolution gets the pointer side right; the anchor side it
   // resolves from that stand-in is not the selection's, so the client keeps its true anchor and
@@ -1400,17 +1400,6 @@ GHOSTTY_API void ghostty_surface_deny_clipboard_request(ghostty_surface_t,
                                                            void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
-// Sets the surface's selection from screen-space coordinates (row 0 is the oldest scrollback
-// row). Coordinates are clamped to the terminal's current extent rather than rejected. Returns
-// false only if the terminal has no rows or a clamped coordinate still fails to resolve to a pin.
-GHOSTTY_API bool ghostty_surface_set_selection_absolute(ghostty_surface_t,
-                                                           uint16_t,
-                                                           uint32_t,
-                                                           uint16_t,
-                                                           uint32_t,
-                                                           bool);
-// Clears the surface's selection. Never triggers a clipboard write.
-GHOSTTY_API void ghostty_surface_clear_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
@@ -1467,10 +1456,8 @@ GHOSTTY_API bool ghostty_mirror_apply_render_frame(ghostty_mirror_t,
 GHOSTTY_API bool ghostty_mirror_apply_render_frame_no_draw(ghostty_mirror_t,
                                                               const ghostty_render_frame_s*);
 GHOSTTY_API ghostty_surface_t ghostty_mirror_surface(ghostty_mirror_t);
-// Rows are signed: an in-progress local drag whose anchor has scrolled above the mirror's
-// viewport is reported at its true, off-grid row (start_y/end_y may be negative) rather than the
-// row-0 position it is clamped to for painting. anchor_clipped is set exactly when that happened.
-// present is false when the mirror has no selection.
+// The mirror's painted selection in viewport coordinates, ordered top-left first. present is
+// false when the mirror has no selection.
 typedef struct {
   bool present;
   bool rectangle;
@@ -1478,7 +1465,6 @@ typedef struct {
   int32_t start_y;
   uint16_t end_x;
   int32_t end_y;
-  bool anchor_clipped;
 } ghostty_mirror_selection_info_s;
 GHOSTTY_API void ghostty_mirror_selection_info(ghostty_mirror_t, ghostty_mirror_selection_info_s*);
 // Paints (or clears, when present is false) the mirror's selection from viewport coordinates and
@@ -1486,7 +1472,7 @@ GHOSTTY_API void ghostty_mirror_selection_info(ghostty_mirror_t, ghostty_mirror_
 // event when its merged selection differs from what Ghostty's gesture resolved (an off-screen
 // anchor), so the mirror shows the client's selection between frames. Coordinates follow the
 // snapshot's selection fields: viewport-relative, already clipped to the grid by the client. The
-// gesture, click pin and drag carry are untouched and nothing is written to the clipboard.
+// gesture and click pin are untouched and nothing is written to the clipboard.
 GHOSTTY_API void ghostty_mirror_set_selection(ghostty_mirror_t, bool present, bool rectangle, uint16_t start_x, uint16_t start_y, uint16_t end_x, uint16_t end_y);
 GHOSTTY_API bool ghostty_mirror_set_host(ghostty_mirror_t,
                                             const ghostty_surface_host_s*);

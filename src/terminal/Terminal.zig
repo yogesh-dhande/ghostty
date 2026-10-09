@@ -325,8 +325,8 @@ fn recordRenderScrollRect(
     // rect-plus-delta model cannot describe "the whole region emptied out and something
     // unrelated took its place": there is no meaningful shift amount to hand a consumer. Poison
     // the carry exactly like the accumulated-delta overflow below does, so a consumer (e.g. a
-    // mirror's in-progress drag) sees `scroll_carry_valid = false` and cancels rather than
-    // trusting an empty or partial rect list to reconstruct the movement.
+    // delta-frame encoder) sees `scroll_carry_valid = false` and falls back to a full diff rather
+    // than trusting an empty or partial rect list to reconstruct the movement.
     if (delta_rows != 0 and @as(u32, @abs(delta_rows)) >= @as(u32, row_count)) {
         self.pending_render_scroll_rect_count = 0;
         self.pending_render_scroll_rect_overflow = true;
@@ -7146,8 +7146,7 @@ test "Terminal: whole-region scroll poisons the render scroll rect carry" {
     // region. recordRenderScrollRect's whole-region guards used to silently drop this rect
     // instead of poisoning the carry the way the accumulated-delta overflow branch does, which
     // left scroll_carry_valid true with an empty rect list for the frame: a consumer (e.g. a
-    // mirror's in-progress drag) then kept its anchor unshifted instead of cancelling, and could
-    // commit the wrong rows.
+    // delta-frame encoder) then trusted an empty rect list for a frame whose content did move.
     try t.scrollUp(5);
 
     try testing.expect(t.pendingRenderScrollRectsOverflowed());

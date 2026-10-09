@@ -545,12 +545,6 @@ pub const Surface = struct {
     session_state_callback: ?SessionStateCallback = null,
     session_state_userdata: ?*anyopaque = null,
 
-    /// The virtual anchor of an in-progress local drag on a mirror surface, carried across frame
-    /// applies. Null when no drag is in progress or the carry was discarded (a new press, or an
-    /// apply with no drag in progress). See `CAPI.MirrorDragCarry` and
-    /// `CAPI.applySnapshotToSurface`.
-    mirror_drag_carry: ?CAPI.MirrorDragCarry = null,
-
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -1854,15 +1848,16 @@ pub const CAPI = struct {
         scroll_rect_count: usize = 0,
         scroll_rects: ?[*]SnapshotScrollRect = null,
         /// True when `scroll_rects` fully describes content movement since the previous frame (no
-        /// overflow of the exporting terminal's pending-scroll-rect ring buffer). A mirror's local
-        /// drag-carry math is only valid to apply when this is true; false means the mirror cannot
-        /// know how content moved and must cancel any in-progress drag instead of guessing.
+        /// overflow of the exporting terminal's pending-scroll-rect ring buffer); false means a
+        /// consumer cannot know how content moved. Populated on export only; applying a snapshot
+        /// ignores `scroll_rects`, `scroll_rect_count` and this flag.
         scroll_carry_valid: bool = false,
-        /// Bits from `SelectionFlags`. Zero (no bit set) means the exporting terminal has no
-        /// selection to paint; `selection_start_*`/`selection_end_*` are meaningful only when
-        /// `SelectionFlags.present` is set.
+        /// The selection a client paints onto a mirror, as bits from `SelectionFlags`. Applied
+        /// only; export leaves it zero. Zero (no bit set) means paint no selection;
+        /// `selection_start_*`/`selection_end_*` are meaningful only when `SelectionFlags.present`
+        /// is set.
         selection_flags: u8 = 0,
-        /// The exported selection's endpoints, viewport-relative and clipped to the grid, ordered
+        /// The painted selection's endpoints, viewport-relative and clipped to the grid, ordered
         /// start before end. Zero when no selection is present.
         selection_start_x: u16 = 0,
         selection_start_y: u16 = 0,
@@ -1911,9 +1906,9 @@ pub const CAPI = struct {
         /// never fills it.
         ///
         /// While a local drag is in progress the apply paints the client's projected selection
-        /// (the frame's selection fields), re-seats the click pin on this cell, and does not
-        /// cancel on overflowed scroll rects (`scroll_carry_valid == false`). Between drags it
-        /// re-seats the click pin a later shift-click extends from.
+        /// (the frame's selection fields) and re-seats the click pin on this cell; a drag
+        /// whose frame carries no anchor is cancelled. Between drags it re-seats the click pin
+        /// a later shift-click extends from.
         ///
         /// An off-grid anchor seats the click pin on the visible edge so Ghostty's next
         /// resolution gets the pointer side right; the anchor side it resolves from that
@@ -2145,73 +2140,6 @@ pub const CAPI = struct {
         }
     }
 
-    /// The signed, viewport-relative virtual position of an in-progress local drag's anchor (the
-    /// pin tracking where the left press landed), carried across frame applies via the snapshot's
-    /// scroll rects.
-    ///
-    /// A mirror repaints its whole grid every frame and holds no scrollback (see the doc comment
-    /// on `applySnapshotToSurface`), so once the content the anchor was on scrolls above row 0
-    /// there is no pin left to track it with: the anchor becomes purely virtual, tracked here as
-    /// a coordinate that can run negative, until it either scrolls back into the grid or the drag
-    /// ends. `Surface.mirror_drag_carry` holds this across applies; it survives release so a
-    /// client can query the drag's final shape via `ghostty_mirror_selection_info` right after
-    /// delivering the mouse-up, and is discarded on the next press or on any apply with no local
-    /// drag in progress. A snapshot that carries a client anchor never uses this: the client owns
-    /// the anchor, so no carry is kept.
-    const MirrorDragCarry = struct {
-        anchor_x: i32,
-        anchor_y: i32,
-
-        /// Preserved so `ghostty_mirror_selection_info` can report the drag's shape without
-        /// needing the live, frame-painted selection, which does not exist while the anchor is
-        /// virtual (no pin on the current grid corresponds to it).
-        rectangle: bool,
-    };
-
-    /// Shifts a virtual drag anchor by the content movement `rects` describe, applying the same
-    /// delta a real cell at that position would receive: a rect's `delta_rows`/`delta_columns`
-    /// apply when the anchor falls inside its `[row_start, row_start + row_count)` x
-    /// `[column_start, column_start + column_count)` region.
-    ///
-    /// Once the anchor has gone above the viewport (negative `y`) no rect region can contain it,
-    /// since a rect's coordinates are always grid-relative and non-negative. Content leaving the
-    /// top of the viewport keeps pushing that already-virtual anchor further up at the same rate;
-    /// a rect spanning the full grid width and starting at row 0 represents exactly that, so only
-    /// rects of that shape move a negative anchor. Any other rect says nothing about content above
-    /// the viewport and leaves it alone. Pure and grid-state-free so it can be unit tested
-    /// directly against literal scroll rects.
-    fn shiftVirtualDragAnchor(
-        x: i32,
-        y: i32,
-        columns: u16,
-        rects: []const SnapshotScrollRect,
-    ) struct { x: i32, y: i32 } {
-        var out_x = x;
-        var out_y = y;
-        for (rects) |rect| {
-            if (out_y < 0) {
-                const full_width = rect.column_start == 0 and rect.column_count >= columns;
-                if (rect.row_start == 0 and full_width) {
-                    out_y += rect.delta_rows;
-                    out_x += rect.delta_columns;
-                }
-                continue;
-            }
-
-            const row_start: i32 = rect.row_start;
-            const row_end: i32 = row_start + @as(i32, rect.row_count);
-            const column_start: i32 = rect.column_start;
-            const column_end: i32 = column_start + @as(i32, rect.column_count);
-            if (out_y >= row_start and out_y < row_end and
-                out_x >= column_start and out_x < column_end)
-            {
-                out_y += rect.delta_rows;
-                out_x += rect.delta_columns;
-            }
-        }
-        return .{ .x = out_x, .y = out_y };
-    }
-
     /// Clamps a (possibly virtual: negative, or beyond the grid) coordinate into `[0, columns) x
     /// [0, rows)` and pins it on the just-painted grid. `columns`/`rows` describe that grid, so
     /// the lookup cannot fail and callers do not need to handle a null case.
@@ -2279,7 +2207,7 @@ pub const CAPI = struct {
     }
 
     /// Reads the coordinate of the gesture's tracked click pin before the grid-wiping reset, for
-    /// simple (non-drag-carrying) re-anchoring afterward. Read through `validatedLeftClickPin` so
+    /// re-anchoring afterward. Read through `validatedLeftClickPin` so
     /// a pin belonging to a screen the gesture no longer owns is never resurrected on this one.
     fn captureClickCoordinate(surface: *Surface, terminal_state: *terminal.Terminal) ?terminal.point.Coordinate {
         const gesture = &surface.core_surface.mouse.selection_gesture;
@@ -2292,9 +2220,9 @@ pub const CAPI = struct {
 
     /// Re-anchors the gesture's tracked click pin at a coordinate captured before the destructive
     /// grid reset, or ends the gesture if that coordinate no longer fits the grid this frame
-    /// painted (or was never captured at all). Used whenever there is no drag carry to apply
-    /// instead: a lingering multi-click still needs a valid pin for the next click to compare
-    /// against, and a fresh press with no selection yet has nothing to carry.
+    /// painted (or was never captured at all). Used whenever the frame carries no client anchor
+    /// and no drag is in progress: a lingering multi-click still needs a valid pin for the next
+    /// click to compare against.
     fn rebindOrResetClick(
         gesture: *terminal.SelectionGesture,
         terminal_state: *terminal.Terminal,
@@ -2332,7 +2260,7 @@ pub const CAPI = struct {
     /// Paints (or clears, when `present` is false) the screen's selection from viewport
     /// coordinates already clipped to the grid. Shared by frame apply and
     /// `ghostty_mirror_set_selection`. It touches only the selection: never the gesture, the
-    /// click pin or the drag carry, and never the clipboard.
+    /// click pin, and never the clipboard.
     fn paintMirrorSelection(
         screen: *terminal.Screen,
         present: bool,
@@ -2385,25 +2313,18 @@ pub const CAPI = struct {
     /// Writes a snapshot onto a mirror surface's terminal state.
     ///
     /// A mirror is viewport-only: it holds no scrollback and every frame rewrites the whole grid.
-    /// Its selection is therefore shared with the exporting (host) terminal rather than an
-    /// independent local one, except while the mirror surface itself is in the middle of a local
-    /// left-button drag:
+    /// Its selection is the client's: the frame's selection fields (viewport-relative, already
+    /// projected by the client onto this frame) are what gets painted.
     ///
-    ///  * No drag in progress: the frame is authoritative. Its selection fields (viewport-relative,
-    ///    already clipped by the export side) are painted via `applyMirrorSelectionFromSnapshot`,
-    ///    replacing whatever the mirror had. This is also what clears a selection the host ended.
-    ///  * A drag is in progress without a client anchor: the local gesture is authoritative and
-    ///    the frame's selection is never painted, so a live drag is never interrupted by a frame
-    ///    that raced it. The drag's anchor (the pin at the original press location) is carried
-    ///    across the reset using the snapshot's scroll rects, since a coordinate alone cannot
-    ///    survive `fullReset` once its content has scrolled out of the grid entirely (see
-    ///    `MirrorDragCarry`). A frame that cannot describe how content moved
-    ///    (`scroll_carry_valid == false`) or that resizes the grid out from under the drag
-    ///    cancels it instead of guessing.
+    ///  * No drag in progress: the frame is authoritative. Its selection fields are painted via
+    ///    `applyMirrorSelectionFromSnapshot`, replacing whatever the mirror had. This is also
+    ///    what clears a selection the client ended.
+    ///  * A drag is in progress without a client anchor: a drag the client does not own cannot be
+    ///    followed across the grid reset (the anchor's pin does not survive `fullReset`), so the
+    ///    drag is cancelled. A grid resize under the drag cancels it too.
     ///  * A drag is in progress with a client anchor (`drag_anchor_valid`, the click cell
     ///    projected onto this frame's viewport): the client owns the selection, so the frame's
-    ///    projected selection is painted, the gesture's click pin is re-seated on the anchor, and
-    ///    no carry is kept. Overflowed scroll rects do not cancel it; only a grid resize does.
+    ///    projected selection is painted and the gesture's click pin is re-seated on the anchor.
     ///    An off-grid anchor seats the click pin on the visible edge so Ghostty's next
     ///    resolution gets the pointer side right; the anchor side it resolves from that
     ///    stand-in is not the selection's, so the client keeps its true anchor and repaints the
@@ -2419,7 +2340,6 @@ pub const CAPI = struct {
         if (snapshot.columns == 0 or snapshot.rows == 0) return error.InvalidRenderFrame;
         const expected_cell_count = @as(usize, snapshot.columns) * @as(usize, snapshot.rows);
         if (snapshot.cell_count < expected_cell_count or snapshot.cells == null) return error.InvalidRenderFrame;
-        if (snapshot.scroll_rect_count > 0 and snapshot.scroll_rects == null) return error.InvalidRenderFrame;
 
         const core_surface = &surface.core_surface;
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
@@ -2438,9 +2358,8 @@ pub const CAPI = struct {
         const left_idx = @intFromEnum(input.MouseButton.left);
         const drag_in_progress = mouse.click_state[left_idx] == .press and gesture.left_click_count > 0;
 
-        // Grid dimensions before the resize below, compared against the snapshot's to decide
-        // whether a drag carry can trust the scroll rects: the rects describe movement within the
-        // OLD grid, and a resize landing between two applies invalidates that geometry entirely.
+        // Grid dimensions before the resize below, compared against the snapshot's: a resize
+        // landing under a drag cancels it.
         const grid_changed = terminal_state.cols != snapshot.columns or terminal_state.rows != snapshot.rows;
 
         // Everything a later branch needs from the live gesture/selection is read now, before the
@@ -2528,7 +2447,6 @@ pub const CAPI = struct {
         // Selection handling happens last so it resolves against the pages this frame actually
         // wrote, after the capacity growth above.
         try reconcileMirrorGesture(
-            &surface.mirror_drag_carry,
             gesture,
             terminal_state,
             snapshot,
@@ -2550,11 +2468,10 @@ pub const CAPI = struct {
         drag_selection: ?MirrorDragSelection,
     };
 
-    /// Reconciles the mirror's selection, drag carry and gesture click pin with a frame whose
-    /// grid has just been painted. Split out of `applySnapshotToSurface` so the gesture handling
-    /// can be exercised against a bare `Terminal` and `SelectionGesture`.
+    /// Reconciles the mirror's selection and gesture click pin with a frame whose grid has just
+    /// been painted. Split out of `applySnapshotToSurface` so the gesture handling can be
+    /// exercised against a bare `Terminal` and `SelectionGesture`.
     fn reconcileMirrorGesture(
-        carry_slot: *?MirrorDragCarry,
         gesture: *terminal.SelectionGesture,
         terminal_state: *terminal.Terminal,
         snapshot: Snapshot,
@@ -2565,11 +2482,7 @@ pub const CAPI = struct {
         const drag_selection = inputs.drag_selection;
 
         if (!inputs.drag_in_progress) {
-            // No local drag owns the mirror's selection: paint whatever the frame carries, and
-            // drop any carry state from a drag that just ended. (Its last carrying apply already
-            // ran with drag_in_progress true; this apply, with the button up, is the one that
-            // discards it.)
-            carry_slot.* = null;
+            // No local drag owns the mirror's selection: paint whatever the frame carries.
             try applyMirrorSelectionFromSnapshot(screen, snapshot);
             if (snapshot.drag_anchor_valid) {
                 // The committed selection's anchor, projected by the client onto this frame. The
@@ -2590,89 +2503,29 @@ pub const CAPI = struct {
             return;
         }
 
-        // A local drag owns the mirror's selection: never paint the frame's, and cancel instead of
-        // guessing when the grid changed under the drag, or when the frame cannot describe how
-        // content moved and the client supplied no anchor of its own. Both make the scroll rects
-        // meaningless for carrying the anchor, so the drag simply ends with no selection; the
-        // user's next press starts fresh. A client-supplied anchor needs no scroll rects, so
-        // overflowed ones (`scroll_carry_valid == false`) do not cancel it.
-        if (inputs.grid_changed or (!snapshot.scroll_carry_valid and !snapshot.drag_anchor_valid)) {
-            carry_slot.* = null;
+        // A drag the client does not own (no anchor in this frame's epoch) or that a grid resize
+        // landed under cannot be followed across the reset, so it ends with no selection; the
+        // user's next press starts fresh.
+        if (inputs.grid_changed or !snapshot.drag_anchor_valid) {
             screen.clearSelection();
             gesture.reset(terminal_state);
             return;
         }
 
-        if (snapshot.drag_anchor_valid) {
-            // The client owns the anchor and the selection: it already projected its own
-            // selection into the frame's selection fields, so the fork paints that instead of
-            // rebuilding one from the gesture (whose word/line/output selections are stored in
-            // document order, not gesture order). No carry state exists in this mode. Re-seating
-            // the click pin lets Ghostty's own drag code resolve the next mouse move from the
-            // anchor for every drag behavior.
-            carry_slot.* = null;
-            try applyMirrorSelectionFromSnapshot(screen, snapshot);
-            // The frame's own flags are the source when it carries a selection, since that is
-            // the shape the client paints. Only a frame with no selection yet (right after the
-            // press) falls back to the live local selection's shape.
-            const rectangle = if (snapshot.selection_flags & SelectionFlags.present != 0)
-                snapshot.selection_flags & SelectionFlags.rectangle != 0
-            else if (drag_selection) |s| s.rectangle else false;
-            try gesture.rebindLeftClickPin(terminal_state, clientAnchorPin(screen, snapshot, rectangle));
-            return;
-        }
+        // The client owns the anchor and the selection: it already projected its own selection
+        // into the frame's selection fields, so the fork paints that instead of rebuilding one
+        // from the gesture (whose word/line/output selections are stored in document order, not
+        // gesture order). Re-seating the click pin lets Ghostty's own drag code resolve the next
+        // mouse move from the anchor for every drag behavior.
+        try applyMirrorSelectionFromSnapshot(screen, snapshot);
+        // The frame's own flags are the source when it carries a selection, since that is the
+        // shape the client paints. Only a frame with no selection yet (right after the press)
+        // falls back to the live local selection's shape.
+        const rectangle = if (snapshot.selection_flags & SelectionFlags.present != 0)
+            snapshot.selection_flags & SelectionFlags.rectangle != 0
+        else if (drag_selection) |s| s.rectangle else false;
+        try gesture.rebindLeftClickPin(terminal_state, clientAnchorPin(screen, snapshot, rectangle));
 
-        const selection = drag_selection orelse {
-            // A press with no selection yet (no movement, or a click that intentionally selects
-            // nothing on its own): nothing to carry or paint, but the click pin still needs a
-            // valid anchor on the repainted grid for the drag that starts moving it.
-            carry_slot.* = null;
-            try rebindOrResetClick(gesture, terminal_state, screen, click_coord);
-            return;
-        };
-
-        // The anchor is the selection's start endpoint and the live drag point is its end
-        // endpoint. This is exact for the default cell-behavior drag, which covers the
-        // overwhelming majority of drags including every autoscroll case. Word, line, and output
-        // behaviors can invert which endpoint moves with the mouse depending on drag direction
-        // (see dragSelectionWord/dragSelectionLine in SelectionGesture.zig); a scroll-carrying
-        // frame apply that lands mid-drag on one of those, in the direction where the mapping
-        // inverts, carries the wrong endpoint and degrades that drag to a plain cell-shape
-        // selection for the rest of the gesture.
-        //
-        // Deviation from the spec's literal anchor definition, accepted because disambiguating
-        // which endpoint is the press location would require matching it against the gesture's
-        // tracked click pin through word/line boundary snapping rather than a direct coordinate
-        // comparison, and the failure mode self-corrects: the next local mouse-move event
-        // recomputes the true selection from the gesture's own drag logic, unaffected by this
-        // simplification.
-        const rects: []const SnapshotScrollRect = if (snapshot.scroll_rect_count > 0)
-            snapshot.scroll_rects.?[0..snapshot.scroll_rect_count]
-        else
-            &.{};
-
-        const anchor_baseline: struct { x: i32, y: i32 } = if (carry_slot.*) |carry|
-            .{ .x = carry.anchor_x, .y = carry.anchor_y }
-        else
-            .{ .x = selection.start.x, .y = @intCast(selection.start.y) };
-        const anchor = shiftVirtualDragAnchor(anchor_baseline.x, anchor_baseline.y, snapshot.columns, rects);
-
-        carry_slot.* = .{
-            .anchor_x = anchor.x,
-            .anchor_y = anchor.y,
-            .rectangle = selection.rectangle,
-        };
-
-        // The drag point never needs multi-frame memory: the mouse can only be over the visible
-        // surface while dragging, so it is always re-derived fresh from the live selection rather
-        // than carried.
-        const other_x: i32 = selection.end.x;
-        const other_y: i32 = @intCast(selection.end.y);
-
-        const anchor_pin = clampedDragPin(screen, anchor.x, anchor.y, snapshot.columns, snapshot.rows);
-        const other_pin = clampedDragPin(screen, other_x, other_y, snapshot.columns, snapshot.rows);
-        try screen.select(terminal.Selection.init(anchor_pin, other_pin, selection.rectangle));
-        try gesture.rebindLeftClickPin(terminal_state, anchor_pin);
     }
 
     const Session = struct {
@@ -3374,76 +3227,6 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
-    /// Sets a surface's selection from screen-space coordinates (row 0 is the oldest scrollback
-    /// row, growing downward through the active area), for a host terminal to install a selection
-    /// another party (a mirror, over the device API) asked for.
-    ///
-    /// Coordinates are clamped to the terminal's current grid/scrollback extent rather than
-    /// rejected, since the caller's view of that extent (a mirror's last-applied frame) can be a
-    /// few rows stale by the time this call lands; clamping keeps a slightly-stale request
-    /// selecting the nearest still-valid cell instead of failing outright. Installed through
-    /// `Surface.setRemoteSelection`, the notification-aware funnel every selection mutation uses
-    /// (so the apprt hears `selection_changed`, without any clipboard write), which tracks the
-    /// pins the same way a live mouse-driven selection does: the selection follows scrollback
-    /// trimming and content edits like any other.
-    ///
-    /// Returns false only when the terminal has no rows at all, or a clamped coordinate still
-    /// fails to resolve to a pin (both indicate an empty or otherwise unusable terminal, not a
-    /// bad request).
-    export fn ghostty_surface_set_selection_absolute(
-        surface: *Surface,
-        start_x: u16,
-        start_y: u32,
-        end_x: u16,
-        end_y: u32,
-        rectangle: bool,
-    ) bool {
-        const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        const ok = ok: {
-            const terminal_state = core_surface.renderer_state.terminal;
-            const screen = terminal_state.screens.active;
-            const bar = screen.pages.scrollbar();
-            if (bar.total == 0) break :ok false;
-
-            const max_row: u32 = @intCast(bar.total - 1);
-            const max_col: terminal.size.CellCountInt = terminal_state.cols - 1;
-            const clamped_start: terminal.point.Coordinate = .{
-                .x = @min(start_x, max_col),
-                .y = @min(start_y, max_row),
-            };
-            const clamped_end: terminal.point.Coordinate = .{
-                .x = @min(end_x, max_col),
-                .y = @min(end_y, max_row),
-            };
-
-            const start_pin = screen.pages.pin(.{ .screen = clamped_start }) orelse break :ok false;
-            const end_pin = screen.pages.pin(.{ .screen = clamped_end }) orelse break :ok false;
-            core_surface.setRemoteSelection(terminal.Selection.init(start_pin, end_pin, rectangle)) catch break :ok false;
-            break :ok true;
-        };
-        // Released before refresh() to match every other mutation-then-refresh call site in this
-        // file (ghostty_surface_refresh, ghostty_session_refresh): refresh's own callback chain
-        // may need the renderer state lock, so holding it here would deadlock.
-        core_surface.renderer_state.mutex.unlock(global.io());
-        if (ok) surface.refresh();
-        return ok;
-    }
-
-    /// Clears a surface's selection, for a host terminal to drop a selection another party asked
-    /// it to release (for example, a mirror-side click that ends the shared selection). Goes
-    /// through `Surface.setRemoteSelection`, the notification-aware funnel every selection
-    /// mutation uses, so the apprt hears `selection_changed` and no clipboard write happens
-    /// (only the release path after an actual local drag copies).
-    export fn ghostty_surface_clear_selection(surface: *Surface) void {
-        const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        // Clearing cannot fail: `setSelection(null)` only frees the tracked pins.
-        core_surface.setRemoteSelection(null) catch {};
-        core_surface.renderer_state.mutex.unlock(global.io());
-        surface.refresh();
-    }
-
     /// Read some arbitrary text from the surface.
     ///
     /// This is an expensive operation so it shouldn't be called too
@@ -3528,88 +3311,11 @@ pub const CAPI = struct {
         return flags;
     }
 
-    /// The result of projecting a terminal's selection into an exported viewport: which
-    /// `SelectionFlags` bits apply and the clipped, viewport-relative endpoints. All zero
-    /// (`flags == 0`) means no selection is exported, matching a zeroed `Snapshot`.
-    const ExportedSelection = struct {
-        flags: u8 = 0,
-        start_x: u16 = 0,
-        start_y: u16 = 0,
-        end_x: u16 = 0,
-        end_y: u16 = 0,
-    };
-
-    /// True if `screen`'s selection exists and has been pruned out from under it: PageList's
-    /// prune step (PageList.zig, the tracked-pins loop in the prune block around line 4045)
-    /// remaps a garbaged pin to a valid but meaningless (0, 0) coordinate rather than leaving it
-    /// dangling, so a garbage pin cannot be detected by a failed pin lookup and must be checked
-    /// directly. Shared by `projectSelectionForExport` (to export no selection) and
-    /// `exportSnapshotFromSurface` (to actually clear the stale selection off the surface); see
-    /// the latter for why both are needed.
-    fn selectionGarbageAfterPrune(screen: *terminal.Screen) bool {
-        const sel = screen.selection orelse return false;
-        return sel.start().garbage or sel.end().garbage;
-    }
-
-    /// Projects `screen`'s selection into the viewport a snapshot is about to export, in
-    /// screen-space rows starting at `viewport_top` and spanning `rows` rows of `columns` columns.
-    ///
-    /// A selection with no intersection with the viewport, or whose tracked pins were pruned out
-    /// from under it (garbage, see `selectionGarbageAfterPrune`), exports as absent.
-    fn projectSelectionForExport(
-        screen: *terminal.Screen,
-        viewport_top: u32,
-        rows: u16,
-        columns: u16,
-    ) ExportedSelection {
-        if (rows == 0 or columns == 0) return .{};
-        const sel = screen.selection orelse return .{};
-        if (selectionGarbageAfterPrune(screen)) return .{};
-
-        const tl_pin = sel.topLeft(screen);
-        const br_pin = sel.bottomRight(screen);
-        const tl = (screen.pages.pointFromPin(.screen, tl_pin) orelse return .{}).screen;
-        const br = (screen.pages.pointFromPin(.screen, br_pin) orelse return .{}).screen;
-
-        const viewport_bottom = viewport_top + @as(u32, rows) - 1;
-        if (tl.y > viewport_bottom or br.y < viewport_top) return .{};
-
-        const last_column: u16 = columns - 1;
-        var result: ExportedSelection = .{ .flags = SelectionFlags.present };
-        if (sel.rectangle) result.flags |= SelectionFlags.rectangle;
-
-        if (tl.y < viewport_top) {
-            result.flags |= SelectionFlags.extends_above;
-            result.start_y = 0;
-            result.start_x = if (sel.rectangle) @min(tl.x, last_column) else 0;
-        } else {
-            result.start_y = @intCast(tl.y - viewport_top);
-            result.start_x = @min(tl.x, last_column);
-        }
-
-        if (br.y > viewport_bottom) {
-            result.flags |= SelectionFlags.extends_below;
-            result.end_y = rows - 1;
-            result.end_x = if (sel.rectangle) @min(br.x, last_column) else last_column;
-        } else {
-            result.end_y = @intCast(br.y - viewport_top);
-            result.end_x = @min(br.x, last_column);
-        }
-
-        return result;
-    }
-
     fn exportSnapshotFromSurface(
         surface: *Surface,
         result: *Snapshot,
     ) bool {
         result.* = .{};
-
-        var cleared_garbage_selection = false;
-        // Registered before the mutex lock/unlock defers so it runs after the unlock (defers run
-        // last-in-first-out): `Surface.refresh` must not be called with the renderer mutex held,
-        // matching how `ghostty_surface_clear_selection` refreshes only after releasing the lock.
-        defer if (cleared_garbage_selection) surface.refresh();
 
         const core_surface = &surface.core_surface;
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
@@ -3737,7 +3443,7 @@ pub const CAPI = struct {
         const cursor = render_state.cursor.viewport;
         // Captured once and reused both for the flag on the result below and to decide whether
         // pending_scroll_rects is trustworthy: an overflowed ring buffer means rects were dropped,
-        // so a mirror cannot reconstruct movement from them and must not try.
+        // so a consumer cannot reconstruct movement from them and must not try.
         var scroll_carry_valid = !terminal_state.pendingRenderScrollRectsOverflowed();
         const pending_scroll_rects = if (scroll_carry_valid)
             terminal_state.pendingRenderScrollRects()
@@ -3750,7 +3456,7 @@ pub const CAPI = struct {
                 log.warn("error allocating snapshot scroll rects err={}", .{err});
                 // Rects existed but could not be exported (and the pending buffer is cleared
                 // below regardless), so this frame does not describe how content moved; a
-                // mirror must cancel a drag carry rather than trust an empty rect list.
+                // consumer must not trust an empty rect list.
                 scroll_carry_valid = false;
                 scroll_rect_count = 0;
                 break :blk &.{};
@@ -3769,36 +3475,7 @@ pub const CAPI = struct {
             }
         }
 
-        // A garbaged selection (its tracked pins pruned out of scrollback, see
-        // `selectionGarbageAfterPrune`) is only half handled by `projectSelectionForExport`
-        // below returning absent: that stops this and every future frame from exporting a
-        // highlight, but `screen.selection` itself stays installed, so `ghostty_surface_has_
-        // selection` keeps reporting true and `ghostty_surface_read_selection` /
-        // `Screen.selectionString` (which has no garbage guard) keep formatting whatever text now
-        // sits at the pin's remapped (0, 0) location, unrelated to what the user actually
-        // selected. Clear it here through `setRemoteSelection`, the same notification-firing,
-        // clipboard-silent funnel `ghostty_surface_clear_selection` uses, so subscribers observe
-        // the clear via `selection_changed`. The renderer mutex is already held for this whole
-        // function (see the lock above), which is `setRemoteSelection`'s contract, so this does
-        // not re-acquire it. The Linux headless host clears the equivalent way in its render pass
-        // (GhosttyLinuxHeadlessSessionCore.swift) for the identical reason. The deferred
-        // `surface.refresh()` registered before the mutex defers (above) schedules the owner
-        // view's redraw once the lock is released, so the stale highlight does not linger on the
-        // owner's rendered surface until an unrelated event happens to trigger a render.
-        if (selectionGarbageAfterPrune(screen)) {
-            core_surface.setRemoteSelection(null) catch |err| {
-                log.warn("error clearing garbaged selection during snapshot export err={}", .{err});
-            };
-            cleared_garbage_selection = true;
-        }
-
         const scrollbar = screen.pages.scrollbar();
-        const exported_selection = projectSelectionForExport(
-            screen,
-            @intCast(scrollbar.offset),
-            rows,
-            columns,
-        );
 
         result.* = .{
             .columns = columns,
@@ -3813,11 +3490,6 @@ pub const CAPI = struct {
             .scroll_rect_count = scroll_rect_count,
             .scroll_rects = if (scroll_rect_count > 0) copied_scroll_rects.ptr else null,
             .scroll_carry_valid = scroll_carry_valid,
-            .selection_flags = exported_selection.flags,
-            .selection_start_x = exported_selection.start_x,
-            .selection_start_y = exported_selection.start_y,
-            .selection_end_x = exported_selection.end_x,
-            .selection_end_y = exported_selection.end_y,
             .scrollbar_total = @intCast(scrollbar.total),
             .scrollbar_offset = @intCast(scrollbar.offset),
             .mouse_reporting_active = terminal_state.flags.mouse_event != .none,
@@ -4215,10 +3887,7 @@ pub const CAPI = struct {
         return mirror.session.surface;
     }
 
-    /// Mirrors `ghostty_mirror_selection_info_s` in include/ghostty.h. Rows are signed so an
-    /// in-progress local drag whose anchor has scrolled above the mirror's viewport (see
-    /// `MirrorDragCarry`) can be reported at its true, off-grid row instead of the row-0 position
-    /// it is clamped to for painting.
+    /// Mirrors `ghostty_mirror_selection_info_s` in include/ghostty.h.
     const MirrorSelectionInfo = extern struct {
         present: bool = false,
         rectangle: bool = false,
@@ -4226,35 +3895,18 @@ pub const CAPI = struct {
         start_y: i32 = 0,
         end_x: u16 = 0,
         end_y: i32 = 0,
-        anchor_clipped: bool = false,
     };
 
-    fn clampColumn(x: i32) u16 {
-        return @intCast(std.math.clamp(x, 0, std.math.maxInt(u16)));
-    }
-
-    /// Reports a mirror surface's current selection in viewport coordinates.
-    ///
-    /// A drag whose anchor is still on the grid is reported straight from the live, painted
-    /// selection, ordered top-left first via the same `Selection.topLeft`/`bottomRight` logic the
-    /// export path uses (exact, including rectangle-selection column mirroring). A virtual
-    /// (off-grid) anchor has no pin to order that way, so it is reported as the raw anchor/drag-
-    /// point pair instead, with `anchor_clipped` set: the anchor is always the topmost endpoint in
-    /// that case (any on-grid row is greater than a negative one), so start/end ordering by row is
-    /// still exact, but column ordering for a rectangle-mode drag is not re-normalized. This only
-    /// under-orders the columns of a rectangle drag that is simultaneously scrolled off the top of
-    /// the viewport and dragged to a smaller column than its anchor, a compound edge case accepted
-    /// rather than adding a second, mostly-unused ordering path for it.
+    /// Reports a mirror surface's current painted selection in viewport coordinates, ordered
+    /// top-left first via the same `Selection.topLeft`/`bottomRight` logic the export path uses
+    /// (exact, including rectangle-selection column mirroring).
     export fn ghostty_mirror_selection_info(mirror: *Mirror, out: *MirrorSelectionInfo) void {
         const surface = mirror.session.surface;
         const core_surface = &surface.core_surface;
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
         defer core_surface.renderer_state.mutex.unlock(global.io());
 
-        out.* = mirrorSelectionInfo(
-            core_surface.renderer_state.terminal.screens.active,
-            surface.mirror_drag_carry,
-        );
+        out.* = mirrorSelectionInfo(core_surface.renderer_state.terminal.screens.active);
     }
 
     /// Paints (or clears, when `present` is false) the mirror's selection from viewport
@@ -4264,8 +3916,8 @@ pub const CAPI = struct {
     /// merged selection differs from what Ghostty's gesture resolved (an off-screen anchor), so
     /// the mirror shows the client's selection between frames. The coordinates have the same
     /// space and clipping contract as a snapshot's selection fields: viewport-relative and
-    /// already clipped to the grid by the client. The gesture, the click pin and the drag carry
-    /// are never touched, and nothing is written to the clipboard.
+    /// already clipped to the grid by the client. The gesture and the click pin are never
+    /// touched, and nothing is written to the clipboard.
     export fn ghostty_mirror_set_selection(
         mirror: *Mirror,
         present: bool,
@@ -4297,23 +3949,7 @@ pub const CAPI = struct {
         surface.refresh();
     }
 
-    fn mirrorSelectionInfo(screen: *terminal.Screen, carry_: ?MirrorDragCarry) MirrorSelectionInfo {
-        if (carry_) |carry| {
-            if (carry.anchor_x < 0 or carry.anchor_y < 0) {
-                const sel = screen.selection orelse return .{};
-                const other = screen.pages.pointFromPin(.active, sel.end()) orelse return .{};
-                return .{
-                    .present = true,
-                    .rectangle = carry.rectangle,
-                    .start_x = clampColumn(carry.anchor_x),
-                    .start_y = carry.anchor_y,
-                    .end_x = other.coord().x,
-                    .end_y = @intCast(other.coord().y),
-                    .anchor_clipped = true,
-                };
-            }
-        }
-
+    fn mirrorSelectionInfo(screen: *terminal.Screen) MirrorSelectionInfo {
         const sel = screen.selection orelse return .{};
         const tl = screen.pages.pointFromPin(.active, sel.topLeft(screen)) orelse return .{};
         const br = screen.pages.pointFromPin(.active, sel.bottomRight(screen)) orelse return .{};
@@ -4324,7 +3960,6 @@ pub const CAPI = struct {
             .start_y = @intCast(tl.coord().y),
             .end_x = br.coord().x,
             .end_y = @intCast(br.coord().y),
-            .anchor_clipped = false,
         };
     }
 
@@ -4974,83 +4609,11 @@ pub const CAPI = struct {
 };
 
 // Tests below cover the pure or `*terminal.Screen`-only pieces of the mirror selection model
-// (export projection, drag-anchor carry math, frame-selection painting): `shiftVirtualDragAnchor`
-// and `projectSelectionForExport` take no state beyond their arguments or a `Screen`, and
-// `applyMirrorSelectionFromSnapshot`/`clampedDragPin` only need a `Screen`, so all four are
-// testable directly. The orchestration around them in `applySnapshotToSurface` (in-progress-drag
-// detection off `Surface.core_surface.mouse`, `Surface.mirror_drag_carry`, and the
-// `Surface.refresh()` call) needs a full apprt `Surface`, and this codebase has no test harness
-// that constructs one (there is no other `test` block anywhere in this file, or any Surface-level
-// test fixture elsewhere in the tree) with a real `App`/window/renderer callback set. Building one
-// from scratch was out of scope for this change, and the orchestration was not exercised against a
-// running app either; only the pieces it wires together are covered here. That leaves the mode
-// selection (drag-in-progress detection) and the carry-state bookkeeping in `applySnapshotToSurface`
-// itself as the residual, untested surface of this change.
-
-test "shiftVirtualDragAnchor shifts an on-grid anchor inside a containing rect" {
-    const rects = [_]CAPI.SnapshotScrollRect{.{
-        .row_start = 0,
-        .row_count = 5,
-        .column_start = 0,
-        .column_count = 10,
-        .delta_rows = -2,
-        .delta_columns = 0,
-    }};
-    const result = CAPI.shiftVirtualDragAnchor(3, 4, 10, &rects);
-    try std.testing.expectEqual(@as(i32, 3), result.x);
-    try std.testing.expectEqual(@as(i32, 2), result.y);
-}
-
-test "shiftVirtualDragAnchor leaves an anchor outside every rect's region alone" {
-    const rects = [_]CAPI.SnapshotScrollRect{.{
-        .row_start = 5,
-        .row_count = 2,
-        .column_start = 0,
-        .column_count = 10,
-        .delta_rows = -2,
-        .delta_columns = 0,
-    }};
-    const result = CAPI.shiftVirtualDragAnchor(3, 4, 10, &rects);
-    try std.testing.expectEqual(@as(i32, 3), result.x);
-    try std.testing.expectEqual(@as(i32, 4), result.y);
-}
-
-test "shiftVirtualDragAnchor pushes an already-virtual anchor further up only via full-width row-0 rects" {
-    const columns: u16 = 10;
-
-    const full_width = [_]CAPI.SnapshotScrollRect{.{
-        .row_start = 0,
-        .row_count = 3,
-        .column_start = 0,
-        .column_count = columns,
-        .delta_rows = -1,
-        .delta_columns = 0,
-    }};
-    const moved = CAPI.shiftVirtualDragAnchor(0, -2, columns, &full_width);
-    try std.testing.expectEqual(@as(i32, -3), moved.y);
-
-    const partial_width = [_]CAPI.SnapshotScrollRect{.{
-        .row_start = 0,
-        .row_count = 3,
-        .column_start = 2,
-        .column_count = 4,
-        .delta_rows = -1,
-        .delta_columns = 0,
-    }};
-    const unmoved_by_width = CAPI.shiftVirtualDragAnchor(0, -2, columns, &partial_width);
-    try std.testing.expectEqual(@as(i32, -2), unmoved_by_width.y);
-
-    const not_row_zero = [_]CAPI.SnapshotScrollRect{.{
-        .row_start = 1,
-        .row_count = 3,
-        .column_start = 0,
-        .column_count = columns,
-        .delta_rows = -1,
-        .delta_columns = 0,
-    }};
-    const unmoved_by_row = CAPI.shiftVirtualDragAnchor(0, -2, columns, &not_row_zero);
-    try std.testing.expectEqual(@as(i32, -2), unmoved_by_row.y);
-}
+// (frame-selection painting) and the gesture reconciliation against a bare `Terminal`. The
+// orchestration around them in `applySnapshotToSurface` (in-progress-drag detection off
+// `Surface.core_surface.mouse` and the `Surface.refresh()` call) needs a full apprt `Surface`,
+// and this codebase has no test harness that constructs one with a real `App`/window/renderer
+// callback set; only the pieces it wires together are covered here.
 
 test "clampedDragPin clamps a virtual position to row 0 / column 0 and to the grid extent" {
     var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
@@ -5124,268 +4687,6 @@ test "applyMirrorSelectionFromSnapshot paints a rectangle selection" {
     try std.testing.expect(s.selection.?.rectangle);
 }
 
-test "projectSelectionForExport returns the selection unclipped when it fits the viewport" {
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback_bytes = 4096,
-    });
-    defer s.deinit();
-    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
-
-    try s.select(terminal.Selection.init(
-        s.pages.pin(.{ .active = .{ .x = 1, .y = 0 } }).?,
-        s.pages.pin(.{ .active = .{ .x = 3, .y = 1 } }).?,
-        false,
-    ));
-
-    const bar = s.pages.scrollbar();
-    const result = CAPI.projectSelectionForExport(&s, @intCast(bar.offset), 3, 5);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.present != 0);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.extends_above == 0);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.extends_below == 0);
-    try std.testing.expectEqual(@as(u16, 1), result.start_x);
-    try std.testing.expectEqual(@as(u16, 0), result.start_y);
-    try std.testing.expectEqual(@as(u16, 3), result.end_x);
-    try std.testing.expectEqual(@as(u16, 1), result.end_y);
-}
-
-test "projectSelectionForExport clips a selection extending above the viewport" {
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback_bytes = 4096,
-    });
-    defer s.deinit();
-    try s.testWriteString("1AAAA\n2BBBB\n3CCCC\n4DDDD\n5EEEE\n6FFFF");
-
-    // Screen space: 6 rows total (0..5), a 3-row viewport defaults to the bottom (3..5).
-    try s.select(terminal.Selection.init(
-        s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
-        s.pages.pin(.{ .screen = .{ .x = 3, .y = 4 } }).?,
-        false,
-    ));
-
-    const bar = s.pages.scrollbar();
-    try std.testing.expectEqual(@as(usize, 3), bar.offset);
-
-    const result = CAPI.projectSelectionForExport(&s, @intCast(bar.offset), 3, 5);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.present != 0);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.extends_above != 0);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.extends_below == 0);
-    try std.testing.expectEqual(@as(u16, 0), result.start_x);
-    try std.testing.expectEqual(@as(u16, 0), result.start_y);
-    try std.testing.expectEqual(@as(u16, 3), result.end_x);
-    try std.testing.expectEqual(@as(u16, 1), result.end_y);
-}
-
-test "projectSelectionForExport clips a selection extending below the viewport" {
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback_bytes = 4096,
-    });
-    defer s.deinit();
-    try s.testWriteString("1AAAA\n2BBBB\n3CCCC\n4DDDD\n5EEEE\n6FFFF");
-    s.scroll(.top); // Viewport moves to the top 3 rows (0..2).
-
-    try s.select(terminal.Selection.init(
-        s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
-        s.pages.pin(.{ .screen = .{ .x = 3, .y = 4 } }).?,
-        false,
-    ));
-
-    const bar = s.pages.scrollbar();
-    try std.testing.expectEqual(@as(usize, 0), bar.offset);
-
-    const result = CAPI.projectSelectionForExport(&s, @intCast(bar.offset), 3, 5);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.present != 0);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.extends_above == 0);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.extends_below != 0);
-    try std.testing.expectEqual(@as(u16, 1), result.start_x);
-    try std.testing.expectEqual(@as(u16, 1), result.start_y);
-    try std.testing.expectEqual(@as(u16, 4), result.end_x);
-    try std.testing.expectEqual(@as(u16, 2), result.end_y);
-}
-
-test "projectSelectionForExport keeps rectangle columns as-is and clips only rows" {
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback_bytes = 4096,
-    });
-    defer s.deinit();
-    try s.testWriteString("1AAAA\n2BBBB\n3CCCC\n4DDDD\n5EEEE\n6FFFF");
-
-    try s.select(terminal.Selection.init(
-        s.pages.pin(.{ .screen = .{ .x = 1, .y = 1 } }).?,
-        s.pages.pin(.{ .screen = .{ .x = 3, .y = 4 } }).?,
-        true, // rectangle
-    ));
-
-    const bar = s.pages.scrollbar();
-    const result = CAPI.projectSelectionForExport(&s, @intCast(bar.offset), 3, 5);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.rectangle != 0);
-    try std.testing.expect(result.flags & CAPI.SelectionFlags.extends_above != 0);
-    // A clipped rectangle selection keeps its own columns instead of snapping to 0/last_column.
-    try std.testing.expectEqual(@as(u16, 1), result.start_x);
-    try std.testing.expectEqual(@as(u16, 0), result.start_y);
-    try std.testing.expectEqual(@as(u16, 3), result.end_x);
-    try std.testing.expectEqual(@as(u16, 1), result.end_y);
-}
-
-test "projectSelectionForExport returns absent when the selection does not intersect the viewport" {
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback_bytes = 4096,
-    });
-    defer s.deinit();
-    try s.testWriteString("1AAAA\n2BBBB\n3CCCC\n4DDDD\n5EEEE\n6FFFF");
-    s.scroll(.top); // Viewport is rows 0..2; select rows 4..5, entirely below it.
-
-    try s.select(terminal.Selection.init(
-        s.pages.pin(.{ .screen = .{ .x = 0, .y = 4 } }).?,
-        s.pages.pin(.{ .screen = .{ .x = 4, .y = 5 } }).?,
-        false,
-    ));
-
-    const bar = s.pages.scrollbar();
-    const result = CAPI.projectSelectionForExport(&s, @intCast(bar.offset), 3, 5);
-    try std.testing.expectEqual(@as(u8, 0), result.flags);
-}
-
-test "projectSelectionForExport returns absent for a selection pruned out of scrollback" {
-    // A small max_size forces PageList.Limits.enforce to evict whole historical pages once the
-    // budget is exceeded, marking any tracked pin on an evicted page garbage (PageList.zig
-    // Limits.enforce). This mirrors "PageList grow prune scrollback" in PageList.zig's own test
-    // suite, adapted to select through the page that gets evicted.
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 80,
-        .rows = 24,
-        .max_scrollback_bytes = 65536,
-    });
-    defer s.deinit();
-
-    // Fill the first page to capacity so the next grow() allocates a second page.
-    const page1_node = s.pages.pages.last.?;
-    const page1 = page1_node.page();
-    for (0..page1.capacity.rows - page1.size.rows) |_| {
-        try std.testing.expect(try s.pages.grow() == null);
-    }
-
-    // Select the top-left of the first (about to become historical) page.
-    try s.select(terminal.Selection.init(
-        s.pages.pin(.{ .screen = .{} }).?,
-        s.pages.pin(.{ .screen = .{} }).?,
-        false,
-    ));
-    try std.testing.expect(!s.selection.?.start().garbage);
-
-    // Keep growing (each grow can allocate a new page and enforce the byte budget) until the
-    // first page has been evicted and our selection's pins were marked garbage. Bounded so a
-    // regression that stops pruning from happening fails the test instead of hanging it.
-    var grew: usize = 0;
-    while (!s.selection.?.start().garbage and grew < 10_000) : (grew += 1) {
-        _ = try s.pages.grow();
-    }
-    try std.testing.expect(s.selection.?.start().garbage);
-
-    const bar = s.pages.scrollbar();
-    const result = CAPI.projectSelectionForExport(&s, @intCast(bar.offset), 24, 80);
-    try std.testing.expectEqual(@as(u8, 0), result.flags);
-}
-
-test "selectionGarbageAfterPrune detects a selection pruned out of scrollback" {
-    // Same eviction recipe as "projectSelectionForExport returns absent for a selection pruned
-    // out of scrollback" above: force PageList.Limits.enforce to evict the page the selection is
-    // pinned to, which marks its tracked pins garbage and remaps them to (0, 0) rather than
-    // leaving them dangling.
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 80,
-        .rows = 24,
-        .max_scrollback_bytes = 65536,
-    });
-    defer s.deinit();
-
-    const page1_node = s.pages.pages.last.?;
-    const page1 = page1_node.page();
-    for (0..page1.capacity.rows - page1.size.rows) |_| {
-        try std.testing.expect(try s.pages.grow() == null);
-    }
-
-    try s.select(terminal.Selection.init(
-        s.pages.pin(.{ .screen = .{} }).?,
-        s.pages.pin(.{ .screen = .{} }).?,
-        false,
-    ));
-    try std.testing.expect(!CAPI.selectionGarbageAfterPrune(&s));
-
-    var grew: usize = 0;
-    while (!s.selection.?.start().garbage and grew < 10_000) : (grew += 1) {
-        _ = try s.pages.grow();
-    }
-    try std.testing.expect(CAPI.selectionGarbageAfterPrune(&s));
-
-    // This is the detection half of `exportSnapshotFromSurface`'s fix: once
-    // `selectionGarbageAfterPrune` is true, it clears the selection through
-    // `Surface.setRemoteSelection(null)`, which (via `Surface.setSelection`) reduces to
-    // `screen.select(null)` plus the `selection_changed` notification. `setRemoteSelection`
-    // needs a full apprt `Surface` to call (see the file-level test doc comment above for why
-    // that is not built here), so only its effect on the screen is asserted directly: once the
-    // garbaged selection is cleared, detection reports it gone, matching what
-    // `ghostty_surface_has_selection` should report afterward.
-    try s.select(null);
-    try std.testing.expect(!CAPI.selectionGarbageAfterPrune(&s));
-    try std.testing.expect(s.selection == null);
-}
-
-test "absolute screen-space selection tracks its text across new output (ghostty_surface_set_selection_absolute's recipe)" {
-    // Exercises the clamp-then-pin-then-select recipe ghostty_surface_set_selection_absolute
-    // uses, directly against a Screen: the C function itself needs a full apprt Surface (see the
-    // file-level test doc comment above for why that is not built here).
-    var s = try terminal.Screen.init(std.testing.io, std.testing.allocator, .{
-        .cols = 5,
-        .rows = 3,
-        .max_scrollback_bytes = 4096,
-    });
-    defer s.deinit();
-    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
-
-    const bar_before = s.pages.scrollbar();
-    const max_row: u32 = @intCast(bar_before.total - 1);
-    const max_col: terminal.size.CellCountInt = s.pages.cols - 1;
-    const start_pin = s.pages.pin(.{ .screen = .{
-        .x = @min(@as(u16, 1), max_col),
-        .y = @min(@as(u32, 1), max_row),
-    } }).?;
-    const end_pin = s.pages.pin(.{ .screen = .{
-        .x = @min(@as(u16, 3), max_col),
-        .y = @min(@as(u32, 1), max_row),
-    } }).?;
-    try s.select(terminal.Selection.init(start_pin, end_pin, false));
-
-    // More output pushes the selected row ("2EFGH") into scrollback and out of the viewport.
-    try s.testWriteString("\n4MNOP\n5QRST");
-
-    {
-        const sel = s.selection.?;
-        const start = s.pages.pointFromPin(.screen, sel.start()).?.coord();
-        const end = s.pages.pointFromPin(.screen, sel.end()).?.coord();
-        try std.testing.expectEqual(@as(u16, 1), start.x);
-        try std.testing.expectEqual(@as(u32, 1), start.y);
-        try std.testing.expectEqual(@as(u16, 3), end.x);
-        try std.testing.expectEqual(@as(u32, 1), end.y);
-    }
-
-    // The selection is still anchored to "2EFGH" (unmoved in screen space) even though it is now
-    // above the viewport: the export projection reflects that as extends_above.
-    const bar_after = s.pages.scrollbar();
-    const projected = CAPI.projectSelectionForExport(&s, @intCast(bar_after.offset), 3, 5);
-    try std.testing.expect(projected.flags & CAPI.SelectionFlags.present != 0);
-    try std.testing.expect(projected.flags & CAPI.SelectionFlags.extends_above != 0);
-}
-
 // Gesture-level tests for the client-supplied anchor, and the click-pin re-seat.
 // They drive `reconcileMirrorGesture` and `mirrorSelectionInfo` with a bare `Terminal` and
 // `SelectionGesture`, replaying what `applySnapshotToSurface` does around them: read the live
@@ -5436,11 +4737,10 @@ fn testStartDrag(
 fn testApplyFrame(
     t: *terminal.Terminal,
     gesture: *terminal.SelectionGesture,
-    carry: *?CAPI.MirrorDragCarry,
     snapshot: CAPI.Snapshot,
     drag_in_progress: bool,
 ) !void {
-    try testApplyFrameWithText(t, gesture, carry, snapshot, drag_in_progress, "");
+    try testApplyFrameWithText(t, gesture, snapshot, drag_in_progress, "");
 }
 
 /// Like `testApplyFrame`, but repaints `text` onto the wiped grid the way a real frame repaints
@@ -5448,7 +4748,6 @@ fn testApplyFrame(
 fn testApplyFrameWithText(
     t: *terminal.Terminal,
     gesture: *terminal.SelectionGesture,
-    carry: *?CAPI.MirrorDragCarry,
     snapshot: CAPI.Snapshot,
     drag_in_progress: bool,
     text: []const u8,
@@ -5462,7 +4761,7 @@ fn testApplyFrameWithText(
     const grid_changed = t.cols != snapshot.columns or t.rows != snapshot.rows;
     t.fullReset();
     try t.printString(text);
-    try CAPI.reconcileMirrorGesture(carry, gesture, t, snapshot, .{
+    try CAPI.reconcileMirrorGesture(gesture, t, snapshot, .{
         .drag_in_progress = drag_in_progress,
         .grid_changed = grid_changed,
         .click_coord = click_coord,
@@ -5470,11 +4769,10 @@ fn testApplyFrameWithText(
     });
 }
 
-fn testFrame(anchor: ?struct { x: i32, y: i32 }, scroll_carry_valid: bool) CAPI.Snapshot {
+fn testFrame(anchor: ?struct { x: i32, y: i32 }) CAPI.Snapshot {
     return .{
         .columns = test_columns,
         .rows = test_rows,
-        .scroll_carry_valid = scroll_carry_valid,
         .drag_anchor_valid = anchor != null,
         .drag_anchor_x = if (anchor) |a| a.x else 0,
         .drag_anchor_y = if (anchor) |a| a.y else 0,
@@ -5485,12 +4783,11 @@ fn testFrame(anchor: ?struct { x: i32, y: i32 }, scroll_carry_valid: bool) CAPI.
 /// as a client that owns its selection writes it.
 fn testFrameWithSelection(
     anchor: struct { x: i32, y: i32 },
-    scroll_carry_valid: bool,
     start: struct { x: u16, y: u16 },
     end: struct { x: u16, y: u16 },
     rectangle: bool,
 ) CAPI.Snapshot {
-    var frame = testFrame(.{ .x = anchor.x, .y = anchor.y }, scroll_carry_valid);
+    var frame = testFrame(.{ .x = anchor.x, .y = anchor.y });
     frame.selection_flags = CAPI.SelectionFlags.present |
         (if (rectangle) CAPI.SelectionFlags.rectangle else 0);
     frame.selection_start_x = start.x;
@@ -5525,38 +4822,34 @@ fn expectClickPin(t: *terminal.Terminal, gesture: *terminal.SelectionGesture, x:
     try std.testing.expectEqual(y, coord.y);
 }
 
-test "client anchor keeps a drag alive when the frame's scroll rects overflowed" {
+test "a client anchor keeps a drag alive and paints the client's projection" {
     var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
 
-    // Content moved up two rows under the drag; the client knows, the rects cannot say. The
-    // client's projection of its selection is what gets painted.
-    const frame = testFrameWithSelection(.{ .x = 2, .y = 1 }, false, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 2 }, false);
-    try testApplyFrame(&t, &gesture, &carry, frame, true);
+    // Content moved up two rows under the drag; the client knows, so its projection of its
+    // selection is what gets painted.
+    const frame = testFrameWithSelection(.{ .x = 2, .y = 1 }, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 2 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
 
     try expectSelectionCells(t.screens.active, .{ .x = 2, .y = 1 }, .{ .x = 6, .y = 2 }, false);
-    try std.testing.expect(carry == null);
     try expectClickPin(&t, &gesture, 2, 1);
 }
 
-test "an overflowed scroll carry without a client anchor still cancels the drag" {
+test "a drag without a client anchor cancels" {
     var t = try terminal.Terminal.init(std.testing.io, std.testing.allocator, .{ .cols = test_columns, .rows = test_rows });
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
-    try testApplyFrame(&t, &gesture, &carry, testFrame(null, false), true);
+    try testApplyFrame(&t, &gesture, testFrame(null), true);
 
     try std.testing.expect(t.screens.active.selection == null);
     try std.testing.expectEqual(@as(u3, 0), gesture.left_click_count);
-    try std.testing.expect(carry == null);
 }
 
 test "a grid size change cancels a drag even when the client supplies an anchor" {
@@ -5564,17 +4857,15 @@ test "a grid size change cancels a drag even when the client supplies an anchor"
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
     // The frame is one row taller than the grid the drag started on.
-    var frame = testFrame(.{ .x = 2, .y = 1 }, true);
+    var frame = testFrame(.{ .x = 2, .y = 1 });
     frame.rows = test_rows + 1;
-    try testApplyFrame(&t, &gesture, &carry, frame, true);
+    try testApplyFrame(&t, &gesture, frame, true);
 
     try std.testing.expect(t.screens.active.selection == null);
     try std.testing.expectEqual(@as(u3, 0), gesture.left_click_count);
-    try std.testing.expect(carry == null);
 }
 
 test "a client anchor above the viewport paints the client's selection and seats the click pin top-left" {
@@ -5582,17 +4873,15 @@ test "a client anchor above the viewport paints the client's selection and seats
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 5, 1, 4, 2, false);
-    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, false, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
-    try testApplyFrame(&t, &gesture, &carry, frame, true);
+    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
 
     // The painted selection is the client's projection, not a rebuild from the pin.
     try expectSelectionCells(t.screens.active, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
     // The anchor's whole row is above the viewport, so the pin sits at the corner (not (5, 0)).
     try expectClickPin(&t, &gesture, 0, 0);
-    try std.testing.expect(carry == null);
 }
 
 test "a client anchor below the viewport seats the click pin bottom-right" {
@@ -5600,15 +4889,13 @@ test "a client anchor below the viewport seats the click pin bottom-right" {
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 3, 3, 2, 1, false);
-    const frame = testFrameWithSelection(.{ .x = 3, .y = 9 }, false, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
-    try testApplyFrame(&t, &gesture, &carry, frame, true);
+    const frame = testFrameWithSelection(.{ .x = 3, .y = 9 }, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
 
     try expectSelectionCells(t.screens.active, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
     try expectClickPin(&t, &gesture, test_columns - 1, test_rows - 1);
-    try std.testing.expect(carry == null);
 }
 
 test "a client anchor above the viewport keeps a rectangle selection's column" {
@@ -5616,15 +4903,13 @@ test "a client anchor above the viewport keeps a rectangle selection's column" {
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 5, 1, 7, 2, true);
-    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, false, .{ .x = 5, .y = 0 }, .{ .x = 7, .y = 2 }, true);
-    try testApplyFrame(&t, &gesture, &carry, frame, true);
+    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, .{ .x = 5, .y = 0 }, .{ .x = 7, .y = 2 }, true);
+    try testApplyFrame(&t, &gesture, frame, true);
 
     try expectSelectionCells(t.screens.active, .{ .x = 5, .y = 0 }, .{ .x = 7, .y = 2 }, true);
     try expectClickPin(&t, &gesture, 5, 0);
-    try std.testing.expect(carry == null);
 }
 
 fn testPress(t: *terminal.Terminal, gesture: *terminal.SelectionGesture, x: u16, y: u32, xpos: f64) !void {
@@ -5655,11 +4940,10 @@ test "a further drag with the anchor above the viewport resolves the pointer sid
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testPress(&t, &gesture, 5, 1, 58);
-    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, false, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
-    try testApplyFrame(&t, &gesture, &carry, frame, true);
+    const frame = testFrameWithSelection(.{ .x = 5, .y = -3 }, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 2 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
 
     const screen = t.screens.active;
     const selection = gesture.drag(&t, testCellDrag(screen, 4, 2, 49)).?;
@@ -5672,11 +4956,10 @@ test "a further drag with the anchor below the viewport resolves the pointer sid
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testPress(&t, &gesture, 3, 3, 31);
-    const frame = testFrameWithSelection(.{ .x = 3, .y = 9 }, false, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
-    try testApplyFrame(&t, &gesture, &carry, frame, true);
+    const frame = testFrameWithSelection(.{ .x = 3, .y = 9 }, .{ .x = 2, .y = 1 }, .{ .x = 9, .y = 4 }, false);
+    try testApplyFrame(&t, &gesture, frame, true);
 
     const screen = t.screens.active;
     const selection = gesture.drag(&t, testCellDrag(screen, 2, 1, 21)).?;
@@ -5729,7 +5012,6 @@ test "a backward word drag continues from the click word after a client-anchor f
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
     const text = "aa bb cc";
     try t.printString(text);
 
@@ -5752,11 +5034,10 @@ test "a backward word drag continues from the click word after a client-anchor f
     try expectSelectionCells(screen, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 0 }, false);
 
     // The client projects the same selection and the click cell onto the next frame.
-    const frame = testFrameWithSelection(.{ .x = 6, .y = 0 }, true, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 0 }, false);
-    try testApplyFrameWithText(&t, &gesture, &carry, frame, true, text);
+    const frame = testFrameWithSelection(.{ .x = 6, .y = 0 }, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 0 }, false);
+    try testApplyFrameWithText(&t, &gesture, frame, true, text);
     const repainted = t.screens.active;
     try expectSelectionCells(repainted, .{ .x = 0, .y = 0 }, .{ .x = 7, .y = 0 }, false);
-    try std.testing.expect(carry == null);
     try expectClickPin(&t, &gesture, 6, 0);
 
     // The next mouse move resolves from the re-seated pin: pointer word start to click word end.
@@ -5784,19 +5065,18 @@ test "a committed client anchor re-seats the click pin that a shift-click extend
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     // A finished click-drag whose text has since moved up two rows.
     try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
     try std.testing.expect(gesture.left_click_count > 0);
 
     // Without an anchor the pin goes back to its pre-reset cell, one stale position.
-    try testApplyFrame(&t, &gesture, &carry, testFrame(null, true), false);
+    try testApplyFrame(&t, &gesture, testFrame(null), false);
     var pin = gesture.validatedLeftClickPin(&t.screens).?;
     try std.testing.expectEqual(@as(u32, 3), testCoord(t.screens.active, pin.*).y);
 
     // With the committed anchor projected onto the frame, it follows the text.
-    try testApplyFrame(&t, &gesture, &carry, testFrame(.{ .x = 2, .y = 1 }, true), false);
+    try testApplyFrame(&t, &gesture, testFrame(.{ .x = 2, .y = 1 }), false);
     pin = gesture.validatedLeftClickPin(&t.screens).?;
     const coord = testCoord(t.screens.active, pin.*);
     try std.testing.expectEqual(@as(u16, 2), coord.x);
@@ -5808,11 +5088,10 @@ test "a committed client anchor outside the grid seats the click pin on the stan
     defer t.deinit(std.testing.allocator);
     var gesture: terminal.SelectionGesture = .init;
     defer gesture.deinit(&t);
-    var carry: ?CAPI.MirrorDragCarry = null;
 
     try testStartDrag(&t, &gesture, 2, 3, 6, 4, false);
     // Above the grid: the top-left corner cell.
-    try testApplyFrame(&t, &gesture, &carry, testFrame(.{ .x = 2, .y = -1 }, true), false);
+    try testApplyFrame(&t, &gesture, testFrame(.{ .x = 2, .y = -1 }), false);
     try std.testing.expect(gesture.left_click_count > 0);
     var pin = gesture.validatedLeftClickPin(&t.screens).?;
     var coord = testCoord(t.screens.active, pin.*);
@@ -5820,7 +5099,7 @@ test "a committed client anchor outside the grid seats the click pin on the stan
     try std.testing.expectEqual(@as(u32, 0), coord.y);
 
     // Below the grid: the bottom-right corner cell.
-    try testApplyFrame(&t, &gesture, &carry, testFrame(.{ .x = 2, .y = test_rows }, true), false);
+    try testApplyFrame(&t, &gesture, testFrame(.{ .x = 2, .y = test_rows }), false);
     try std.testing.expect(gesture.left_click_count > 0);
     pin = gesture.validatedLeftClickPin(&t.screens).?;
     coord = testCoord(t.screens.active, pin.*);
@@ -5848,7 +5127,7 @@ test "mirrorSelectionInfo reports the selection top-left first" {
     const anchor = s.pages.pin(.{ .active = .{ .x = 6, .y = 3 } }).?;
     const head = s.pages.pin(.{ .active = .{ .x = 1, .y = 1 } }).?;
     try s.select(terminal.Selection.init(anchor, head, false));
-    var info = CAPI.mirrorSelectionInfo(&s, null);
+    var info = CAPI.mirrorSelectionInfo(&s);
     try std.testing.expect(info.present);
     try std.testing.expectEqual(@as(u16, 1), info.start_x);
     try std.testing.expectEqual(@as(i32, 1), info.start_y);
@@ -5859,11 +5138,11 @@ test "mirrorSelectionInfo reports the selection top-left first" {
     const rect_anchor = s.pages.pin(.{ .active = .{ .x = 6, .y = 1 } }).?;
     const rect_head = s.pages.pin(.{ .active = .{ .x = 2, .y = 3 } }).?;
     try s.select(terminal.Selection.init(rect_anchor, rect_head, true));
-    info = CAPI.mirrorSelectionInfo(&s, null);
+    info = CAPI.mirrorSelectionInfo(&s);
     try std.testing.expectEqual(@as(u16, 2), info.start_x);
     try std.testing.expectEqual(@as(u16, 6), info.end_x);
 
     // No selection, nothing reported.
     s.clearSelection();
-    try std.testing.expect(!CAPI.mirrorSelectionInfo(&s, null).present);
+    try std.testing.expect(!CAPI.mirrorSelectionInfo(&s).present);
 }

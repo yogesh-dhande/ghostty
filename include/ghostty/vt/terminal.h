@@ -3020,6 +3020,46 @@ GHOSTTY_API GhosttyResult ghostty_terminal_tabstop(
     bool* out);
 
 /**
+ * The smallest buffer accepted by ghostty_terminal_clear_screen_sequence().
+ *
+ * @ingroup terminal
+ */
+#define GHOSTTY_TERMINAL_CLEAR_SCREEN_SEQUENCE_MAX_LEN 256
+
+/**
+ * Write the escape sequences that perform the clear-screen action (Cmd+K).
+ *
+ * The rule is Ghostty's: on the alternate screen nothing is cleared; at a
+ * shell prompt the scrollback and the whole screen are erased and the host
+ * should then write a form feed (0x0C) to the shell so it repaints; elsewhere
+ * the scrollback is erased, the rows above the cursor are deleted so the
+ * cursor row becomes the top row, and Kitty images are deleted.
+ *
+ * The terminal is only read. The host feeds the bytes to the terminal like any
+ * other output (and records them wherever it records output), before any other
+ * output, so the state they were built from still holds.
+ *
+ * @param terminal The terminal handle
+ * @param[out] out Receives the escape sequences
+ * @param out_cap Capacity of `out`, at least
+ *        GHOSTTY_TERMINAL_CLEAR_SCREEN_SEQUENCE_MAX_LEN
+ * @param[out] out_len Receives the number of bytes written to `out`
+ * @param[out] out_at_prompt Receives true when the host should write a form
+ *        feed to the shell after feeding the bytes
+ * @return GHOSTTY_SUCCESS; GHOSTTY_NO_VALUE when nothing is to be cleared (the
+ *         alternate screen is active); GHOSTTY_OUT_OF_SPACE when `out_cap` is
+ *         too small; GHOSTTY_INVALID_VALUE for a NULL argument
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_clear_screen_sequence(
+    GhosttyTerminal terminal,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len,
+    bool* out_at_prompt);
+
+/**
  * Scroll the terminal viewport.
  *
  * Scrolls the terminal's viewport according to the given behavior.

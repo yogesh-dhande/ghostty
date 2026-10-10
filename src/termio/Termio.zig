@@ -807,6 +807,8 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
+    if (history and self.backend.isHostManaged()) return self.clearScreenAsOutput(td);
+
     var send_form_feed = false;
 
     {
@@ -869,6 +871,39 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // If we reached here it means we're at a prompt, so we send a form-feed.
         try self.queueWrite(td, &[_]u8{0x0C}, false);
     }
+}
+
+/// Fork-owned. `clearScreen` for a host-managed terminal: the same clear,
+/// performed as escape bytes fed through the host output path (see
+/// `terminal/clear_screen.zig`). The bytes reach the host's data callback, the
+/// parser and `bytes_processed` together, in order with PTY output, so a
+/// transcript the host keeps of consumed bytes replays to this screen.
+fn clearScreenAsOutput(self: *Termio, td: *ThreadData) !void {
+    var buf: [terminalpkg.clear_screen.max_len]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    const outcome = outcome: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        // The terminal changes only on this thread, so the bytes built here
+        // still describe the screen when they are processed below.
+        const written = try terminalpkg.clear_screen.write(&self.terminal, &writer);
+        if (written == .skipped) return;
+        self.terminal.screens.active.clearSelection();
+        break :outcome written;
+    };
+
+    // The bytes enter the parser wherever it stands. When the last PTY chunk
+    // split an escape sequence or a UTF-8 character (only while a program is
+    // writing), the clear's leading ESC ends it, the clear still applies, and
+    // the rest of the program's sequence prints as text until it repaints.
+    // Accepted: waiting for a parser boundary would need a pending-clear state
+    // here and on every host that replays the bytes, for a one-time glitch in a
+    // race this narrow.
+    self.processOutput(writer.buffered());
+
+    // The shell repaints its prompt in answer to a form feed.
+    if (outcome == .cleared_at_prompt) try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
 /// Scroll the viewport

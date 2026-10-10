@@ -12,6 +12,7 @@ const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
 const apc = @import("../apc.zig");
+const clear_screen = @import("../clear_screen.zig");
 const kitty = @import("../kitty/key.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
@@ -2130,6 +2131,38 @@ pub fn tabstop(
     return .success;
 }
 
+/// Write the escape sequences that perform the clear-screen action (Cmd+K)
+/// into `out` (see `terminal/clear_screen.zig` for the rule). Reads the
+/// terminal only; the caller feeds the bytes to the terminal like any other
+/// output.
+///
+/// Returns GHOSTTY_NO_VALUE when nothing is to be cleared (the alternate
+/// screen is active), GHOSTTY_OUT_OF_SPACE when `out_cap` is below
+/// `clear_screen.max_len`, and GHOSTTY_INVALID_VALUE for a NULL argument.
+///
+/// Fork-owned; not part of upstream libghostty-vt.
+pub fn clear_screen_sequence(
+    terminal_: Terminal,
+    out: ?[*]u8,
+    out_cap: usize,
+    out_len: ?*usize,
+    out_at_prompt: ?*bool,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t: *ZigTerminal = wrapper.terminal;
+    const buf = out orelse return .invalid_value;
+    const len_ptr = out_len orelse return .invalid_value;
+    const prompt_ptr = out_at_prompt orelse return .invalid_value;
+    if (out_cap < clear_screen.max_len) return .out_of_space;
+
+    var writer: std.Io.Writer = .fixed(buf[0..out_cap]);
+    const outcome = clear_screen.write(t, &writer) catch return .out_of_space;
+    if (outcome == .skipped) return .no_value;
+    len_ptr.* = writer.buffered().len;
+    prompt_ptr.* = outcome == .cleared_at_prompt;
+    return .success;
+}
+
 pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     const t = wrapper.terminal;
@@ -3695,6 +3728,46 @@ test "get mouse_event" {
     var tracking: bool = undefined;
     try testing.expectEqual(Result.success, get(t, .mouse_tracking, @ptrCast(&tracking)));
     try testing.expect(tracking);
+}
+
+test "clear_screen_sequence" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var buf: [clear_screen.max_len]u8 = undefined;
+    var len: usize = undefined;
+    var at_prompt: bool = undefined;
+
+    try testing.expectEqual(Result.invalid_value, clear_screen_sequence(null, &buf, buf.len, &len, &at_prompt));
+    try testing.expectEqual(Result.out_of_space, clear_screen_sequence(t, &buf, buf.len - 1, &len, &at_prompt));
+
+    // Away from a prompt the rows above the cursor go and the cursor moves to the top.
+    const output = "one\r\ntwo\r\nthree";
+    vt_write(t, output.ptr, output.len);
+    try testing.expectEqual(Result.success, clear_screen_sequence(t, &buf, buf.len, &len, &at_prompt));
+    try testing.expect(len > 0);
+    try testing.expect(!at_prompt);
+    vt_write(t, &buf, len);
+    var y: u16 = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_y, @ptrCast(&y)));
+    try testing.expectEqual(@as(u16, 0), y);
+
+    // At a marked prompt the screen is erased and a form feed is wanted.
+    const prompt = "\x1b]133;A\x07$ ";
+    vt_write(t, prompt.ptr, prompt.len);
+    try testing.expectEqual(Result.success, clear_screen_sequence(t, &buf, buf.len, &len, &at_prompt));
+    try testing.expect(at_prompt);
+
+    // The alternate screen is left alone.
+    const alternate = "\x1b[?1049h";
+    vt_write(t, alternate.ptr, alternate.len);
+    try testing.expectEqual(Result.no_value, clear_screen_sequence(t, &buf, buf.len, &len, &at_prompt));
 }
 
 test "get total_rows" {

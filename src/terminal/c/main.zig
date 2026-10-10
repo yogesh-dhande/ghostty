@@ -231,6 +231,7 @@ pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
 pub const terminal_take_render_scroll_rects = terminal.take_render_scroll_rects;
 pub const terminal_set_active_screen = terminal.set_active_screen;
 pub const terminal_tabstop = terminal.tabstop;
+pub const terminal_clear_screen_sequence = terminal.clear_screen_sequence;
 
 pub const snapshot_encode = snapshot.encode;
 pub const snapshot_encode_buf = snapshot.encode_buf;

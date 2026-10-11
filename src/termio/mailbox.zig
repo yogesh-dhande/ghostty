@@ -31,6 +31,9 @@ pub const Mailbox = union(enum) {
     spsc: struct {
         queue: *Queue,
         wakeup: xev.Async,
+        active: std.atomic.Value(bool) = .init(false),
+        closed: bool = false,
+        cond_active: std.Io.Condition = .init,
     },
 
     /// Init the SPSC writer.
@@ -65,6 +68,16 @@ pub const Mailbox = union(enum) {
         msg: termio.Message,
         mutex: ?*std.Io.Mutex,
     ) void {
+        _ = self.sendTracked(msg, mutex);
+    }
+
+    /// Sends the given message without notifying there are messages. Returns
+    /// false if the message was not queued and will never be processed.
+    pub fn sendTracked(
+        self: *Mailbox,
+        msg: termio.Message,
+        mutex: ?*std.Io.Mutex,
+    ) bool {
         switch (self.*) {
             .spsc => |*mb| send: {
                 // Try to write to the queue with an instant timeout. This is the
@@ -78,7 +91,7 @@ pub const Mailbox = union(enum) {
                 mb.wakeup.notify() catch |err| {
                     log.warn("failed to wake up writer, data will be dropped err={}", .{err});
                     msg.deinit();
-                    return;
+                    return false;
                 };
 
                 // Unlock the renderer state so the writer thread can acquire it.
@@ -92,7 +105,133 @@ pub const Mailbox = union(enum) {
                 // here.
                 if (mutex) |m| m.unlock(global.io());
                 defer if (mutex) |m| m.lockUncancelable(global.io());
-                if (mb.queue.push(global.io(), msg, .{ .forever = {} }) == 0) msg.deinit();
+                if (mb.queue.push(global.io(), msg, .{ .forever = {} }) == 0) {
+                    msg.deinit();
+                    return false;
+                }
+            },
+        }
+
+        return true;
+    }
+
+    /// Sends the given message and wakes the mailbox consumer. Returns false
+    /// if the message was not queued or the wakeup could not be guaranteed.
+    pub fn sendAndNotifyTracked(
+        self: *Mailbox,
+        msg: termio.Message,
+    ) bool {
+        switch (self.*) {
+            .spsc => |*mb| {
+                const io = global.io();
+                const queue = mb.queue;
+                queue.mutex.lockUncancelable(io);
+                defer queue.mutex.unlock(io);
+
+                if (!mb.active.load(.acquire)) return false;
+                if (queue.len == queue.data.len) return false;
+
+                const old_write = queue.write;
+                const bounds: Queue.Size = @intCast(queue.data.len);
+                queue.data[queue.write] = msg;
+                queue.write += 1;
+                if (queue.write >= bounds) queue.write -= bounds;
+                queue.len += 1;
+
+                mb.wakeup.notify() catch |err| {
+                    queue.write = old_write;
+                    queue.len -= 1;
+                    if (queue.not_full_waiters > 0) queue.cond_not_full.signal(io);
+
+                    log.warn("failed to wake up writer, data will be dropped err={}", .{err});
+                    return false;
+                };
+            },
+        }
+
+        return true;
+    }
+
+    /// Sends the given message and wakes the mailbox consumer. This blocks
+    /// through transient startup and full-queue states so callers that cannot
+    /// report retryable errors don't silently lose their message.
+    pub fn sendAndNotifyBlocking(
+        self: *Mailbox,
+        msg: termio.Message,
+    ) bool {
+        switch (self.*) {
+            .spsc => |*mb| {
+                const io = global.io();
+                const queue = mb.queue;
+                queue.mutex.lockUncancelable(io);
+                defer queue.mutex.unlock(io);
+
+                while (!mb.active.load(.acquire) and !mb.closed) {
+                    mb.cond_active.waitUncancelable(io, &queue.mutex);
+                }
+                if (mb.closed) return false;
+
+                while (queue.len == queue.data.len) {
+                    mb.wakeup.notify() catch |err| {
+                        log.warn("failed to wake up writer, data will be dropped err={}", .{err});
+                        return false;
+                    };
+
+                    queue.not_full_waiters += 1;
+                    queue.cond_not_full.waitUncancelable(io, &queue.mutex);
+                    queue.not_full_waiters -= 1;
+
+                    if (mb.closed) return false;
+                }
+
+                const old_write = queue.write;
+                const bounds: Queue.Size = @intCast(queue.data.len);
+                queue.data[queue.write] = msg;
+                queue.write += 1;
+                if (queue.write >= bounds) queue.write -= bounds;
+                queue.len += 1;
+
+                mb.wakeup.notify() catch |err| {
+                    queue.write = old_write;
+                    queue.len -= 1;
+                    if (queue.not_full_waiters > 0) queue.cond_not_full.signal(io);
+
+                    log.warn("failed to wake up writer, data will be dropped err={}", .{err});
+                    return false;
+                };
+            },
+        }
+
+        return true;
+    }
+
+    /// Mark the mailbox as accepting messages that require a guaranteed
+    /// consumer wakeup.
+    pub fn activate(self: *Mailbox) void {
+        switch (self.*) {
+            .spsc => |*mb| {
+                const io = global.io();
+                mb.queue.mutex.lockUncancelable(io);
+                defer mb.queue.mutex.unlock(io);
+                mb.active.store(true, .release);
+                mb.cond_active.broadcast(io);
+            },
+        }
+    }
+
+    /// Stop accepting guaranteed-wakeup messages and release queued messages.
+    pub fn deactivateAndDrain(self: *Mailbox) void {
+        switch (self.*) {
+            .spsc => |*mb| {
+                const io = global.io();
+                mb.queue.mutex.lockUncancelable(io);
+                mb.closed = true;
+                mb.active.store(false, .release);
+                mb.cond_active.broadcast(io);
+                mb.queue.cond_not_full.broadcast(io);
+                mb.queue.mutex.unlock(io);
+
+                while (mb.queue.pop(io)) |msg| msg.deinit();
             },
         }
     }

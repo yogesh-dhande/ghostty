@@ -130,6 +130,24 @@ pub fn changeEntrypoint(
     return result;
 }
 
+/// Treat the compile as the embedded library (see
+/// `Config.embedded_apprt_test`).
+pub fn changeEmbeddedAppRuntimeTest(
+    self: *const SharedDeps,
+    b: *std.Build,
+) !SharedDeps {
+    const config = try b.allocator.create(Config);
+    config.* = self.config.*;
+    config.embedded_apprt_test = true;
+
+    var result = self.*;
+    result.config = config;
+    result.options = b.addOptions();
+    try config.addOptions(result.options);
+
+    return result;
+}
+
 fn initTarget(
     self: *SharedDeps,
     b: *std.Build,

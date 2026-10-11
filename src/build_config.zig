@@ -29,7 +29,7 @@ pub const mode_string = mode: {
 
 /// The artifact we're producing. This can be used to determine if we're
 /// building a standalone exe, an embedded lib, etc.
-pub const artifact = Artifact.detect();
+pub const artifact: Artifact = if (options.embedded_apprt_test) .lib else Artifact.detect();
 
 /// Our build configuration. We re-export a lot of these back at the
 /// top-level so its a bit cleaner to use throughout the code. See the doc

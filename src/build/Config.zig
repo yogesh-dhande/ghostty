@@ -35,6 +35,12 @@ simd: bool = true,
 i18n: bool = true,
 wasm_shared: bool = true,
 
+/// Compile the test executable as if it were the embedded library, so
+/// `apprt.runtime` is `apprt/embedded.zig` and its test blocks build. A test
+/// executable's output mode is always Exe, so `build_config.artifact` cannot
+/// report `.lib` on its own.
+embedded_apprt_test: bool = false,
+
 /// Ghostty exe properties
 exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
@@ -661,6 +667,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
+    step.addOption(bool, "embedded_apprt_test", self.embedded_apprt_test);
 
     // Our version. We also add the string version so we don't need
     // to do any allocations at runtime. This has to be long enough to

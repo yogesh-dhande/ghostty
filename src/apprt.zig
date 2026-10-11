@@ -40,7 +40,7 @@ pub const SurfaceSize = structs.SurfaceSize;
 /// so that every build has exactly one application runtime implementation.
 /// Note: it is very rare to use Runtime directly; most usage will use
 /// Window or something.
-pub const runtime = switch (build_config.artifact) {
+pub const runtime = if (build_config.embedded_apprt_test) embedded else switch (build_config.artifact) {
     .exe => switch (build_config.app_runtime) {
         .none => none,
         .gtk => gtk,

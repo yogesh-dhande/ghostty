@@ -35,10 +35,9 @@ simd: bool = true,
 i18n: bool = true,
 wasm_shared: bool = true,
 
-/// Compile the test executable as if it were the embedded library, so
-/// `apprt.runtime` is `apprt/embedded.zig` and its test blocks build. A test
-/// executable's output mode is always Exe, so `build_config.artifact` cannot
-/// report `.lib` on its own.
+/// Make `apprt.runtime` the embedded runtime (`apprt/embedded.zig`) so its
+/// test blocks build. The embedded runtime is otherwise selected only for lib
+/// artifacts, and a test executable's output mode is always Exe.
 embedded_apprt_test: bool = false,
 
 /// Ghostty exe properties

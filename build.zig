@@ -407,8 +407,8 @@ pub fn build(b: *std.Build) !void {
         test_step.dependOn(&test_run.step);
 
         // The embedded app runtime is only selected for lib artifacts, which
-        // compile no test blocks, so its tests run in a test executable that
-        // reports itself as the lib artifact.
+        // compile no test blocks, so its tests run in a test executable built
+        // with `embedded_apprt_test`, which selects the embedded runtime.
         {
             const embedded_deps = try deps.changeEmbeddedAppRuntimeTest(b);
             const embedded_test_exe = b.addTest(.{

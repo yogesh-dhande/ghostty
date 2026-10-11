@@ -121,6 +121,7 @@ drepper
 dungdm93
 dzhlobo
 ekaterinepapava
+ekusiadadus
 elias8
 elitex45
 -enkr1
@@ -162,6 +163,7 @@ helium777
 hlcfan
 howdeploy
 hqnna
+huge
 hulet
 i999rri
 ibaios
@@ -193,6 +195,7 @@ kataokatsuki
 kawarimidoll
 kayleung
 kenvandine
+kgni
 khipp
 kierancanter
 kirwiisp
@@ -220,12 +223,14 @@ luisnquin
 lynicis
 mac0ne
 maddythewisp
+magnussp
 mahnokropotkinvich
 marijagjorgjieva
 markdorison
 markhuot
 marler8997
 marrocco-simone
+-martzcode Repeated meatproxying in spite of prior warning
 masterflitzer
 matkotiric
 mattn
@@ -301,15 +306,19 @@ qwerasd205
 radicaltray
 ragnoroct
 raphamorim
+rayzerrek
+-rebecca-bell-2001 automated vomit
 reo101
 rewdy
 rgehan
 rhodes-b
 rightaditya
+-riskirills66 Demonstrated indefensibly poor taste, judgement and AI steering capabilities
 rjwittams
 rkoten
 rmengelbrecht
 rmunn
+robmorgan
 rockorager
 ronijacobson
 rpfaeffle

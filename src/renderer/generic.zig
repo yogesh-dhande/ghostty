@@ -914,7 +914,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // while unrealized and not every apprt unrealizes before
                 // destroying a surface (macOS never does), so mark it
                 // unrealized. This also stops any later draw.
-                self.display_realized = false;
+                //
+                // A surface rebind keeps the display realized: the
+                // replacement thread keeps drawing with the same shaders and
+                // rebuilds only the swap chain, and the embedded apprt never
+                // calls `displayRealized`, so clearing the flag here would
+                // leave the rebound surface blank for good.
+                if (!self.surface_rebinding) self.display_realized = false;
                 self.releaseGpuResources();
 
                 // A surface rebind stops this thread only to hand the

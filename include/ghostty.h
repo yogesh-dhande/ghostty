@@ -583,7 +583,8 @@ typedef struct {
   uint16_t grapheme_extra_len;
   uint32_t* grapheme_extras;
   // 1-based index of this cell's OSC 8 hyperlink target in the snapshot's `links` table; 0 when
-  // the cell carries no link. Populated on export only — applying a snapshot ignores it.
+  // the cell carries no link. Exported from a terminal, and applied to a mirror's pages so the
+  // surface resolves link hover and clicks; an index outside the table is ignored.
   uint32_t link_index;
 } ghostty_terminal_snapshot_cell_s;
 
@@ -645,7 +646,8 @@ typedef struct {
   // local viewport while this is set. Populated on export only; applying a snapshot ignores it.
   bool alternate_screen_active;
   // The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes. A
-  // cell's `link_index` is 1-based into this table. Populated on export only.
+  // cell's `link_index` is 1-based into this table. Exported from a terminal, and applied to a
+  // mirror's pages.
   size_t link_count;
   ghostty_terminal_snapshot_string_s* links;
   // Rows ever pruned off the top of the exporting terminal's active screen, the terminal's history

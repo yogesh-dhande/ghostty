@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const terminal_hyperlink = @import("../terminal/hyperlink.zig");
 const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
@@ -1807,7 +1808,7 @@ pub const CAPI = struct {
         grapheme_extras: ?[*]u32 = null,
 
         /// The 1-based index of this cell's OSC 8 hyperlink target in the snapshot's link table;
-        /// zero when the cell carries no link. Export-only: `applySnapshotToSurface` ignores it.
+        /// zero when the cell carries no link. An index outside the table is ignored on apply.
         link_index: u32 = 0,
 
         /// The cell's cluster codepoints beyond the base, clamped to the documented cap. Both the
@@ -1887,7 +1888,8 @@ pub const CAPI = struct {
         /// since a mirror paints cells rather than switching screens of its own.
         alternate_screen_active: bool = false,
         /// The OSC 8 hyperlink targets this snapshot's cells reference, deduplicated by URI bytes.
-        /// A cell's `link_index` is 1-based into this table. Populated on export only.
+        /// A cell's `link_index` is 1-based into this table. Exported from a terminal, and
+        /// written onto a mirror's pages when applied so the surface resolves hover and clicks.
         link_count: usize = 0,
         links: ?[*]SnapshotString = null,
         /// Rows ever pruned off the top of the exporting terminal's active screen
@@ -2076,6 +2078,79 @@ pub const CAPI = struct {
         try page.setGraphemes(row, dst, cps[0..len]);
     }
 
+    /// The snapshot's link table as a slice (empty when the frame carries none).
+    fn snapshotLinks(snapshot: Snapshot) []const SnapshotString {
+        const ptr = snapshot.links orelse return &.{};
+        return ptr[0..snapshot.link_count];
+    }
+
+    /// A link table entry that can be written to a page: it has bytes. An empty URI is what a
+    /// closing `OSC 8 ;;` leaves behind and is not a link.
+    fn snapshotLinkUri(entry: SnapshotString) ?[]const u8 {
+        const ptr = entry.ptr orelse return null;
+        if (entry.len == 0) return null;
+        return ptr[0..entry.len];
+    }
+
+    /// The page capacities a frame's link table needs, so `applySnapshotToSurface` can size the
+    /// page before the write pass holds pointers into it (the same reasoning as graphemes).
+    /// Counts every writable table entry as unique and every in-range linked cell, which can only
+    /// over-size the page.
+    const SnapshotLinkSizing = struct {
+        string_bytes: usize = 0,
+        hyperlink_bytes: usize = 0,
+    };
+
+    fn snapshotLinkSizing(snapshot: Snapshot, frame_cells: []const SnapshotCell) SnapshotLinkSizing {
+        const links = snapshotLinks(snapshot);
+        var unique: usize = 0;
+        var result: SnapshotLinkSizing = .{};
+        for (links) |entry| {
+            const uri = snapshotLinkUri(entry) orelse continue;
+            unique += 1;
+            result.string_bytes += terminal.page.stringBytesRequired(uri.len);
+        }
+        if (unique == 0) return result;
+        var linked_cells: usize = 0;
+        for (frame_cells) |frame_cell| {
+            if (frame_cell.link_index != 0 and frame_cell.link_index <= links.len) linked_cells += 1;
+        }
+        result.hyperlink_bytes = terminal.page.hyperlinkBytesRequired(unique, linked_cells);
+        return result;
+    }
+
+    /// Grows the page `node` points at in one capacity dimension (null rehashes at the current
+    /// capacity), replacing `node` with the grown page. False when the page cannot grow, in which
+    /// case the caller applies the frame without links.
+    fn growPage(
+        screen: *terminal.Screen,
+        node: **terminal.PageList.List.Node,
+        adjustment: ?terminal.PageList.IncreaseCapacity,
+    ) bool {
+        node.* = screen.increaseCapacity(node.*, adjustment) catch |err| {
+            log.warn("error growing mirror page for links err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Grows the page until its strings and hyperlink capacity cover `sizing`.
+    fn growPageForLinks(
+        screen: *terminal.Screen,
+        node: **terminal.PageList.List.Node,
+        sizing: SnapshotLinkSizing,
+    ) bool {
+        while (node.*.page().capacity.string_bytes < sizing.string_bytes) {
+            if (!growPage(screen, node, .string_bytes)) return false;
+        }
+        while (node.*.page().capacity.hyperlink_bytes < sizing.hyperlink_bytes) {
+            if (!growPage(screen, node, .hyperlink_bytes)) return false;
+        }
+        return true;
+    }
+
+    /// Writes one snapshot cell. `link_id` is the page's hyperlink id for the cell's link, zero
+    /// when the cell has none.
     fn writeSnapshotCell(
         screen: *terminal.Screen,
         page: *terminal.Page,
@@ -2083,6 +2158,7 @@ pub const CAPI = struct {
         dst: *terminal.Cell,
         cell: SnapshotCell,
         snapshot: Snapshot,
+        link_id: terminal_hyperlink.Id,
     ) !void {
         var next_cell = cellForSnapshotCell(cell);
         const next_style = styleForSnapshotCell(cell, snapshot);
@@ -2109,25 +2185,68 @@ pub const CAPI = struct {
                 } },
             };
         }
+        // Applied whichever branch ran: the trailing spacer of a wide character exports with no
+        // codepoint and a default style, yet it carries the link, and hover and click resolve the
+        // exact cell under the pointer.
+        if (link_id != 0) {
+            try page.setHyperlink(row, dst, link_id);
+            // The cell's own reference; `writeSnapshotGrid` releases the table's.
+            page.hyperlink_set.use(page.memory, link_id);
+        }
         row.dirty = true;
         screen.dirty.selection = true;
     }
 
     /// Rewrites every row of the active page from `frame_cells`. Holds page, row, and cell pointers
     /// for its whole run, so the caller must not grow `node`'s page except by abandoning this pass.
+    ///
+    /// With `write_links`, the frame's link table is inserted into the page once per entry and each
+    /// linked cell references its entry, so the surface's own link hover and click handling
+    /// resolves them. The page needs `snapshotLinkSizing` capacity; the errors a short page
+    /// returns (`StringsOutOfMemory`, `SetOutOfMemory`, `SetNeedsRehash`,
+    /// `HyperlinkMapOutOfMemory`) are the caller's cue to grow it and rewrite the grid.
     fn writeSnapshotGrid(
         screen: *terminal.Screen,
         node: *terminal.PageList.List.Node,
         snapshot: Snapshot,
         frame_cells: []const SnapshotCell,
+        write_links: bool,
     ) !void {
         const page = node.page();
         const grid_rows = page.rows.ptr(page.memory)[0..snapshot.rows];
 
-        for (grid_rows, 0..) |*row, row_index| {
+        // Page hyperlink ids by table position; zero marks an entry that was not inserted.
+        const links = if (write_links) snapshotLinks(snapshot) else &.{};
+
+        // Clear the whole grid before inserting any link: a restart after growth finds the previous
+        // pass's rows (and their link references) in the cloned page, and those must not count
+        // against the table's capacity.
+        for (grid_rows) |*row| {
             const cells = row.cells.ptr(page.memory)[0..snapshot.columns];
             screen.clearCells(page, row, cells);
             row.* = .{ .cells = row.cells, .dirty = true };
+        }
+
+        const link_ids = try global.alloc().alloc(terminal_hyperlink.Id, links.len);
+        defer global.alloc().free(link_ids);
+        @memset(link_ids, 0);
+        // Drops the table's own reference once the cells hold theirs. An entry no cell used is
+        // freed here, and on an abandoned pass nothing is left holding a reference.
+        defer for (link_ids) |id| {
+            if (id != 0) page.hyperlink_set.release(page.memory, id);
+        };
+        for (links, link_ids, 0..) |entry, *id, index| {
+            const uri = snapshotLinkUri(entry) orelse continue;
+            // The implicit id is the table position, so two entries never compare equal even if
+            // their URIs did.
+            id.* = try page.insertHyperlink(.{
+                .id = .{ .implicit = @intCast(index + 1) },
+                .uri = uri,
+            });
+        }
+
+        for (grid_rows, 0..) |*row, row_index| {
+            const cells = row.cells.ptr(page.memory)[0..snapshot.columns];
             const frame_row = frame_cells[row_index * snapshot.columns .. (row_index + 1) * snapshot.columns];
             if (frame_row.len > 0) {
                 const row_flags = frame_row[0].flags;
@@ -2135,7 +2254,11 @@ pub const CAPI = struct {
                 row.wrap_continuation = (row_flags & SnapshotFlags.row_wrap_continuation) != 0;
             }
             for (cells, frame_row) |*dst, frame_cell| {
-                try writeSnapshotCell(screen, page, row, dst, frame_cell, snapshot);
+                const link_id: terminal_hyperlink.Id = if (frame_cell.link_index != 0 and frame_cell.link_index <= link_ids.len)
+                    link_ids[frame_cell.link_index - 1]
+                else
+                    0;
+                try writeSnapshotCell(screen, page, row, dst, frame_cell, snapshot, link_id);
             }
         }
     }
@@ -2332,10 +2455,11 @@ pub const CAPI = struct {
     ///  * A client anchor on a frame with no drag in progress re-seats the gesture's click pin on
     ///    the anchor, so a later shift-click extends from the selection's anchor exactly.
     ///
-    /// A cell's OSC 8 link fields (`link_index` and the snapshot's link table) are deliberately not
-    /// applied: they are export-only. Restoring them would mean sizing a page's `string_bytes` and
-    /// `hyperlink_bytes` capacity as well, and Spaces already resolves link hover and clicks from
-    /// the Swift snapshot rather than from the mirror surface.
+    /// A cell's OSC 8 link (`link_index` into the snapshot's link table) is written onto the page
+    /// as a page hyperlink, so the surface's own `linkAtPos` finds it on a Cmd-click, the renderer
+    /// underlines it while Cmd is held, and hover raises `mouse_over_link`. The page's
+    /// `string_bytes` and `hyperlink_bytes` are sized for the table up front. A frame whose links
+    /// cannot be fitted is applied without them: dropping the frame would leave the pane stale.
     fn applySnapshotToSurface(surface: *Surface, snapshot: Snapshot) !void {
         if (snapshot.columns == 0 or snapshot.rows == 0) return error.InvalidRenderFrame;
         const expected_cell_count = @as(usize, snapshot.columns) * @as(usize, snapshot.rows);
@@ -2411,14 +2535,35 @@ pub const CAPI = struct {
         // grid on the grown page. Growing relocates the page, so the restart re-derives every pointer
         // from the new node instead of resuming; the grid is rewritten from scratch every frame
         // anyway. Failing the apply instead would drop the whole frame and leave the pane stale.
+        //
+        // Link capacity is decided up front like graphemes (the table's size is known), but a set
+        // that needs a rehash or a map that fills early still surfaces here, so the link errors
+        // take the same restart path.
+        var write_links = true;
+        const link_sizing = snapshotLinkSizing(snapshot, frame_cells);
+        if (link_sizing.string_bytes > 0) {
+            write_links = growPageForLinks(screen, &node, link_sizing);
+        }
         while (true) {
-            writeSnapshotGrid(screen, node, snapshot, frame_cells) catch |err| switch (err) {
+            writeSnapshotGrid(screen, node, snapshot, frame_cells, write_links) catch |err| switch (err) {
                 error.StyleCapacityExhausted => {
                     node = try screen.increaseCapacity(node, .styles);
                     continue;
                 },
                 error.StyleSetNeedsRehash => {
                     node = try screen.increaseCapacity(node, null);
+                    continue;
+                },
+                error.StringsOutOfMemory => {
+                    write_links = growPage(screen, &node, .string_bytes);
+                    continue;
+                },
+                error.SetOutOfMemory, error.HyperlinkMapOutOfMemory => {
+                    write_links = growPage(screen, &node, .hyperlink_bytes);
+                    continue;
+                },
+                error.SetNeedsRehash => {
+                    write_links = growPage(screen, &node, null);
                     continue;
                 },
                 else => return err,

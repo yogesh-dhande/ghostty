@@ -427,13 +427,13 @@ pub const StreamHandler = struct {
             .apc_put => self.apc.feed(self.alloc, value),
             .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
             .kitty_clipboard => try self.kittyClipboard(value),
+            .program_status => try self.programStatus(value),
 
             // Unimplemented
             .title_push,
             .title_pop,
             .kitty_dnd,
             .osc_unknown,
-            .program_status,
             => {},
         }
     }
@@ -1971,6 +1971,36 @@ pub const StreamHandler = struct {
         // the read() syscall.
     }
 
+    /// Handle an OSC 7501 query or report.
+    fn programStatus(
+        self: *StreamHandler,
+        cmd: terminal.osc.Command.ProgramStatus,
+    ) !void {
+        switch (cmd) {
+            // This fork is only consumed by Spaces, which handles the
+            // reports, so support is always claimed. Programs only send
+            // reports after seeing this reply.
+            .query => |terminator| try self.programStatusQuery(terminator),
+
+            // The report's id points into the parser buffer and surface
+            // messages cross threads, so the message carries its own copy.
+            .report => |report| self.surfaceMessageWriter(.{
+                .program_status = .init(report),
+            }),
+        }
+    }
+
+    fn programStatusQuery(self: *StreamHandler, terminator: terminal.osc.Terminator) !void {
+        var buf: [128]u8 = undefined;
+        const resp = try std.fmt.bufPrint(
+            &buf,
+            "\x1b]7501;{s}{s}",
+            .{ terminal.osc.program_status.query_reply, terminator.string() },
+        );
+        const msg = try termio.Message.writeReq(self.alloc, resp);
+        self.messageWriter(msg);
+    }
+
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
@@ -2050,4 +2080,42 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "program status query: replies with the query's terminator" {
+    const testing = std.testing;
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = undefined,
+    };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+
+    const reply = "\x1b]7501;" ++ terminal.osc.program_status.query_reply;
+    inline for (.{ terminal.osc.Terminator.st, terminal.osc.Terminator.bel }) |t| {
+        try handler.programStatusQuery(t);
+        const msg = mailbox.spsc.queue.pop(global.io()).?;
+        defer msg.deinit();
+        switch (msg) {
+            .write_small => |v| try testing.expectEqualStrings(
+                reply ++ comptime t.string(),
+                v.data[0..v.len],
+            ),
+            .write_alloc => |v| try testing.expectEqualStrings(
+                reply ++ comptime t.string(),
+                v.data,
+            ),
+            else => try testing.expect(false),
+        }
+    }
 }

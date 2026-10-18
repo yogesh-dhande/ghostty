@@ -35,6 +35,11 @@ simd: bool = true,
 i18n: bool = true,
 wasm_shared: bool = true,
 
+/// Make `apprt.runtime` the embedded runtime (`apprt/embedded.zig`) so its
+/// test blocks build. The embedded runtime is otherwise selected only for lib
+/// artifacts, and a test executable's output mode is always Exe.
+embedded_apprt_test: bool = false,
+
 /// Ghostty exe properties
 exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
@@ -127,17 +132,6 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
                 @intFromEnum(std.Target.wasm.Feature.simd128),
             );
             result = b.resolveTargetQuery(query);
-        }
-
-        // The full Ghostty build no longer supports iOS; Fail early
-        // with a clear message rather than partway through the build.
-        if (result.result.os.tag == .ios and !emit_lib_vt) {
-            std.log.err(
-                "iOS is not a supported target for the full Ghostty build; " ++
-                    "only libghostty-vt supports iOS (-Demit-lib-vt)",
-                .{},
-            );
-            return error.UnsupportedTarget;
         }
 
         // If we have no minimum OS version, we set the default based on
@@ -672,6 +666,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(ExeEntrypoint, "exe_entrypoint", self.exe_entrypoint);
     step.addOption(WasmTarget, "wasm_target", self.wasm_target);
     step.addOption(bool, "wasm_shared", self.wasm_shared);
+    step.addOption(bool, "embedded_apprt_test", self.embedded_apprt_test);
 
     // Our version. We also add the string version so we don't need
     // to do any allocations at runtime. This has to be long enough to
@@ -796,6 +791,15 @@ pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
             .patch = 0,
         } },
 
+        // Spaces fork: upstream stopped building the full Ghostty library for
+        // iOS, but the Spaces iOS app embeds GhosttyKit for its terminal
+        // mirror, so the fork keeps the iOS target alive.
+        .ios => .{ .semver = .{
+            .major = 17,
+            .minor = 0,
+            .patch = 0,
+        } },
+
         // This should never happen currently. If we add a new target then
         // we should add a new case here.
         else => null,
@@ -806,8 +810,8 @@ pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
 ///
 /// This should only be used for Darwin targets.
 pub fn osVersionMinLibVt(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
-    // lib-vt is the only thing we still build for iOS, so its deployment
-    // target lives here rather than in osVersionMin.
+    // lib-vt supports older iOS than the full Ghostty build, so its
+    // deployment target lives here rather than in osVersionMin.
     if (tag == .ios) return .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
     return osVersionMin(tag);
 }

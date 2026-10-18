@@ -364,6 +364,9 @@ pub const Action = union(Key) {
     /// split or the window is fullscreen.
     resize_window: ResizeWindow,
 
+    /// A program reported its status with OSC 7501.
+    program_status: ProgramStatus,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -436,6 +439,7 @@ pub const Action = union(Key) {
         copy_title_to_clipboard,
         move_tab_to_new_window,
         resize_window,
+        program_status,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1022,6 +1026,30 @@ pub const CommandFinished = struct {
         return .{
             .exit_code = self.exit_code orelse -1,
             .duration = self.duration.duration,
+        };
+    }
+};
+
+/// An OSC 7501 report. Only the state and record id are forwarded.
+pub const ProgramStatus = struct {
+    state: terminal.osc.Command.ProgramStatus.State,
+
+    /// The record id, empty for the root record. The memory is owned by
+    /// the caller of performAction and only valid during that call.
+    id: [:0]const u8,
+
+    // Sync with: ghostty_action_program_status_s
+    pub const C = extern struct {
+        // The integer value of the state, which matches
+        // ghostty_action_program_status_state_e.
+        state: c_int,
+        id: [*:0]const u8,
+    };
+
+    pub fn cval(self: ProgramStatus) C {
+        return .{
+            .state = @intFromEnum(self.state),
+            .id = self.id.ptr,
         };
     }
 };

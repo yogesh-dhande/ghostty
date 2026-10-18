@@ -406,6 +406,39 @@ pub fn build(b: *std.Build) !void {
         config.addPatchElf(test_exe, &test_run.step);
         test_step.dependOn(&test_run.step);
 
+        // The embedded app runtime is only selected for lib artifacts, which
+        // compile no test blocks, so its tests run in a test executable built
+        // with `embedded_apprt_test`, which selects the embedded runtime.
+        {
+            const embedded_deps = try deps.changeEmbeddedAppRuntimeTest(b);
+            const embedded_test_exe = b.addTest(.{
+                .name = "ghostty-embedded-test",
+                // The embedded runtime pulls in the rest of the tree, which
+                // `ghostty-test` already runs; keep to the runtime's own tests.
+                .filters = if (test_filters.len > 0) test_filters else &.{"apprt.embedded"},
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/main_embedded_test.zig"),
+                    .target = config.baselineTarget(b.graph.io),
+                    .optimize = .Debug,
+                    .strip = false,
+                    .omit_frame_pointer = false,
+                    .unwind_tables = .sync,
+                }),
+                .use_llvm = true,
+            });
+            _ = try embedded_deps.add(embedded_test_exe);
+            // The embedded runtime reaches the Metal renderer, which the
+            // library build leaves for the host app to link.
+            if (config.target.result.os.tag.isDarwin()) {
+                embedded_test_exe.root_module.linkFramework("Metal", .{});
+            }
+            addGhosttyH(b, embedded_test_exe.root_module, config.baselineTarget(b.graph.io), .Debug);
+
+            const embedded_test_run = b.addRunArtifact(embedded_test_exe);
+            config.addPatchElf(embedded_test_exe, &embedded_test_run.step);
+            test_step.dependOn(&embedded_test_run.step);
+        }
+
         // Normal tests always test our libghostty modules
         //test_step.dependOn(test_lib_vt_step);
 

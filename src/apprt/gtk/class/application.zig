@@ -756,6 +756,9 @@ pub const Application = extern struct {
 
             .progress_report => return Action.progressReport(target, value),
 
+            // GTK has no consumer for OSC 7501 reports.
+            .program_status => {},
+
             .prompt_title => return Action.promptTitle(target, value),
 
             .quit => self.quit(),

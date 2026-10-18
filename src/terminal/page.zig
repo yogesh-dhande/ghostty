@@ -99,6 +99,15 @@ const GraphemeMap = AutoOffsetHashMap(
     hash_map.default_max_load_percentage,
 );
 
+/// The `Capacity.grapheme_bytes` a single `setGraphemes` call of the given codepoint count
+/// consumes. Callers that must size a page's grapheme capacity before writing (rather than
+/// growing reactively, which relocates the page and invalidates every cell pointer they hold)
+/// sum this over the cells they are about to write. This is the same accounting
+/// `Page.exactRowCapacity` uses to size a page for graphemes it already holds.
+pub fn graphemeBytesRequired(cps_len: usize) usize {
+    return GraphemeAlloc.bytesRequired(u21, cps_len);
+}
+
 /// The allocator used for shared utf8-encoded strings within a page.
 /// Note the chunk size below is the minimum size of a single allocation
 /// and requires a single bit of metadata in our bitmap allocator. Therefore
@@ -125,6 +134,23 @@ pub const string_bytes_default = string_count_default * string_chunk;
 const hyperlink_count_default = 4;
 const hyperlink_bytes_default = hyperlink_count_default * @sizeOf(hyperlink.Set.Item);
 const hyperlink_cell_multiplier = 16;
+
+/// The `Capacity.string_bytes` a single string of the given byte length consumes in the page's
+/// strings table (an OSC 8 URI, for instance). Callers that must size a page before writing sum
+/// this over the strings they are about to insert; it is the accounting `Page.exactRowCapacity`
+/// uses for the strings it already holds.
+pub fn stringBytesRequired(len: usize) usize {
+    return StringAlloc.bytesRequired(u8, len);
+}
+
+/// The `Capacity.hyperlink_bytes` a page needs to hold `unique_links` distinct hyperlinks across
+/// `linked_cells` cells. This is the same sizing `Page.exactRowCapacity` derives: the set must fit
+/// the distinct links and the cell-to-link map must fit every linked cell.
+pub fn hyperlinkBytesRequired(unique_links: usize, linked_cells: usize) usize {
+    const set_cap = hyperlink.Set.capacityForCount(unique_links);
+    const map_min = std.math.divCeil(usize, linked_cells, hyperlink_cell_multiplier) catch 0;
+    return @max(set_cap, map_min) * @sizeOf(hyperlink.Set.Item);
+}
 
 /// The alignment of the start of a page's cell array. Align it to a cache
 /// line so that row cells always start on a cache line. This avoids

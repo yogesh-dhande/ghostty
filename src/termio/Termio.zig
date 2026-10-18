@@ -730,17 +730,20 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
-    // Update PTY-backed processes before resizing the terminal. Host-managed
-    // resize callbacks run after the terminal grid is updated because hosts
-    // may synchronously feed output back into Ghostty.
-    try self.backend.resizeBeforeTerminal(grid_size, size.terminal());
-
     var report_size = false;
 
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+
+        // Resizing the pty can immediately wake the shell with SIGWINCH.
+        // Hold the same lock used by processOutput before notifying it, so
+        // its redraw cannot be parsed against the old terminal dimensions.
+        // Host-managed resize callbacks run after this critical area (see
+        // resizeAfterTerminal below) because hosts may synchronously feed
+        // output back into Ghostty, which takes this lock.
+        try self.backend.resizeBeforeTerminal(grid_size, size.terminal());
 
         // Update the size of our terminal state
         try self.terminal.resize(

@@ -1389,6 +1389,7 @@ GHOSTTY_API void ghostty_surface_set_data_callback(ghostty_surface_t,
 GHOSTTY_API void ghostty_surface_send_input_raw(ghostty_surface_t,
                                                    const uint8_t*,
                                                    uintptr_t);
+GHOSTTY_API void ghostty_surface_paste_text(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,

@@ -99,6 +99,8 @@ danneu
 danulqua
 dariogriffo
 dave92082
+davey-hughes
+davidhodge
 -davidpmclaughlin Refusing to follow AI policy and exhibit good faith behavior
 davidsanchez222
 deblasis
@@ -143,6 +145,7 @@ fornwall
 francescarpi
 francislata
 fru1tworld
+gaborbernat
 gadgetman6
 gagbo
 ghokun
@@ -158,6 +161,7 @@ hakonhagland
 halosatrio
 heaths
 heddxh heddxh
+heitoraugustoln
 helium777
 -highimpact-dev Disrespectful AI user
 hlcfan
@@ -205,6 +209,7 @@ kloneets
 knu
 -kody-w
 konstantinhudyakov
+-kooshapari No HITL
 koranir
 korikhin
 kostich
@@ -216,6 +221,7 @@ lebdron
 lepips
 liby
 linustalacko
+locriani
 lonsagisawa
 lotheac
 louisunlimited
@@ -275,6 +281,7 @@ nolinmcfarland
 nouritsu
 nwehg
 ocean6954
+ollieatkinson
 ollioddi
 oshdubh
 otomn
@@ -300,6 +307,7 @@ prihlop
 priyans-hu
 pssalman
 puzza007
+pyre909
 qappell
 quinnypig
 qwerasd205
@@ -390,3 +398,4 @@ zeshi09
 zlitus
 -zorzysty Meatproxying
 zubb
+zzznu

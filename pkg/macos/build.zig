@@ -74,6 +74,11 @@ pub fn build(b: *std.Build) !void {
         ) } },
         .target = target,
         .optimize = optimize,
+        // Blocks must be enabled explicitly to translate Apple SDK headers.
+        // Aro only auto-enables them for macOS targets; the iOS and iOS
+        // simulator slices of GhosttyKit (fork-only, upstream builds macOS
+        // alone) fail with "blocks are not enabled" without this flag.
+        .extra_args = &.{"-fblocks"},
     });
 
     const lib = b.addLibrary(.{

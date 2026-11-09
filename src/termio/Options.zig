@@ -31,11 +31,11 @@ mailbox: termio.Mailbox,
 renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// a repaint should happen. Null for a headless session, which has no renderer.
+renderer_wakeup: ?xev.Async,
 
-/// The mailbox for renderer messages.
-renderer_mailbox: *renderer.Thread.Mailbox,
+/// The mailbox for renderer messages. Null for a headless session.
+renderer_mailbox: ?*renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,

@@ -42,6 +42,7 @@
   gobject-introspection,
   gst_all_1,
   graphene,
+  libabigail,
   libadwaita,
   blueprint-compiler,
   gettext,
@@ -217,6 +218,14 @@ in
 
         # for benchmarking
         poop
+
+        # libghostty-vt ABI checks (test/abi/check.sh)
+        libabigail
+
+        # llvm-readobj lists the DLLs a Windows DLL needs. The libghostty-vt
+        # release checks the DLLs in its Windows zips with it
+        # (release-lib-vt.yml).
+        llvmPackages_22.llvm
       ]
       ++ lib.optionals (stdenv.hostPlatform.isLinux && withAfl) [
         (aflplusplus.override {

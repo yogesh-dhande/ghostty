@@ -364,6 +364,9 @@ pub const Action = union(Key) {
     /// split or the window is fullscreen.
     resize_window: ResizeWindow,
 
+    /// Set the application window theme for this session.
+    set_window_theme: WindowTheme,
+
     /// A program reported its status with OSC 7501.
     program_status: ProgramStatus,
 
@@ -439,6 +442,7 @@ pub const Action = union(Key) {
         copy_title_to_clipboard,
         move_tab_to_new_window,
         resize_window,
+        set_window_theme,
         program_status,
 
         test "ghostty.h Action.Key" {
@@ -622,6 +626,17 @@ pub const SecureInput = enum(c_int) {
 
     test "ghostty.h SecureInput" {
         try lib.checkGhosttyHEnum(SecureInput, "GHOSTTY_SECURE_INPUT_");
+    }
+};
+
+pub const WindowTheme = enum(c_int) {
+    config,
+    system,
+    light,
+    dark,
+
+    test "ghostty.h WindowTheme" {
+        try lib.checkGhosttyHEnum(WindowTheme, "GHOSTTY_ACTION_WINDOW_THEME_");
     }
 };
 

@@ -453,12 +453,18 @@ pub fn reset(self: *Screen) void {
         // Reset kitty graphics storage
         const image_limits = self.kitty_images.image_limits;
         const total_limit = self.kitty_images.total_limit;
+        const dirty = self.kitty_images.dirty;
         self.kitty_images.deinit(self.alloc, self);
         self.kitty_images = .{
-            .dirty = true,
+            // Carry the counter over instead of starting from zero.
+            // A consumer that saw the old storage's value must see a
+            // different one after the reset, and a fresh counter could
+            // happen to match it.
+            .dirty = dirty,
             .image_limits = image_limits,
             .total_limit = total_limit,
         };
+        self.kitty_images.markDirty();
     }
 
     // Reset our basic state
@@ -964,7 +970,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
 
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
-        self.kitty_images.dirty = true;
+        self.kitty_images.markDirty();
     }
 
     // If we have no scrollback, then we shift all our rows instead.
@@ -1697,7 +1703,7 @@ pub inline fn scroll(self: *Screen, behavior: Scroll) void {
         // No matter what, scrolling marks our image state as dirty since
         // it could move placements. If there are no placements or no images
         // this is still a very cheap operation.
-        self.kitty_images.dirty = true;
+        self.kitty_images.markDirty();
     }
 
     switch (behavior) {
@@ -1722,7 +1728,7 @@ pub inline fn scrollClear(self: *Screen) !void {
         // No matter what, scrolling marks our image state as dirty since
         // it could move placements. If there are no placements or no images
         // this is still a very cheap operation.
-        self.kitty_images.dirty = true;
+        self.kitty_images.markDirty();
     }
 }
 
@@ -1739,8 +1745,20 @@ pub inline fn eraseHistory(
     bl: ?point.Point,
 ) void {
     defer self.assertIntegrity();
+
+    // Placements anchored in the erased rows are removed first, while
+    // their pins still identify those rows. Erasing moves those pins to
+    // the top-left of the retained rows rather than marking them garbage.
+    if (comptime build_options.kitty_graphics) {
+        self.kitty_images.eraseHistory(self.io, self, bl);
+    }
+
     self.pages.eraseHistory(bl);
     self.cursorReload();
+
+    // Erasing rows shifts the placements below them, so placements may
+    // have moved.
+    if (comptime build_options.kitty_graphics) self.kitty_images.markDirty();
 }
 
 pub inline fn eraseActive(
@@ -1750,6 +1768,10 @@ pub inline fn eraseActive(
     defer self.assertIntegrity();
     self.pages.eraseActive(y);
     self.cursorReload();
+
+    // Erasing rows removes placements attached to them and shifts the
+    // ones below, so placements may have moved.
+    if (comptime build_options.kitty_graphics) self.kitty_images.markDirty();
 }
 
 // Clear the region specified by tl and bl, inclusive. Cleared cells are
@@ -2183,7 +2205,7 @@ pub inline fn resize(
     errdefer comptime unreachable;
 
     // Resizing moves image placements, so mark their geometry as dirty.
-    if (comptime build_options.kitty_graphics) self.kitty_images.dirty = true;
+    if (comptime build_options.kitty_graphics) self.kitty_images.markDirty();
 
     // If we have no scrollback and we shrunk our rows, we must explicitly
     // erase our history. This is because PageList always keeps at least
@@ -2494,11 +2516,11 @@ pub fn setAttribute(
         },
 
         .@"8_fg" => |n| {
-            self.cursor.style.fg_color = .{ .palette = @intFromEnum(n) };
+            self.cursor.style.fg_color = .{ .palette = @backingInt(n) };
         },
 
         .@"8_bg" => |n| {
-            self.cursor.style.bg_color = .{ .palette = @intFromEnum(n) };
+            self.cursor.style.bg_color = .{ .palette = @backingInt(n) };
         },
 
         .reset_fg => self.cursor.style.fg_color = .none,
@@ -2506,11 +2528,11 @@ pub fn setAttribute(
         .reset_bg => self.cursor.style.bg_color = .none,
 
         .@"8_bright_fg" => |n| {
-            self.cursor.style.fg_color = .{ .palette = @intFromEnum(n) };
+            self.cursor.style.fg_color = .{ .palette = @backingInt(n) };
         },
 
         .@"8_bright_bg" => |n| {
-            self.cursor.style.bg_color = .{ .palette = @intFromEnum(n) };
+            self.cursor.style.bg_color = .{ .palette = @backingInt(n) };
         },
 
         .@"256_fg" => |idx| {
@@ -4106,7 +4128,7 @@ test "Screen read and write no scrollback large" {
 
     for (0..1_000) |i| {
         var buf: [128]u8 = undefined;
-        const str = try std.fmt.bufPrint(&buf, "{}\n", .{i});
+        const str = try std.mem.print(&buf, "{}\n", .{i});
         try s.testWriteString(str);
     }
     try s.testWriteString("1000");
@@ -6340,7 +6362,7 @@ test "Screen: scroll above hyperlink-dense row to fresh page" {
     // page can hold with default hyperlink capacity.
     for (0..s.pages.cols) |i| {
         var buf: [64]u8 = undefined;
-        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{i});
+        const uri = try std.mem.print(&buf, "http://example.com/{d}", .{i});
         try s.startHyperlink(uri, null);
         try s.testWriteString("A");
         s.endHyperlink();
@@ -6396,7 +6418,7 @@ test "Screen: scroll above hyperlink-dense row to fresh page" {
         const id = page.lookupHyperlink(list_cell.cell).?;
         const link = page.hyperlink_set.get(page.memory, id);
         var buf: [64]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+        const expected = try std.mem.print(&buf, "http://example.com/{d}", .{x});
         try testing.expectEqualStrings(expected, link.uri.slice(page.memory));
     }
 }
@@ -6423,7 +6445,7 @@ test "Screen: scroll above hyperlink-dense row to existing page" {
     // more than a page can hold with default hyperlink capacity.
     for (0..s.pages.cols) |i| {
         var buf: [64]u8 = undefined;
-        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{i});
+        const uri = try std.mem.print(&buf, "http://example.com/{d}", .{i});
         try s.startHyperlink(uri, null);
         try s.testWriteString("A");
         s.endHyperlink();
@@ -8185,10 +8207,6 @@ test "Screen: resize errors preserve state" {
             .origin = false,
             .charset = s.charset,
         };
-
-        if (comptime build_options.kitty_graphics) {
-            s.kitty_images.dirty = false;
-        }
 
         // Keep a shallow copy for all non-page state and a byte-for-byte
         // copy of the sole page so reference counts and prompt contents are
@@ -11569,8 +11587,8 @@ test "Screen: cursorSetHyperlink OOM + URI too large for string alloc" {
     // Start a hyperlink with a URI that just barely fits in the string alloc.
     // This will ensure that additional string alloc space is needed for the
     // redundant copy of the URI when the page is re-alloced.
-    const uri = "a" ** (pagepkg.std_capacity.string_bytes - 8);
-    try s.startHyperlink(uri, null);
+    const uri: [pagepkg.std_capacity.string_bytes - 8]u8 = @splat('a');
+    try s.startHyperlink(&uri, null);
 
     // Figure out how many cells should can have hyperlinks in this page,
     // and write twice that number, to guarantee the capacity needs to be

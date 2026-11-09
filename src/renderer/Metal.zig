@@ -70,7 +70,7 @@ pub fn init(
     device: *const Device,
     opts: rendererpkg.Options,
 ) !Metal {
-    comptime switch (builtin.os.tag) {
+    comptime switch (builtin.target.os.tag) {
         .macos, .ios => {},
         else => @compileError("unsupported platform for Metal"),
     };
@@ -278,7 +278,7 @@ fn viewInfo(surface: *apprt.Surface) ViewInfo {
 }
 
 fn attachLayer(view: objc.Object, layer: *IOSurfaceLayer, scale_factor: f64) void {
-    switch (comptime builtin.os.tag) {
+    switch (comptime builtin.target.os.tag) {
         .macos => {
             view.setProperty("layer", layer.layer.value);
             view.setProperty("wantsLayer", true);
@@ -301,7 +301,7 @@ fn attachLayer(view: objc.Object, layer: *IOSurfaceLayer, scale_factor: f64) voi
 }
 
 fn detachLayer(view: objc.Object, layer: IOSurfaceLayer) void {
-    switch (comptime builtin.os.tag) {
+    switch (comptime builtin.target.os.tag) {
         .macos => {
             view.msgSend(void, objc.sel("setLayer:"), .{@as(objc.c.id, null)});
             view.setProperty("wantsLayer", false);

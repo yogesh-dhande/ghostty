@@ -564,7 +564,10 @@ pub fn build(b: *std.Build) !void {
             if (config.target.result.os.tag.isDarwin()) {
                 embedded_test_exe.root_module.linkFramework("Metal", .{});
             }
-            addGhosttyH(b, embedded_test_exe.root_module, config.baselineTarget(b.graph.io), .Debug);
+            try c_deps.add(b, .@"ghostty-h", embedded_test_exe.root_module, &config, .{
+                .target = config.baselineTarget(b.graph.io),
+                .optimize = .Debug,
+            });
 
             const embedded_test_run = b.addRunArtifact(embedded_test_exe);
             config.addPatchElf(embedded_test_exe, &embedded_test_run.step);

@@ -2063,10 +2063,10 @@ pub const CAPI = struct {
         const foreground = unpackRGB(cell.foreground_rgb);
         const background = unpackRGB(cell.background_rgb);
         if (!foreground.eql(unpackRGB(snapshot.default_foreground_rgb))) {
-            result.fg_color = .{ .rgb = foreground };
+            result.fg_color = .rgb(foreground);
         }
         if (!background.eql(unpackRGB(snapshot.default_background_rgb))) {
-            result.bg_color = .{ .rgb = background };
+            result.bg_color = .rgb(background);
         }
         result.flags.bold = (cell.flags & SnapshotFlags.bold) != 0;
         result.flags.italic = (cell.flags & SnapshotFlags.italic) != 0;

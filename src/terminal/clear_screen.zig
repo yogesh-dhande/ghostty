@@ -84,7 +84,7 @@ pub fn write(t: *Terminal, writer: *std.Io.Writer) std.Io.Writer.Error!Outcome {
     const origin = t.modes.get(.origin);
     const left_right = t.modes.get(.enable_left_and_right_margin);
     const top_bottom = region.top != 0 or region.bottom != t.rows - 1;
-    const bg = cursor.style.bg_color;
+    const bg = cursor.style.bg_color.value();
 
     // Each of these resets homes the cursor, which is fine: the cursor is put
     // back below.
@@ -324,7 +324,7 @@ test "clear screen: a background color keeps applying and does not color the new
     defer pair.deinit();
     pair.setup("a\r\nb\r\nc\x1b[44m\x1b[3;1H");
     _ = try pair.expectSameClear();
-    try testing.expect(pair.bytes.screens.active.cursor.style.bg_color != .none);
+    try testing.expect(pair.bytes.screens.active.cursor.style.bg_color.value() != .none);
     try testing.expectEqual(pair.direct.screens.active.cursor.style.bg_color, pair.bytes.screens.active.cursor.style.bg_color);
     // The bottom row is the one scrolled in; a direct deletion leaves it uncolored.
     const bottom_direct = pair.direct.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 3 } }).?;

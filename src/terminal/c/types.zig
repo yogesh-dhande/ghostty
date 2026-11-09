@@ -440,6 +440,7 @@ pub const type_decls = [_]TypeDecl{
         terminal.ResizeWindow.CValue,
         terminal.ResizeWindow.C,
     ),
+    .initStruct("GhosttyTerminalScrollRect", terminal.TerminalScrollRect),
     .initStruct("GhosttyTerminalScrollbar", terminal.TerminalScrollbar),
     .initStruct("GhosttyTerminalSemanticPrompt", terminal.SemanticPrompt),
     .initTaggedStruct("GhosttyTerminalScrollViewport", terminal.ScrollViewport, "tag", "value", .generated),

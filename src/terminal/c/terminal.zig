@@ -8526,7 +8526,7 @@ test "take_render_scroll_rects reports overflow after more than max_render_scrol
     var i: usize = 0;
     while (i < max_render_scroll_rects + 1) : (i += 1) {
         const delta: isize = if (i % 2 == 0) -1 else 1;
-        scroll_viewport(t, .{ .tag = .delta, .value = .{ .delta = delta } });
+        _ = scroll_viewport(t, .{ .tag = .delta, .value = .{ .delta = delta } });
     }
 
     overflowed = false;

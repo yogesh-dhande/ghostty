@@ -2135,10 +2135,14 @@ pub const CAPI = struct {
     /// The page capacities a frame's link table needs, so `applySnapshotToSurface` can size the
     /// page before the write pass holds pointers into it (the same reasoning as graphemes).
     /// Counts every writable table entry as unique and every in-range linked cell, which can only
-    /// over-size the page.
+    /// over-size the page. The page sizes its hyperlink set (`hyperlink_bytes`, by unique links)
+    /// and its cell-to-link map (`hyperlink_cells`, by linked cells) independently, so a frame
+    /// with many cells sharing few links or few cells with many long links needs each dimension
+    /// sized on its own.
     const SnapshotLinkSizing = struct {
         string_bytes: usize = 0,
         hyperlink_bytes: usize = 0,
+        hyperlink_cells: usize = 0,
     };
 
     fn snapshotLinkSizing(snapshot: Snapshot, frame_cells: []const SnapshotCell) SnapshotLinkSizing {
@@ -2155,7 +2159,10 @@ pub const CAPI = struct {
         for (frame_cells) |frame_cell| {
             if (frame_cell.link_index != 0 and frame_cell.link_index <= links.len) linked_cells += 1;
         }
-        result.hyperlink_bytes = terminal.page.hyperlinkBytesRequired(unique, linked_cells);
+        result.hyperlink_bytes = terminal.Page.hyperlinkBytesForCount(unique);
+        // The capacity field's range bounds the count, as `Page.exactRowCapacity` does; the map's
+        // own rounding leaves room beyond a clamped count.
+        result.hyperlink_cells = @min(linked_cells, std.math.maxInt(terminal.size.HyperlinkCountInt));
         return result;
     }
 
@@ -2174,7 +2181,7 @@ pub const CAPI = struct {
         return true;
     }
 
-    /// Grows the page until its strings and hyperlink capacity cover `sizing`.
+    /// Grows the page until its strings, hyperlink set, and hyperlink map capacity cover `sizing`.
     fn growPageForLinks(
         screen: *terminal.Screen,
         node: **terminal.PageList.List.Node,
@@ -2185,6 +2192,9 @@ pub const CAPI = struct {
         }
         while (node.*.page().capacity.hyperlink_bytes < sizing.hyperlink_bytes) {
             if (!growPage(screen, node, .hyperlink_bytes)) return false;
+        }
+        while (node.*.page().capacity.hyperlink_cells < sizing.hyperlink_cells) {
+            if (!growPage(screen, node, .hyperlink_cells)) return false;
         }
         return true;
     }
@@ -2498,8 +2508,9 @@ pub const CAPI = struct {
     /// A cell's OSC 8 link (`link_index` into the snapshot's link table) is written onto the page
     /// as a page hyperlink, so the surface's own `linkAtPos` finds it on a Cmd-click, the renderer
     /// underlines it while Cmd is held, and hover raises `mouse_over_link`. The page's
-    /// `string_bytes` and `hyperlink_bytes` are sized for the table up front. A frame whose links
-    /// cannot be fitted is applied without them: dropping the frame would leave the pane stale.
+    /// `string_bytes`, `hyperlink_bytes`, and `hyperlink_cells` are sized for the table up front.
+    /// A frame whose links cannot be fitted is applied without them: dropping the frame would
+    /// leave the pane stale.
     fn applySnapshotToSurface(surface: *Surface, snapshot: Snapshot) !void {
         if (snapshot.columns == 0 or snapshot.rows == 0) return error.InvalidRenderFrame;
         const expected_cell_count = @as(usize, snapshot.columns) * @as(usize, snapshot.rows);
@@ -2598,8 +2609,12 @@ pub const CAPI = struct {
                     write_links = growPage(screen, &node, .string_bytes);
                     continue;
                 },
-                error.SetOutOfMemory, error.HyperlinkMapOutOfMemory => {
+                error.SetOutOfMemory => {
                     write_links = growPage(screen, &node, .hyperlink_bytes);
+                    continue;
+                },
+                error.HyperlinkMapOutOfMemory => {
+                    write_links = growPage(screen, &node, .hyperlink_cells);
                     continue;
                 },
                 error.SetNeedsRehash => {
@@ -5346,3 +5361,67 @@ test "mirrorSelectionInfo reports the selection top-left first" {
     s.clearSelection();
     try std.testing.expect(!CAPI.mirrorSelectionInfo(&s).present);
 }
+
+test "a snapshot with many distinct long links sizes the hyperlink set and map and keeps every link" {
+    const alloc = std.testing.allocator;
+    const columns: u16 = 80;
+    const rows: u16 = 24;
+    var s = try terminal.Screen.init(std.testing.io, alloc, .{
+        .cols = columns,
+        .rows = rows,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+
+    // Every 8 cells carry their own ~130 byte URI: 240 unique links over 1920 linked cells, far
+    // past the default set and map capacities, so each dimension has to grow on its own.
+    const cell_count = @as(usize, columns) * rows;
+    const link_count = cell_count / 8;
+    const padding: [100]u8 = @splat('x');
+    const uris = try alloc.alloc([]u8, link_count);
+    defer alloc.free(uris);
+    var made: usize = 0;
+    defer for (uris[0..made]) |uri| alloc.free(uri);
+    const table = try alloc.alloc(SnapshotStringForTest, link_count);
+    defer alloc.free(table);
+    for (uris, table, 0..) |*uri, *entry, i| {
+        uri.* = try std.fmt.allocPrint(alloc, "https://example.com/{d:0>4}/{s}", .{ i, padding });
+        made += 1;
+        entry.* = .{ .ptr = uri.ptr, .len = uri.len };
+    }
+    const cells = try alloc.alloc(CAPI.SnapshotCell, cell_count);
+    defer alloc.free(cells);
+    for (cells, 0..) |*cell, i| cell.* = .{
+        .codepoint = 'a',
+        .link_index = @intCast(i / 8 + 1),
+    };
+    const snapshot: CAPI.Snapshot = .{
+        .columns = columns,
+        .rows = rows,
+        .cell_count = cell_count,
+        .cells = cells.ptr,
+        .link_count = link_count,
+        .links = table.ptr,
+    };
+
+    var node = s.pages.pages.last.?;
+    const sizing = CAPI.snapshotLinkSizing(snapshot, cells);
+    try std.testing.expect(CAPI.growPageForLinks(&s, &node, sizing));
+    try std.testing.expect(node.page().capacity.hyperlink_cells >= cell_count);
+    try CAPI.writeSnapshotGrid(&s, node, snapshot, cells, true);
+
+    const page = node.page();
+    for (0..rows) |y| {
+        const row = page.getRow(y);
+        const row_cells = row.cells.ptr(page.memory)[0..columns];
+        for (row_cells, 0..) |*cell, x| {
+            try std.testing.expect(cell.hyperlink);
+            const id = page.lookupHyperlink(cell).?;
+            const entry = page.hyperlink_set.get(page.memory, id);
+            const want = uris[(y * columns + x) / 8];
+            try std.testing.expectEqualStrings(want, entry.uri.slice(page.memory));
+        }
+    }
+}
+
+const SnapshotStringForTest = CAPI.SnapshotString;

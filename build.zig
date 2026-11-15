@@ -613,7 +613,7 @@ pub fn build(b: *std.Build) !void {
             });
 
             const embedded_test_run = b.addRunArtifact(embedded_test_exe);
-            config.addPatchElf(embedded_test_exe, &embedded_test_run.step);
+            _ = config.addPatchElf(embedded_test_exe, &embedded_test_run.step);
             test_step.dependOn(&embedded_test_run.step);
         }
 

@@ -137,6 +137,9 @@ pub const Message = union(enum) {
     /// The terminal encountered a bell character.
     ring_bell,
 
+    /// The terminal screen content changed.
+    screen_change,
+
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
 
@@ -159,6 +162,25 @@ pub const Message = union(enum) {
 
     /// Renderer pushed a new frame, redraw this surface.
     redraw,
+
+    /// A program reported its status with OSC 7501.
+    program_status: ProgramStatus,
+
+    /// The parts of an OSC 7501 report forwarded to the apprt. The parser
+    /// bounds `id` to `max_id_bytes`, so the copy never truncates.
+    pub const ProgramStatus = struct {
+        state: terminal.osc.Command.ProgramStatus.State,
+        id: [terminal.osc.program_status.max_id_bytes:0]u8,
+
+        pub fn init(report: terminal.osc.Command.ProgramStatus.Report) ProgramStatus {
+            const id = report.readOption(.id) orelse "";
+            std.debug.assert(id.len <= terminal.osc.program_status.max_id_bytes);
+            var result: ProgramStatus = .{ .state = report.state, .id = undefined };
+            @memcpy(result.id[0..id.len], id);
+            result.id[id.len] = 0;
+            return result;
+        }
+    };
 
     pub const ReportTitleStyle = enum {
         csi_21_t,
